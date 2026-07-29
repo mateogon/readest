@@ -66,6 +66,10 @@ export interface ChunkTiming {
   mediaScale: number;
   // Silence scheduled after this chunk; the caller rate-scales it.
   gapSec: number;
+  // Logical transition into this chunk. Undefined preserves the historical
+  // inference: the first chunk uses the session transition and later chunks
+  // are sentences. Null explicitly suppresses transition diagnostics.
+  transitionFromPrevious?: 'sentence' | TTSPlaybackTransition;
 }
 
 export type WebAudioPlayerEvent =
@@ -309,20 +313,35 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const session = this.#session;
     const ctx = this.#ctx;
     if (!session || session.generation !== generation || !ctx) return;
+    const previousChunk = session.chunks.at(-1);
+    const hasPreviousAudio = previousChunk !== undefined || this.#lastAudibleEndSec !== null;
+    const inferredTransition = previousChunk
+      ? 'sentence'
+      : session.transitionFromPrevious !== null && this.#lastAudibleEndSec !== null
+        ? session.transitionFromPrevious
+        : null;
+    const requestedTransition = timing.transitionFromPrevious;
     const transitionKind =
-      session.chunks.length > 0
-        ? 'sentence'
-        : session.transitionFromPrevious !== null && this.#lastAudibleEndSec !== null
-          ? session.transitionFromPrevious
+      requestedTransition === undefined
+        ? inferredTransition
+        : requestedTransition !== null && hasPreviousAudio
+          ? requestedTransition
           : null;
-    const targetStart =
-      transitionKind === 'sentence'
-        ? session.nextStartTime
-        : transitionKind === null
-          ? null
-          : this.#lastAudibleEndSec! + session.leadingGapSec;
+    const configuredGapSec =
+      transitionKind === null
+        ? null
+        : previousChunk
+          ? Math.max(0, previousChunk.timing.gapSec)
+          : session.leadingGapSec;
+    const targetStartTime =
+      transitionKind === null || configuredGapSec === null
+        ? null
+        : previousChunk
+          ? previousChunk.startTime + previousChunk.duration + configuredGapSec
+          : this.#lastAudibleEndSec! + configuredGapSec;
     const start = Math.max(session.nextStartTime, ctx.currentTime + SCHEDULE_SAFETY_SEC);
-    const unplannedGapMs = targetStart === null ? null : Math.max(0, start - targetStart) * 1000;
+    const unplannedGapMs =
+      targetStartTime === null ? null : Math.max(0, start - targetStartTime) * 1000;
     if (session.chunks.length === 0) this.#lastAudibleEndSec = null;
     const source = ctx.createBufferSource();
     source.buffer = buffer;
@@ -353,12 +372,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
         durationSec: Number(buffer.duration.toFixed(3)),
         transitionKind,
         configuredGapMs:
-          transitionKind === null
-            ? null
-            : Math.round(
-                Math.max(0, transitionKind === 'sentence' ? timing.gapSec : session.leadingGapSec) *
-                  1000,
-              ),
+          configuredGapSec === null ? null : Math.round(Math.max(0, configuredGapSec) * 1000),
         unplannedGapMs: unplannedGapMs === null ? null : Math.round(unplannedGapMs),
         bufferAheadMs: Math.round(bufferAheadMs),
       })}`,

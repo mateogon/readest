@@ -63,6 +63,137 @@ describe('WebAudioPlayer scheduling', () => {
     ]);
   });
 
+  test('classifies an explicit paragraph transition using the previous chunk gap', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.4,
+    });
+    ctx.currentTime = 3;
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.9,
+      transitionFromPrevious: 'paragraph',
+    });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(3 + SAFETY, 5);
+    await ctx.advanceTo(3 + SAFETY + 1);
+    expect(player.getDiagnostics()).toMatchObject({
+      sentenceGaps: { transitions: 0 },
+      paragraphGaps: { transitions: 1, unplannedGapMsP95: 600 },
+    });
+    const paragraphSchedule = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)))
+      .find((payload) => payload.transitionKind === 'paragraph');
+    expect(paragraphSchedule).toMatchObject({
+      configuredGapMs: 400,
+      unplannedGapMs: 600,
+    });
+  });
+
+  test('classifies an explicit sentence transition using the previous chunk gap', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.15,
+    });
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.8,
+      transitionFromPrevious: 'sentence',
+    });
+
+    await ctx.advanceTo(SAFETY + 1 + 0.15 + 1);
+    expect(player.getDiagnostics()).toMatchObject({
+      sentenceGaps: { transitions: 1, unplannedGapMsP95: 0 },
+      paragraphGaps: { transitions: 0 },
+    });
+    const sentenceSchedule = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)))
+      .find((payload) => payload.transitionKind === 'sentence');
+    expect(sentenceSchedule).toMatchObject({
+      configuredGapMs: 150,
+      unplannedGapMs: 0,
+    });
+  });
+
+  test('explicit null suppresses transition diagnostics without changing contiguous scheduling', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.25,
+    });
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.8,
+      transitionFromPrevious: null,
+    });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 1 + 0.25, 5);
+    await ctx.advanceTo(SAFETY + 1 + 0.25 + 1);
+    expect(player.getDiagnostics()).toMatchObject({
+      sentenceGaps: { transitions: 0 },
+      paragraphGaps: { transitions: 0 },
+      chapterGaps: { transitions: 0 },
+    });
+    const schedules = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)));
+    expect(schedules[1]).toMatchObject({
+      transitionKind: null,
+      configuredGapMs: null,
+      unplannedGapMs: null,
+    });
+  });
+
+  test('undefined transition keeps sentence inference and uses the previous chunk gap', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.35,
+    });
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.8,
+    });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 1 + 0.35, 5);
+    await ctx.advanceTo(SAFETY + 1 + 0.35 + 1);
+    expect(player.getDiagnostics()).toMatchObject({
+      sentenceGaps: { transitions: 1, unplannedGapMsP95: 0 },
+    });
+    const sentenceSchedule = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)))
+      .find((payload) => payload.transitionKind === 'sentence');
+    expect(sentenceSchedule).toMatchObject({
+      configuredGapMs: 350,
+      unplannedGapMs: 0,
+    });
+  });
+
   test('separates configured silence from a late unplanned transition', async () => {
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
