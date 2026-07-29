@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import type { TTSBlockInput, TTSMessageEvent } from '@/services/tts/TTSClient';
+import type { TTSController } from '@/services/tts/TTSController';
 import type {
   SpeechProvider,
   SpeechSynthesisRequest,
@@ -163,6 +164,12 @@ const drain = async (ctx: FakeAudioContext, done: Promise<void>): Promise<void> 
   await done;
 };
 
+const audibleSources = (ctx: FakeAudioContext) =>
+  ctx.sources.filter((source) => (source.buffer?.duration ?? 0) > 0.01);
+
+const markerSources = (ctx: FakeAudioContext) =>
+  ctx.sources.filter((source) => (source.buffer?.duration ?? 0) <= 0.01);
+
 describe('BufferedTTSClient streamed composite playback', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -211,15 +218,21 @@ describe('BufferedTTSClient streamed composite playback', () => {
       mode,
       () => FakeAudioContext.instances[0]?.sources.length ?? 0,
     );
-    const client = new BufferedTTSClient(provider);
+    const controller = {
+      dispatchSpeakMark: vi.fn(),
+      prepareSpeakWords: vi.fn(),
+      dispatchSpeakWord: vi.fn(),
+    };
+    const client = new BufferedTTSClient(provider, controller as unknown as TTSController);
     await client.init();
     const ctx = () => FakeAudioContext.instances[0]!;
-    return { client, provider, individualSourceCounts, ctx, decode, releaseDecode };
+    return { client, provider, individualSourceCounts, controller, ctx, decode, releaseDecode };
   };
 
   test('requires explicit composite capability instead of an engine identity check', async () => {
     const { client, provider } = await startClient('valid', 24_000);
     expect(client.supportsBlockStreaming()).toBe(true);
+    expect(client.getCapabilities().gapControl).toBe(false);
 
     delete (provider as { compositeBoundaries?: SpeechProvider['compositeBoundaries'] })
       .compositeBoundaries;
@@ -229,8 +242,8 @@ describe('BufferedTTSClient streamed composite playback', () => {
 
   test.each([
     24_000, 48_000,
-  ])('synthesizes and decodes once, then schedules logical slices atomically at %i Hz', async (sampleRate) => {
-    const { client, provider, ctx, decode } = await startClient('valid', sampleRate);
+  ])('synthesizes and decodes once, then schedules one continuous chunk with logical marks at %i Hz', async (sampleRate) => {
+    const { client, provider, controller, ctx, decode } = await startClient('valid', sampleRate);
     client.setSentenceGap(0.1);
     client.setParagraphGap(0.3);
     const run = collect(
@@ -251,7 +264,11 @@ describe('BufferedTTSClient streamed composite playback', () => {
       expect.any(Object),
     );
     expect(decode).toHaveBeenCalledTimes(1);
-    expect(ctx().sources[1]!.startedAt! - ctx().sources[0]!.endTime).toBeCloseTo(0.3, 5);
+    expect(audibleSources(ctx())).toHaveLength(1);
+    expect(markerSources(ctx())).toHaveLength(1);
+    // The paragraph-gap setting cannot be inserted inside uncut PCM. The
+    // marker rides the estimated audio offset while speech remains continuous.
+    expect(markerSources(ctx())[0]!.startedAt!).toBeLessThan(audibleSources(ctx())[0]!.endTime);
 
     await drain(ctx(), run.done);
     expect(run.events.map((event) => event.code)).toEqual(['boundary', 'boundary', 'end']);
@@ -259,6 +276,7 @@ describe('BufferedTTSClient streamed composite playback', () => {
       { blockOffset: 0, mark: { name: '0', text: textA } },
       { blockOffset: 1, mark: { name: '0', text: textB } },
     ]);
+    expect(controller.prepareSpeakWords.mock.calls).toEqual([[[textA]], [[textB]]]);
     expect(run.events.at(-1)).toMatchObject({ code: 'end', consumedBlockOffset: 1 });
     expect(client.getSynthesisMetrics()).toMatchObject({
       attempts: 1,
@@ -266,12 +284,13 @@ describe('BufferedTTSClient streamed composite playback', () => {
         compositeRequests: 1,
         compositesScheduled: 1,
         logicalMarksScheduled: 2,
+        logicalMarksStarted: 2,
         fallbackSessions: 0,
       },
     });
   });
 
-  test('keeps a prepared multi-slice composite behind ordinary player backpressure', async () => {
+  test('keeps many logical marks inside one bounded physical chunk', async () => {
     const { client, provider, ctx } = await startClient('many-valid', 24_000);
     const run = collect(
       client,
@@ -284,22 +303,22 @@ describe('BufferedTTSClient streamed composite playback', () => {
       ),
     );
 
-    await vi.waitFor(() => expect(ctx().sources).toHaveLength(2));
+    await vi.waitFor(() => expect(ctx().sources).toHaveLength(4));
     expect(provider.synthesize).toHaveBeenCalledTimes(1);
-    // All four buffers are already validated/prepared, but visible playback
-    // admits only two sources until the first one finishes.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(ctx().sources).toHaveLength(2);
+    expect(audibleSources(ctx())).toHaveLength(1);
+    expect(markerSources(ctx())).toHaveLength(3);
 
     await drain(ctx(), run.done);
     expect(ctx().sources).toHaveLength(4);
     expect(run.events.filter((event) => event.code === 'boundary')).toHaveLength(4);
     expect(run.events.at(-1)).toMatchObject({ code: 'end', consumedBlockOffset: 3 });
+    expect(client.getSynthesisMetrics()).toMatchObject({
+      composite: { logicalMarksScheduled: 4, logicalMarksStarted: 4 },
+    });
   });
 
   test.each([
     ['missing-boundaries', 'boundaries'],
-    ['continuous-pcm', 'no-safe-silence'],
     ['decode-error', 'decode'],
   ] as const)('falls back before scheduling and latches the %s failure', async (mode, reason) => {
     const { client, provider, individualSourceCounts, ctx } = await startClient(mode, 24_000);
@@ -329,6 +348,78 @@ describe('BufferedTTSClient streamed composite playback', () => {
         fallbackReasons: { [reason]: 1 },
       },
     });
+  });
+
+  test('plays continuous composite PCM without cuts or individual regeneration', async () => {
+    const { client, provider, ctx } = await startClient('continuous-pcm', 24_000);
+    const run = collect(
+      client,
+      blocks([
+        { blockOffset: 0, text: textA },
+        { blockOffset: 1, text: textB },
+      ]),
+    );
+
+    await vi.waitFor(() => expect(audibleSources(ctx())).toHaveLength(1));
+    expect(provider.synthesize).toHaveBeenCalledTimes(1);
+    expect(markerSources(ctx())).toHaveLength(1);
+
+    await drain(ctx(), run.done);
+    expect(run.events.map((event) => event.code)).toEqual(['boundary', 'boundary', 'end']);
+    expect(client.getSynthesisMetrics()).toMatchObject({
+      attempts: 1,
+      composite: {
+        compositesScheduled: 1,
+        logicalMarksScheduled: 2,
+        logicalMarksStarted: 2,
+        fallbackSessions: 0,
+        fallbackIndividualRequests: 0,
+      },
+      playback: { scheduledChunks: 1 },
+    });
+  });
+
+  test('reports media position relative to the active logical mark', async () => {
+    const { client, ctx } = await startClient('valid', 24_000);
+    const run = collect(
+      client,
+      blocks([
+        { blockOffset: 0, text: textA },
+        { blockOffset: 1, text: textB },
+      ]),
+    );
+
+    await vi.waitFor(() => expect(markerSources(ctx())).toHaveLength(1));
+    const marker = markerSources(ctx())[0]!;
+    await ctx().advanceTo(marker.endTime + 0.2);
+    await vi.waitFor(() =>
+      expect(run.events.filter((event) => event.code === 'boundary')).toHaveLength(2),
+    );
+
+    expect(client.getChunkPosition()).toBeCloseTo(0.2, 2);
+    await drain(ctx(), run.done);
+  });
+
+  test('maps estimated media offsets onto the rate-stretched output clock', async () => {
+    const { client, ctx } = await startClient('valid', 24_000);
+    await client.setRate(2);
+    const run = collect(
+      client,
+      blocks([
+        { blockOffset: 0, text: textA },
+        { blockOffset: 1, text: textB },
+      ]),
+    );
+
+    await vi.waitFor(() => expect(markerSources(ctx())).toHaveLength(1));
+    const audible = audibleSources(ctx())[0]!;
+    const marker = markerSources(ctx())[0]!;
+    const outputFraction = (marker.startedAt! - audible.startedAt!) / audible.buffer!.duration;
+    // Composite speech is trimmed to media [0.08, 1.95], and the second
+    // logical unit's estimated first range starts at 1.2s.
+    expect(outputFraction).toBeCloseTo((1.2 - 0.08) / (1.95 - 0.08), 3);
+
+    await drain(ctx(), run.done);
   });
 
   test('reports trailing empty blocks only on the successful terminal end', async () => {
@@ -378,7 +469,38 @@ describe('BufferedTTSClient streamed composite playback', () => {
     expect(ctx().sources).toHaveLength(0);
     expect(run.events).toEqual([{ code: 'error', message: 'Aborted' }]);
     expect(client.getSynthesisMetrics()).toMatchObject({
-      composite: { fallbackSessions: 0, fallbackIndividualRequests: 0 },
+      composite: {
+        logicalMarksStarted: 0,
+        fallbackSessions: 0,
+        fallbackIndividualRequests: 0,
+      },
+    });
+  });
+
+  test('does not count internal logical marks after playback is aborted', async () => {
+    const { client, ctx } = await startClient('valid', 24_000);
+    const abort = new AbortController();
+    const run = collect(
+      client,
+      blocks([
+        { blockOffset: 0, text: textA },
+        { blockOffset: 1, text: textB },
+      ]),
+      abort.signal,
+    );
+
+    await vi.waitFor(() =>
+      expect(run.events.filter((event) => event.code === 'boundary')).toHaveLength(1),
+    );
+    expect(client.getSynthesisMetrics()).toMatchObject({
+      composite: { logicalMarksScheduled: 2, logicalMarksStarted: 1 },
+    });
+
+    abort.abort();
+    await run.done;
+    await ctx().advanceTo(100);
+    expect(client.getSynthesisMetrics()).toMatchObject({
+      composite: { logicalMarksScheduled: 2, logicalMarksStarted: 1 },
     });
   });
 

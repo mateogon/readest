@@ -361,6 +361,78 @@ describe('WebAudioPlayer scheduling', () => {
     ]);
   });
 
+  test('emits internal logical boundaries in order from one continuous chunk', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(3), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+      logicalBoundaryOffsetsSec: [1, 2],
+    });
+
+    expect(player.getDiagnostics()).toMatchObject({ scheduledChunks: 1, retainedChunks: 1 });
+    expect(ctx.sources).toHaveLength(3);
+    expect(events).toEqual([{ type: 'chunk-start', chunkIndex: 0 }]);
+
+    // Even if browser task delivery observes the later marker first, public
+    // logical boundaries stay document ordered.
+    ctx.sources[2]!.onended?.();
+    expect(events).toHaveLength(1);
+    ctx.sources[1]!.onended?.();
+    expect(events).toEqual([
+      { type: 'chunk-start', chunkIndex: 0 },
+      { type: 'logical-boundary', chunkIndex: 0, logicalIndex: 1 },
+      { type: 'logical-boundary', chunkIndex: 0, logicalIndex: 2 },
+    ]);
+  });
+
+  test('flushes delayed marker callbacks before next/session end without duplicates', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(3), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+      logicalBoundaryOffsetsSec: [1, 2],
+    });
+    player.endSession(gen);
+    const delayedCallbacks = ctx.sources.slice(1).map((source) => source.onended!);
+
+    // Simulate Chromium grouping background callbacks and delivering the main
+    // source's onended before the queued marker tasks.
+    ctx.sources[0]!.onended?.();
+    expect(events).toEqual([
+      { type: 'chunk-start', chunkIndex: 0 },
+      { type: 'logical-boundary', chunkIndex: 0, logicalIndex: 1 },
+      { type: 'logical-boundary', chunkIndex: 0, logicalIndex: 2 },
+      { type: 'session-end' },
+    ]);
+
+    for (const callback of delayedCallbacks) callback();
+    expect(events).toHaveLength(4);
+  });
+
+  test('validates logical offsets before creating or scheduling any source', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+
+    expect(() =>
+      player.scheduleChunk(gen, makeBuffer(2), {
+        trimStartSec: 0,
+        mediaScale: 1,
+        gapSec: 0,
+        logicalBoundaryOffsetsSec: [1.5, 1],
+      }),
+    ).toThrow('Invalid logical boundary offset');
+    expect(ctx.sources).toHaveLength(0);
+    expect(events).toHaveLength(0);
+    expect(player.getDiagnostics().scheduledChunks).toBe(0);
+  });
+
   test('a chunk admitted after an underrun announces its own start', async () => {
     const { ctx, player, events, onEvent } = setup();
     await player.ensureContext();
@@ -531,6 +603,26 @@ describe('WebAudioPlayer abort', () => {
     const countBefore = events.length;
     await ctx.advanceTo(100);
     expect(events).toHaveLength(countBefore);
+  });
+
+  test('abort cancels silent logical markers and rejects their stale callbacks', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(3), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+      logicalBoundaryOffsetsSec: [1, 2],
+    });
+    const staleCallbacks = ctx.sources.slice(1).map((source) => source.onended!);
+    const countBeforeAbort = events.length;
+
+    player.abortSession();
+    for (const callback of staleCallbacks) callback();
+
+    expect(ctx.sources.every((source) => source.stopped)).toBe(true);
+    expect(events).toHaveLength(countBeforeAbort);
   });
 
   test('double abortSession is idempotent', async () => {

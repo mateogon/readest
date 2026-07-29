@@ -70,10 +70,16 @@ export interface ChunkTiming {
   // inference: the first chunk uses the session transition and later chunks
   // are sentences. Null explicitly suppresses transition diagnostics.
   transitionFromPrevious?: 'sentence' | TTSPlaybackTransition;
+  // Internal logical-mark starts in prepared/output seconds from this
+  // buffer's start. Index zero is represented by chunk-start; these offsets
+  // therefore map to logical indexes 1..N. They drive silent Web Audio marker
+  // nodes, never cuts or gaps in the audible buffer.
+  logicalBoundaryOffsetsSec?: readonly number[];
 }
 
 export type WebAudioPlayerEvent =
   | { type: 'chunk-start'; chunkIndex: number }
+  | { type: 'logical-boundary'; chunkIndex: number; logicalIndex: number }
   | { type: 'session-end' }
   | { type: 'context-error'; message: string };
 
@@ -85,6 +91,9 @@ interface ScheduledChunk {
   timing: ChunkTiming;
   transitionKind: 'sentence' | TTSPlaybackTransition;
   unplannedGapMs: number | null;
+  logicalMarkers: TTSAudioBufferSourceNode[];
+  logicalMarkerEnded: boolean[];
+  nextLogicalIndex: number;
   ended: boolean;
 }
 
@@ -318,6 +327,18 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const session = this.#session;
     const ctx = this.#ctx;
     if (!session || session.generation !== generation || !ctx) return;
+    const logicalBoundaryOffsetsSec = timing.logicalBoundaryOffsetsSec ?? [];
+    let previousLogicalOffsetSec = 0;
+    for (const offsetSec of logicalBoundaryOffsetsSec) {
+      if (
+        !Number.isFinite(offsetSec) ||
+        offsetSec <= previousLogicalOffsetSec ||
+        offsetSec >= buffer.duration
+      ) {
+        throw new Error('Invalid logical boundary offset');
+      }
+      previousLogicalOffsetSec = offsetSec;
+    }
     const previousChunk = session.chunks.at(-1);
     const hasPreviousAudio = previousChunk !== undefined || this.#lastAudibleEndSec !== null;
     const inferredTransition = previousChunk
@@ -350,7 +371,15 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     if (session.chunks.length === 0) this.#lastAudibleEndSec = null;
     const source = ctx.createBufferSource();
     source.buffer = buffer;
+    const logicalMarkerBuffer =
+      logicalBoundaryOffsetsSec.length > 0 ? ctx.createBuffer(1, 1, buffer.sampleRate) : null;
+    const logicalMarkers = logicalBoundaryOffsetsSec.map(() => {
+      const marker = ctx.createBufferSource();
+      marker.buffer = logicalMarkerBuffer;
+      return marker;
+    });
     source.connect(ctx.destination);
+    for (const marker of logicalMarkers) marker.connect(ctx.destination);
     const chunk: ScheduledChunk = {
       index: session.nextChunkIndex++,
       source,
@@ -359,15 +388,35 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       timing,
       transitionKind,
       unplannedGapMs,
+      logicalMarkers,
+      logicalMarkerEnded: logicalMarkers.map(() => false),
+      nextLogicalIndex: 1,
       ended: false,
     };
     source.onended = () => this.#handleChunkEnded(session, chunk);
+    for (let index = 0; index < logicalMarkers.length; index++) {
+      const marker = logicalMarkers[index]!;
+      marker.onended = () => {
+        marker.onended = null;
+        try {
+          marker.disconnect();
+        } catch {
+          // The platform may already have released a completed source.
+        }
+        if (this.#session !== session) return;
+        chunk.logicalMarkerEnded[index] = true;
+        this.#flushLogicalBoundaries(session, chunk);
+      };
+    }
     session.chunks.push(chunk);
     session.nextStartTime = start + buffer.duration + Math.max(0, timing.gapSec);
     this.#scheduledChunks += 1;
     const bufferAheadMs = Math.max(0, start + buffer.duration - ctx.currentTime) * 1000;
     this.#maxBufferAheadMs = Math.max(this.#maxBufferAheadMs, bufferAheadMs);
     source.start(start);
+    for (let index = 0; index < logicalMarkers.length; index++) {
+      logicalMarkers[index]!.start(start + logicalBoundaryOffsetsSec[index]!);
+    }
     console.info(
       `[TTS][WebAudio] ${JSON.stringify({
         event: 'scheduled',
@@ -421,6 +470,19 @@ export class WebAudioPlayer implements TTSAudioPlayer {
         chunk.source.disconnect();
       } catch {
         // Ignore repeated disconnects.
+      }
+      for (const marker of chunk.logicalMarkers) {
+        marker.onended = null;
+        try {
+          marker.stop();
+        } catch {
+          // Sources that already ended throw; irrelevant during teardown.
+        }
+        try {
+          marker.disconnect();
+        } catch {
+          // Ignore repeated disconnects.
+        }
       }
     }
     const waiters = session.waiters;
@@ -531,8 +593,22 @@ export class WebAudioPlayer implements TTSAudioPlayer {
   }
 
   #handleChunkEnded(session: PlayerSession, chunk: ScheduledChunk): void {
-    if (this.#session !== session) return;
+    if (this.#session !== session || chunk.ended) return;
+    // Chromium may deliver several audio-node callbacks in one foreground
+    // turn after background throttling. The audible source cannot end before
+    // its internal marker times have passed, so flush any callbacks still
+    // queued by the browser before announcing the next chunk/session end.
+    chunk.logicalMarkerEnded.fill(true);
+    this.#flushLogicalBoundaries(session, chunk);
     chunk.ended = true;
+    for (const marker of chunk.logicalMarkers) {
+      marker.onended = null;
+      try {
+        marker.disconnect();
+      } catch {
+        // A completed source may already be disconnected by the platform.
+      }
+    }
     this.#lastAudibleEndSec = chunk.startTime + chunk.duration;
     if (chunk.transitionKind !== null && chunk.unplannedGapMs !== null) {
       const gaps =
@@ -553,6 +629,19 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       this.#discardEndedBefore(session, next.index);
     }
     this.#maybeEmitSessionEnd(session);
+  }
+
+  #flushLogicalBoundaries(session: PlayerSession, chunk: ScheduledChunk): void {
+    if (this.#session !== session) return;
+    while (chunk.nextLogicalIndex <= chunk.logicalMarkers.length) {
+      if (!chunk.logicalMarkerEnded[chunk.nextLogicalIndex - 1]) return;
+      session.onEvent({
+        type: 'logical-boundary',
+        chunkIndex: chunk.index,
+        logicalIndex: chunk.nextLogicalIndex,
+      });
+      chunk.nextLogicalIndex += 1;
+    }
   }
 
   #discardEndedBefore(session: PlayerSession, retainedIndex: number): void {

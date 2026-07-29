@@ -10,7 +10,7 @@ import { parseSSMLMarks } from '@/utils/ssml';
 import type { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
-import { applyEdgeFade, findSpeechBounds, PcmCutFailure, planSafePcmCuts } from './pcm';
+import { applyEdgeFade, findSpeechBounds } from './pcm';
 import { timeStretch } from './timeStretch';
 import {
   calibrateVoiceRate,
@@ -59,14 +59,18 @@ const TICKS_PER_SECOND = 10_000_000;
 // resets the count. A wholly-uncached run stops instead of racing to the end.
 const MAX_CONSECUTIVE_SKIPS = 3;
 
-interface ChunkMeta {
+interface LogicalChunkMeta {
   mark: TTSMark;
   logicalBoundary?: { blockOffset: number; mark: TTSMark };
   boundaries: TTSWordBoundary[];
-  trimStartSec: number;
-  trimmedDurationSec: number;
+  startMediaSec: number;
+  durationSec: number;
   // The exact synthesis request, for manifest key recording at chunk-start.
   req?: SpeechSynthesisRequest;
+}
+
+interface ChunkMeta {
+  logicalMarks: LogicalChunkMeta[];
 }
 
 interface StreamProgress {
@@ -81,12 +85,13 @@ interface SchedulerState {
   lastScheduledBlockOffset: number | null;
 }
 
-type CompositeFallbackReason = 'synthesis' | 'boundaries' | 'decode' | PcmCutFailure | 'prepare';
+type CompositeFallbackReason = 'synthesis' | 'boundaries' | 'decode' | 'prepare';
 
 interface CompositeMetrics {
   compositeRequests: number;
   compositesScheduled: number;
   logicalMarksScheduled: number;
+  logicalMarksStarted: number;
   fallbackSessions: number;
   fallbackIndividualRequests: number;
   maxMarksPerComposite: number;
@@ -96,11 +101,13 @@ interface CompositeMetrics {
 interface PreparedWebChunk {
   buffer: TTSAudioBuffer;
   meta: ChunkMeta;
-  transitionAfter: 'sentence' | TTSPlaybackTransition;
+  trimStartSec: number;
+  trimmedDurationSec: number;
+  logicalBoundaryOffsetsSec: number[];
 }
 
 type CompositePreparation =
-  | { ok: true; chunks: PreparedWebChunk[] }
+  | { ok: true; chunk: PreparedWebChunk }
   | { ok: false; reason: Exclude<CompositeFallbackReason, 'synthesis'> };
 
 type CompositeRunResult =
@@ -110,7 +117,7 @@ type CompositeRunResult =
   | { kind: 'stop' };
 
 type SpeakQueueEvent =
-  | { kind: 'chunk-start'; index: number }
+  | { kind: 'logical-start'; chunkIndex: number; logicalIndex: number }
   | { kind: 'chunk-skip'; markName: string }
   | { kind: 'session-end' }
   | { kind: 'error'; message: string };
@@ -162,12 +169,14 @@ export class BufferedTTSClient implements TTSClient {
   #activeQueue: AsyncQueue<SpeakQueueEvent> | null = null;
   #chunkMeta: Array<ChunkMeta | undefined> = [];
   #firstRetainedChunkMeta = 0;
+  #activeLogicalMeta: { chunkIndex: number; meta: LogicalChunkMeta } | null = null;
   #isPlaying = false;
   #wordTrackingRafId: number | null = null;
   readonly #compositeMetrics: CompositeMetrics = {
     compositeRequests: 0,
     compositesScheduled: 0,
     logicalMarksScheduled: 0,
+    logicalMarksStarted: 0,
     fallbackSessions: 0,
     fallbackIndividualRequests: 0,
     maxMarksPerComposite: 0,
@@ -175,11 +184,6 @@ export class BufferedTTSClient implements TTSClient {
       synthesis: 0,
       boundaries: 0,
       decode: 0,
-      'invalid-audio': 0,
-      'invalid-seeds': 0,
-      'no-safe-silence': 0,
-      'conflicting-cuts': 0,
-      'silent-slice': 0,
       prepare: 0,
     },
   };
@@ -335,13 +339,20 @@ export class BufferedTTSClient implements TTSClient {
     this.#activeQueue = queue;
     this.#chunkMeta = chunkMeta;
     this.#firstRetainedChunkMeta = 0;
+    this.#activeLogicalMeta = null;
 
     // startSession before ensureContext: starting a session declares playback
     // intent, clearing any lingering user-pause so the context may resume.
     const generation = this.#player.startSession(
       (event: WebAudioPlayerEvent) => {
         if (event.type === 'chunk-start') {
-          queue.push({ kind: 'chunk-start', index: event.chunkIndex });
+          queue.push({ kind: 'logical-start', chunkIndex: event.chunkIndex, logicalIndex: 0 });
+        } else if (event.type === 'logical-boundary') {
+          queue.push({
+            kind: 'logical-start',
+            chunkIndex: event.chunkIndex,
+            logicalIndex: event.logicalIndex,
+          });
         } else if (event.type === 'session-end') {
           queue.push({ kind: 'session-end' });
         } else {
@@ -385,11 +396,16 @@ export class BufferedTTSClient implements TTSClient {
 
       for (;;) {
         const event = await queue.next();
-        if (event.kind === 'chunk-start') {
-          this.#discardChunkMetaBefore(chunkMeta, event.index);
-          const meta = chunkMeta[event.index];
+        if (event.kind === 'logical-start') {
+          this.#discardChunkMetaBefore(chunkMeta, event.chunkIndex);
+          const meta = chunkMeta[event.chunkIndex]?.logicalMarks[event.logicalIndex];
           if (!meta) continue;
+          this.#activeLogicalMeta = { chunkIndex: event.chunkIndex, meta };
           if (meta.logicalBoundary) {
+            // Unlike logicalMarksScheduled, this is an audio-clock event: the
+            // logical mark has reached playout (or an ended source is flushing
+            // browser-delayed marker callbacks) rather than merely admission.
+            this.#compositeMetrics.logicalMarksStarted += 1;
             yield {
               code: 'boundary',
               message: `Start chunk: ${meta.mark.name}`,
@@ -406,7 +422,7 @@ export class BufferedTTSClient implements TTSClient {
             ) {
               return;
             }
-            this.#startWordTracking(generation, event.index, meta);
+            this.#startWordTracking(generation, event.chunkIndex, meta);
             continue;
           }
           const located = this.controller?.dispatchSpeakMark(meta.mark);
@@ -415,7 +431,7 @@ export class BufferedTTSClient implements TTSClient {
             // section manifest so a fully covered section can compact.
             this.provider.recordMark(located.sectionIndex, located.sentenceIndex, meta.req);
           }
-          this.#startWordTracking(generation, event.index, meta);
+          this.#startWordTracking(generation, event.chunkIndex, meta);
           yield {
             code: 'boundary',
             message: `Start chunk: ${meta.mark.name}`,
@@ -451,6 +467,7 @@ export class BufferedTTSClient implements TTSClient {
       if (this.#chunkMeta === chunkMeta) {
         this.#chunkMeta = [];
         this.#firstRetainedChunkMeta = 0;
+        this.#activeLogicalMeta = null;
       }
     }
   }
@@ -747,20 +764,20 @@ export class BufferedTTSClient implements TTSClient {
       if (!ready || !this.#isSchedulerCurrent(signal, generation, synthesisGeneration))
         return false;
       const index = chunkMeta.length;
-      const meta: ChunkMeta = {
+      const logicalMeta: LogicalChunkMeta = {
         mark: unit.mark,
         logicalBoundary,
         boundaries: audio.boundaries,
-        trimStartSec: 0,
-        trimmedDurationSec: 0,
+        startMediaSec: 0,
+        durationSec: 0,
         req: requestForManifest,
       };
-      chunkMeta.push(meta);
+      chunkMeta.push({ logicalMarks: [logicalMeta] });
       try {
         const durationSec = await this.#player.scheduleRawChunk(generation, index, audio.data, {
           gapSec: this.#gapAfter(transitionAfter, rate),
         });
-        meta.trimmedDurationSec = durationSec;
+        logicalMeta.durationSec = durationSec;
         this.#recordDurations(batch.request.voice, unit.mark.text, audio.boundaries, durationSec);
         state.lastScheduledBlockOffset = unit.blockOffset;
       } catch (error) {
@@ -793,12 +810,16 @@ export class BufferedTTSClient implements TTSClient {
     const ready = await this.#player.waitUntilReady(generation);
     if (!ready || !this.#isSchedulerCurrent(signal, generation, synthesisGeneration)) return false;
     chunkMeta.push({
-      mark: unit.mark,
-      logicalBoundary,
-      boundaries: audio.boundaries,
-      trimStartSec: prepared.trimStartSec,
-      trimmedDurationSec: prepared.trimmedDurationSec,
-      req: requestForManifest,
+      logicalMarks: [
+        {
+          mark: unit.mark,
+          logicalBoundary,
+          boundaries: audio.boundaries,
+          startMediaSec: prepared.trimStartSec,
+          durationSec: prepared.trimmedDurationSec,
+          req: requestForManifest,
+        },
+      ],
     });
     this.#player.scheduleChunk(generation, prepared.buffer, {
       trimStartSec: prepared.trimStartSec,
@@ -858,50 +879,43 @@ export class BufferedTTSClient implements TTSClient {
       return { kind: 'stop' };
     }
 
-    const prepared = await this.#prepareCompositeBatch(
-      batch,
-      audio.boundaries,
-      audio.data,
-      rate,
-      state,
-    );
+    const prepared = await this.#prepareCompositeBatch(batch, audio.boundaries, audio.data, rate);
     if (!this.#isSchedulerCurrent(signal, generation, synthesisGeneration)) {
       return { kind: 'stop' };
     }
     if (!prepared.ok) return { kind: 'fallback', reason: prepared.reason };
 
-    // Structural validation and every PCM allocation complete before the
-    // first admission, so fallback remains all-or-nothing. The already-safe
-    // slices still enter WebAudio through its ordinary bounded admission;
-    // otherwise one pathological 32-mark batch could bypass both pending and
-    // ahead limits and retain a chapter-sized graph on a mobile device.
+    // Structural/timing validation and the one PCM allocation complete before
+    // admission, so fallback remains all-or-nothing. Internal logical marks
+    // are Web Audio clock events over one continuous source, never PCM cuts.
     this.#consecutiveSkips = 0;
-    for (let index = 0; index < prepared.chunks.length; index++) {
-      const unit = batch.logicalUnits[index]!;
-      const chunk = prepared.chunks[index]!;
-      this.#recordDurations(
+    for (const logicalMeta of prepared.chunk.meta.logicalMarks) {
+      // Android range times are estimated rather than measured alignment. Feed
+      // them to the provisional timeline store, never voice-rate calibration.
+      recordProvisionalDuration(
         batch.request.voice,
-        unit.mark.text,
-        chunk.meta.boundaries,
-        chunk.meta.trimmedDurationSec,
+        logicalMeta.mark.text,
+        logicalMeta.durationSec,
       );
     }
-    for (let index = 0; index < prepared.chunks.length; index++) {
-      const unit = batch.logicalUnits[index]!;
-      const chunk = prepared.chunks[index]!;
-      const ready = await player.waitUntilReady(generation);
-      if (!ready || !this.#isSchedulerCurrent(signal, generation, synthesisGeneration)) {
-        return { kind: 'stop' };
-      }
-      chunkMeta.push(chunk.meta);
-      player.scheduleChunk(generation, chunk.buffer, {
-        trimStartSec: chunk.meta.trimStartSec,
-        mediaScale: chunk.meta.trimmedDurationSec / chunk.buffer.duration,
-        gapSec: this.#gapAfter(chunk.transitionAfter, rate),
-        transitionFromPrevious: this.#transitionInto(state, unit),
-      });
-      state.lastScheduledBlockOffset = unit.blockOffset;
+    const ready = await player.waitUntilReady(generation);
+    if (!ready || !this.#isSchedulerCurrent(signal, generation, synthesisGeneration)) {
+      return { kind: 'stop' };
     }
+    const firstUnit = batch.logicalUnits[0]!;
+    const lastUnit = batch.logicalUnits.at(-1)!;
+    chunkMeta.push(prepared.chunk.meta);
+    player.scheduleChunk(generation, prepared.chunk.buffer, {
+      trimStartSec: prepared.chunk.trimStartSec,
+      mediaScale: prepared.chunk.trimmedDurationSec / prepared.chunk.buffer.duration,
+      // A configured gap can only be inserted between physical chunks. Inside
+      // this composite, original punctuation/newlines and engine prosody own
+      // the pauses; inserting silence at estimated offsets would cut speech.
+      gapSec: this.#gapAfter(batch.transitionAfter, rate),
+      transitionFromPrevious: this.#transitionInto(state, firstUnit),
+      logicalBoundaryOffsetsSec: prepared.chunk.logicalBoundaryOffsetsSec,
+    });
+    state.lastScheduledBlockOffset = lastUnit.blockOffset;
     this.#compositeMetrics.compositesScheduled += 1;
     this.#compositeMetrics.logicalMarksScheduled += batch.logicalUnits.length;
     console.info(
@@ -919,7 +933,6 @@ export class BufferedTTSClient implements TTSClient {
     boundaries: TTSWordBoundary[],
     data: ArrayBuffer,
     rate: number,
-    state: SchedulerState,
   ): Promise<CompositePreparation> {
     const mappedBoundaries = this.#mapCompositeBoundaries(batch, boundaries);
     if (!mappedBoundaries) return { ok: false, reason: 'boundaries' };
@@ -932,42 +945,79 @@ export class BufferedTTSClient implements TTSClient {
     } catch {
       return { ok: false, reason: 'decode' };
     }
-    const seedOffsetsTicks = mappedBoundaries.slice(1).map((unit) => unit[0]!.offset);
-    const cutPlan = planSafePcmCuts(samples, decoded.sampleRate, seedOffsetsTicks);
-    if (!cutPlan.ok) return { ok: false, reason: cutPlan.reason };
-    if (cutPlan.cutFrames.length !== batch.logicalUnits.length - 1) {
-      return { ok: false, reason: 'invalid-seeds' };
-    }
-
-    const edges = [0, ...cutPlan.cutFrames, samples.length];
-    const chunks: PreparedWebChunk[] = [];
+    let prepared: {
+      buffer: TTSAudioBuffer;
+      trimStartSec: number;
+      trimmedDurationSec: number;
+    };
     try {
-      for (let index = 0; index < batch.logicalUnits.length; index++) {
-        const unit = batch.logicalUnits[index]!;
-        const prepared = await this.#preparePcmSlice(
-          this.#player as WebAudioPlayer,
-          samples,
-          decoded.sampleRate,
-          edges[index]!,
-          edges[index + 1]!,
-          rate,
-        );
-        chunks.push({
-          buffer: prepared.buffer,
-          meta: {
-            mark: unit.mark,
-            logicalBoundary: { blockOffset: unit.blockOffset, mark: unit.mark },
-            boundaries: mappedBoundaries[index]!,
-            trimStartSec: prepared.trimStartSec,
-            trimmedDurationSec: prepared.trimmedDurationSec,
-          },
-          transitionAfter: this.#transitionAfter(batch, index, state),
-        });
-      }
+      prepared = await this.#preparePcmSlice(
+        this.#player as WebAudioPlayer,
+        samples,
+        decoded.sampleRate,
+        0,
+        samples.length,
+        rate,
+      );
     } catch {
       return { ok: false, reason: 'prepare' };
     }
-    return { ok: true, chunks };
+
+    const mediaEndSec = prepared.trimStartSec + prepared.trimmedDurationSec;
+    const logicalStartMediaSec = [
+      prepared.trimStartSec,
+      ...mappedBoundaries
+        .slice(1)
+        .map((unitBoundaries) => unitBoundaries[0]!.offset / TICKS_PER_SECOND),
+    ];
+    for (let index = 1; index < logicalStartMediaSec.length; index++) {
+      const current = logicalStartMediaSec[index]!;
+      const previous = logicalStartMediaSec[index - 1]!;
+      if (!Number.isFinite(current) || current <= previous || current >= mediaEndSec) {
+        return { ok: false, reason: 'boundaries' };
+      }
+    }
+
+    const mediaScale = prepared.trimmedDurationSec / prepared.buffer.duration;
+    if (!Number.isFinite(mediaScale) || mediaScale <= 0) {
+      return { ok: false, reason: 'prepare' };
+    }
+    const logicalBoundaryOffsetsSec = logicalStartMediaSec
+      .slice(1)
+      .map((startSec) => (startSec - prepared.trimStartSec) / mediaScale);
+    for (let index = 0; index < logicalBoundaryOffsetsSec.length; index++) {
+      const offsetSec = logicalBoundaryOffsetsSec[index]!;
+      const previous = index === 0 ? 0 : logicalBoundaryOffsetsSec[index - 1]!;
+      if (
+        !Number.isFinite(offsetSec) ||
+        offsetSec <= previous ||
+        offsetSec >= prepared.buffer.duration
+      ) {
+        return { ok: false, reason: 'boundaries' };
+      }
+    }
+
+    const logicalMarks = batch.logicalUnits.map((unit, index): LogicalChunkMeta => {
+      const startMediaSec = logicalStartMediaSec[index]!;
+      const endMediaSec = logicalStartMediaSec[index + 1] ?? mediaEndSec;
+      return {
+        mark: unit.mark,
+        logicalBoundary: { blockOffset: unit.blockOffset, mark: unit.mark },
+        boundaries: mappedBoundaries[index]!,
+        startMediaSec,
+        durationSec: endMediaSec - startMediaSec,
+      };
+    });
+    return {
+      ok: true,
+      chunk: {
+        buffer: prepared.buffer,
+        meta: { logicalMarks },
+        trimStartSec: prepared.trimStartSec,
+        trimmedDurationSec: prepared.trimmedDurationSec,
+        logicalBoundaryOffsetsSec,
+      },
+    };
   }
 
   #mapCompositeBoundaries(
@@ -1079,7 +1129,7 @@ export class BufferedTTSClient implements TTSClient {
   // screen off is fine) and tell the controller which word is being spoken.
   // The player reports original (rate-1.0) media time, so the boundary
   // ticks need no rescaling for trim or rate.
-  #startWordTracking(generation: number, chunkIndex: number, meta: ChunkMeta): void {
+  #startWordTracking(generation: number, chunkIndex: number, meta: LogicalChunkMeta): void {
     this.#stopWordTracking();
     const controller = this.controller;
     if (!controller) return;
@@ -1165,6 +1215,7 @@ export class BufferedTTSClient implements TTSClient {
 
   protected async stopInternal() {
     this.#stopWordTracking();
+    this.#activeLogicalMeta = null;
     this.#isPlaying = false;
     if (this.#activeGeneration !== null) {
       this.#activeGeneration = null;
@@ -1181,12 +1232,12 @@ export class BufferedTTSClient implements TTSClient {
     if (generation === null) return null;
     const pos = this.#player.getPlaybackPosition(generation);
     if (!pos) return null;
-    const meta = this.#chunkMeta[pos.chunkIndex];
-    if (!meta) return null;
-    // Trim-relative and clamped: the section timeline sums TRIMMED durations,
-    // while the player reports untrimmed media time (kept that way for word
-    // boundaries).
-    return Math.min(Math.max(pos.mediaTimeSec - meta.trimStartSec, 0), meta.trimmedDurationSec);
+    const active = this.#activeLogicalMeta;
+    if (!active || active.chunkIndex !== pos.chunkIndex) return null;
+    const { meta } = active;
+    // Logical-mark-relative and clamped: a composite is one physical audio
+    // chunk, while the section timeline still advances sentence by sentence.
+    return Math.min(Math.max(pos.mediaTimeSec - meta.startMediaSec, 0), meta.durationSec);
   }
 
   async setRate(rate: number) {
@@ -1320,7 +1371,10 @@ export class BufferedTTSClient implements TTSClient {
     return {
       wordBoundaries: true,
       mediaClock: true,
-      gapControl: true,
+      // A continuous composite cannot insert configurable silence at internal
+      // estimated boundaries without cutting speech. Established one-mark
+      // buffered clients still implement the setting exactly.
+      gapControl: !this.supportsBlockStreaming(),
       // The native player time-stretches live; the web path bakes the rate
       // into the scheduled buffers, so it needs a session restart.
       liveRateChange: this.#player instanceof NativeAudioPlayer,
