@@ -185,9 +185,20 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
   }, 120_000);
 
   afterAll(async () => {
-    const stop = page ? await visibleAriaTarget(page, 'Stop reading aloud') : null;
-    if (stop) await page.tap(stop.x, stop.y);
-    page?.close();
+    try {
+      if (page) {
+        const close = await visibleAriaTarget(page, 'Close', '#tts_player_sheet');
+        if (close) await page.tap(close.x, close.y);
+        const stop = await visibleAriaTarget(page, 'Stop reading aloud');
+        if (stop) await page.tap(stop.x, stop.y);
+      }
+    } finally {
+      page?.close();
+      // The package is an isolated debug build. Always terminate it even when
+      // a failed assertion leaves the sheet covering Stop, otherwise native
+      // synthesis survives CDP teardown and contaminates the next run.
+      await adbShell(`am force-stop ${APP_PKG}`);
+    }
   });
 
   it('selects, persists, schedules, and stops the buffered provider without retaining audio', async () => {
@@ -201,6 +212,17 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
         },
       );
     }
+
+    // This is a dedicated debug package, so seed a deterministic established
+    // provider before each run. A prior successful run leaves Buffered
+    // preferred; without this reset the test would re-select the active voice
+    // instead of exercising a real native -> buffered transition.
+    await page.evaluate<void>(`
+      localStorage.setItem(
+        'ttsPreferredVoices',
+        JSON.stringify({ preferredClient: 'native-tts' }),
+      );
+    `);
 
     // A real touch gesture is required to unlock WebAudio. Do not replace this
     // with element.click() or an app-bus dispatch: those do not carry browser

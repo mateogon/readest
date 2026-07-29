@@ -1114,8 +1114,11 @@ export class TTSController extends EventTarget {
   ) {
     await this.stop(true);
     this.#terminated = false;
-    this.#currentSpeakAbortController = new AbortController();
-    const { signal } = this.#currentSpeakAbortController;
+    const speakAbortController = new AbortController();
+    this.#currentSpeakAbortController = speakAbortController;
+    const { signal } = speakAbortController;
+    const ownsSpeakSession = () =>
+      !signal.aborted && this.#currentSpeakAbortController === speakAbortController;
 
     this.#currentSpeakPromise = new Promise(async (resolve, reject) => {
       try {
@@ -1128,6 +1131,10 @@ export class TTSController extends EventTarget {
         });
 
         ssml = await this.#preprocessSSML(await ssml);
+        if (!ownsSpeakSession()) {
+          resolve();
+          return;
+        }
         if (!ssml) {
           this.#nossmlCnt++;
           // FIXME: in case we are at the end of the book, need a better way to handle this
@@ -1142,7 +1149,9 @@ export class TTSController extends EventTarget {
               await this.#stopAtChapterBoundary();
               return;
             }
-            if (await this.#initTTSForNextSection()) {
+            const hasNextSection = await this.#initTTSForNextSection();
+            if (!ownsSpeakSession()) return;
+            if (hasNextSection) {
               await this.forward(false, true);
             } else {
               // End of book: nothing left to speak.
@@ -1158,6 +1167,7 @@ export class TTSController extends EventTarget {
 
         const { plainText, marks } = parseSSMLMarks(ssml);
         const streamsBlocks = !oneTime && this.#supportsBlockStreaming();
+        const sessionClient = this.ttsClient;
         let streamedBlocks: AsyncIterable<TTSBlockInput> | null = null;
         let streamedLiveTts: FoliateView['tts'] = null;
         const blockStreamState = { highestYieldedBlockOffset: -1 };
@@ -1187,20 +1197,28 @@ export class TTSController extends EventTarget {
           } else {
             this.dispatchSpeakMark(marks[0]);
             await this.preloadSSML(ssml, signal, 'next');
+            if (!ownsSpeakSession()) {
+              resolve();
+              return;
+            }
             void this.preloadNextSSML();
           }
         }
         // Only the native client surfaces an offline engine failure as a
         // terminal 'error' code (Edge/Web throw, which the catch below handles).
-        const canSkipOnError = this.ttsClient === this.ttsNativeClient;
+        const canSkipOnError = sessionClient === this.ttsNativeClient;
         const iter =
           streamsBlocks && streamedBlocks
-            ? await this.ttsClient.speakBlocks!(streamedBlocks, signal, transitionFromPrevious)
-            : await this.ttsClient.speak(ssml, signal, false, undefined, transitionFromPrevious);
+            ? await sessionClient.speakBlocks!(streamedBlocks, signal, transitionFromPrevious)
+            : await sessionClient.speak(ssml, signal, false, undefined, transitionFromPrevious);
+        if (!ownsSpeakSession()) {
+          resolve();
+          return;
+        }
         let lastEvent;
         let committedBlockOffset = 0;
         for await (const event of iter) {
-          if (signal.aborted) {
+          if (!ownsSpeakSession()) {
             resolve();
             return;
           }
@@ -1223,6 +1241,10 @@ export class TTSController extends EventTarget {
           }
           lastEvent = event;
         }
+        if (!ownsSpeakSession()) {
+          resolve();
+          return;
+        }
         if (streamsBlocks && lastEvent?.code !== 'end' && lastEvent?.code !== 'error') {
           throw new Error('Streamed TTS ended without a terminal event');
         }
@@ -1244,12 +1266,12 @@ export class TTSController extends EventTarget {
           this.#consecutiveSpeakErrors = 0;
           resolve();
           await this.#delayParagraphGap(signal);
-          if (signal.aborted) return;
+          if (!ownsSpeakSession()) return;
           await this.forward(false, true);
         } else if (
           lastCode === 'error' &&
           canSkipOnError &&
-          !signal.aborted &&
+          ownsSpeakSession() &&
           this.state === 'playing' &&
           !oneTime
         ) {
@@ -1274,7 +1296,7 @@ export class TTSController extends EventTarget {
         } else if (
           lastCode === 'error' &&
           !canSkipOnError &&
-          !signal.aborted &&
+          ownsSpeakSession() &&
           this.state === 'playing' &&
           !oneTime
         ) {
@@ -1295,8 +1317,12 @@ export class TTSController extends EventTarget {
           reject(e);
         }
       } finally {
-        if (this.#currentSpeakAbortController) {
-          this.#currentSpeakAbortController.abort();
+        // A stopped executor can outlive its already-resolved public promise
+        // while preprocessing or a provider call drains. If a replacement
+        // session starts meanwhile, this stale finally must not abort or clear
+        // the replacement's controller.
+        speakAbortController.abort();
+        if (this.#currentSpeakAbortController === speakAbortController) {
           this.#currentSpeakAbortController = null;
         }
       }
