@@ -39,6 +39,7 @@ interface StructuredPayload {
   composite?: unknown;
   compositesScheduled?: unknown;
   fallbackSessions?: unknown;
+  logicalMarksStarted?: unknown;
   currentBufferAheadMs?: unknown;
   retainedChunks?: unknown;
 }
@@ -135,7 +136,22 @@ const findBufferedVoiceTarget = (page: CdpPage) =>
   `);
 
 const bufferedE2E = process.env['READEST_ANDROID_BUFFERED_E2E'] === '1';
+const backgroundE2E = process.env['READEST_ANDROID_BUFFERED_BACKGROUND_E2E'] === '1';
 const androidEnv = bufferedE2E ? await detectAndroidEnv() : null;
+
+const getWakefulness = async (): Promise<string | null> => {
+  const output = await adbShell('dumpsys power');
+  return output.match(/mWakefulness=(\w+)/)?.[1] ?? null;
+};
+
+const wakeAndUnlock = async (): Promise<void> => {
+  await adbShell('input keyevent KEYCODE_WAKEUP');
+  await adbShell('wm dismiss-keyguard');
+  await waitFor(async () => ((await getWakefulness()) === 'Awake' ? true : null), {
+    timeoutMs: 15_000,
+    label: 'awake Android emulator',
+  });
+};
 
 describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP lane', () => {
   let page: CdpPage;
@@ -148,6 +164,9 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
     }
     if (!androidEnv) {
       throw new Error(`Android buffered E2E prerequisites missing for ${APP_PKG}`);
+    }
+    if (backgroundE2E && !androidEnv.serial.startsWith('emulator-')) {
+      throw new Error('Buffered background E2E is restricted to an Android emulator');
     }
     if (!existsSync(FIXTURE)) throw new Error(`fixture not found: ${FIXTURE}`);
 
@@ -193,6 +212,7 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
         if (stop) await page.tap(stop.x, stop.y);
       }
     } finally {
+      if (backgroundE2E && androidEnv) await wakeAndUnlock();
       page?.close();
       // The package is an isolated debug build. Always terminate it even when
       // a failed assertion leaves the sheet covering Stop, otherwise native
@@ -354,6 +374,46 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
         `(${String(runtimeEvidence.composite.payload.marks)} logical marks, 1 WebAudio chunk)`,
     );
 
+    if (backgroundE2E) {
+      const beforeScreenOffEntryCount = page.getConsoleEntries().length;
+      try {
+        await adbShell('input keyevent KEYCODE_SLEEP');
+        await waitFor(async () => ((await getWakefulness()) !== 'Awake' ? true : null), {
+          timeoutMs: 15_000,
+          label: 'non-awake Android emulator',
+        });
+        const backgroundEvidence = await waitFor(
+          async () => {
+            const entries = page.getConsoleEntries();
+            const newSchedules = parseStructuredEvents(entries, WEB_AUDIO_EVENT_PREFIX).filter(
+              ({ index, payload }) =>
+                index >= beforeScreenOffEntryCount && payload.event === 'scheduled',
+            );
+            const newComposites = parseStructuredEvents(entries, COMPOSITE_EVENT_PREFIX).filter(
+              ({ index, payload }) =>
+                index >= beforeScreenOffEntryCount && payload.event === 'scheduled',
+            );
+            return newSchedules.length >= 4 && newComposites.length > 0
+              ? { newSchedules, newComposites }
+              : null;
+          },
+          {
+            timeoutMs: 180_000,
+            intervalMs: 500,
+            label: 'screen-off WebAudio refill beyond hidden queue headroom',
+          },
+        );
+        expect(backgroundEvidence.newSchedules.length).toBeGreaterThanOrEqual(4);
+        expect(backgroundEvidence.newComposites.length).toBeGreaterThan(0);
+        console.info(
+          `[test:android] screen-off outcome: ${String(backgroundEvidence.newSchedules.length)} ` +
+            `new WebAudio chunks, ${String(backgroundEvidence.newComposites.length)} composites`,
+        );
+      } finally {
+        await wakeAndUnlock();
+      }
+    }
+
     await tapAria(page, 'Close', '#tts_player_sheet');
     const stop = await waitFor(() => visibleAriaTarget(page, 'Stop reading aloud'), {
       label: 'buffered mini-player Stop control',
@@ -377,6 +437,7 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
     const composite = finalMetrics.composite as StructuredPayload | undefined;
     expect(Number(composite?.compositesScheduled)).toBeGreaterThan(0);
     expect(composite?.fallbackSessions).toBe(0);
+    if (backgroundE2E) expect(Number(composite?.logicalMarksStarted)).toBeGreaterThan(2);
     expect(playback?.currentBufferAheadMs).toBe(0);
     expect(playback?.retainedChunks).toBe(0);
     const unexpectedExceptions = page
