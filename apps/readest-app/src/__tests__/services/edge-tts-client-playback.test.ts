@@ -352,6 +352,34 @@ describe('EdgeTTSClient Web Audio playback', () => {
     expect(ctx().sources.every((s) => s.stopped)).toBe(true);
   });
 
+  test('emits a final post-stop metrics snapshot after aborting playback', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const client = await startClient();
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+
+    client.invalidateSynthesis();
+    await client.stop();
+    await done;
+
+    const metricCalls = info.mock.calls.filter(
+      ([message]) => typeof message === 'string' && message.startsWith('[TTS][BufferedMetrics] '),
+    );
+    const payloads = metricCalls.map(([message]) =>
+      JSON.parse((message as string).slice('[TTS][BufferedMetrics] '.length)),
+    );
+    expect(metricCalls.every((call) => call.length === 1)).toBe(true);
+    expect(payloads.at(-1)).toMatchObject({
+      reason: 'stop',
+      playback: {
+        sessionsAborted: 1,
+        currentBufferAheadMs: 0,
+      },
+    });
+    info.mockRestore();
+  });
+
   test('a no-audio mark is skipped and the session continues', async () => {
     createAudioDataBehavior = async (text: string) => {
       if (text === 'First sentence.') throw new Error('No audio data received.');

@@ -98,6 +98,7 @@ export class BufferedTTSClient implements TTSClient {
   #rate = 1.0;
   #pitch = 1.0;
   #sentenceGapSec = DEFAULT_SENTENCE_GAP_SEC;
+  #paragraphGapSec = 0;
 
   // iOS plays natively (app-process AVPlayer): audio in the app's own audio
   // session makes Now Playing, pause-slot retention, AirPods routing, and the
@@ -203,6 +204,7 @@ export class BufferedTTSClient implements TTSClient {
     signal: AbortSignal,
     preload = false,
     preloadPriority: 'next' | 'prefetch' = 'prefetch',
+    continuesPreviousParagraph = false,
   ) {
     const { marks } = parseSSMLMarks(ssml, this.#primaryLang);
 
@@ -220,15 +222,21 @@ export class BufferedTTSClient implements TTSClient {
 
     // startSession before ensureContext: starting a session declares playback
     // intent, clearing any lingering user-pause so the context may resume.
-    const generation = this.#player.startSession((event: WebAudioPlayerEvent) => {
-      if (event.type === 'chunk-start') {
-        queue.push({ kind: 'chunk-start', index: event.chunkIndex });
-      } else if (event.type === 'session-end') {
-        queue.push({ kind: 'session-end' });
-      } else {
-        queue.push({ kind: 'error', message: event.message });
-      }
-    });
+    const generation = this.#player.startSession(
+      (event: WebAudioPlayerEvent) => {
+        if (event.type === 'chunk-start') {
+          queue.push({ kind: 'chunk-start', index: event.chunkIndex });
+        } else if (event.type === 'session-end') {
+          queue.push({ kind: 'session-end' });
+        } else {
+          queue.push({ kind: 'error', message: event.message });
+        }
+      },
+      {
+        continuesPreviousParagraph,
+        leadingGapSec: this.#paragraphGapSec / this.#rate,
+      },
+    );
     this.#activeGeneration = generation;
     await this.#player.ensureContext();
     this.#isPlaying = true;
@@ -544,12 +552,14 @@ export class BufferedTTSClient implements TTSClient {
     return true;
   }
 
-  async stop() {
+  async stop(preserveSynthesis = false) {
     await this.stopInternal();
+    if (!preserveSynthesis) this.#logSynthesisMetrics('stop');
   }
 
   invalidateSynthesis(): void {
     this.#synthesisCoordinator.advanceGeneration();
+    this.#logSynthesisMetrics('invalidate');
   }
 
   waitForSynthesisIdle(): Promise<void> {
@@ -557,7 +567,18 @@ export class BufferedTTSClient implements TTSClient {
   }
 
   getSynthesisMetrics() {
-    return this.#synthesisCoordinator.getMetrics();
+    return {
+      ...this.#synthesisCoordinator.getMetrics(),
+      ...(this.#player instanceof WebAudioPlayer
+        ? { playback: this.#player.getDiagnostics() }
+        : {}),
+    };
+  }
+
+  #logSynthesisMetrics(reason: 'invalidate' | 'stop'): void {
+    console.info(
+      `[TTS][BufferedMetrics] ${JSON.stringify({ client: this.name, reason, ...this.getSynthesisMetrics() })}`,
+    );
   }
 
   protected async stopInternal() {
@@ -601,6 +622,10 @@ export class BufferedTTSClient implements TTSClient {
     // pitch in [0.5 .. 1.5]).
     if (pitch !== this.#pitch) this.invalidateSynthesis();
     this.#pitch = pitch;
+  }
+
+  setParagraphGap(sec: number): void {
+    this.#paragraphGapSec = Math.max(0, sec);
   }
 
   async setVoice(voice: string) {

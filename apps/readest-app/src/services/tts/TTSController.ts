@@ -732,6 +732,7 @@ export class TTSController extends EventTarget {
   // DEFAULT_PARAGRAPH_GAP_SEC and #delayParagraphGap for where it's applied.
   setParagraphGap(sec: number): void {
     this.#paragraphGapSec = sec;
+    this.ttsClient.setParagraphGap?.(sec);
   }
 
   // Abortable delay inserted before auto-advancing to the next paragraph.
@@ -860,9 +861,13 @@ export class TTSController extends EventTarget {
     return await this.#initTTSForSection(prevIndex);
   }
 
-  async #handleNavigationWithSSML(ssml: string | undefined, isPlaying: boolean) {
+  async #handleNavigationWithSSML(
+    ssml: string | undefined,
+    isPlaying: boolean,
+    continuesPreviousParagraph = false,
+  ) {
     if (isPlaying) {
-      this.#speak(ssml);
+      this.#speak(ssml, false, continuesPreviousParagraph);
     } else {
       if (ssml) {
         const { marks } = parseSSMLMarks(ssml);
@@ -902,10 +907,14 @@ export class TTSController extends EventTarget {
     }
   }
 
-  async #handleNavigationWithoutSSML(initSection: () => Promise<boolean>, isPlaying: boolean) {
+  async #handleNavigationWithoutSSML(
+    initSection: () => Promise<boolean>,
+    isPlaying: boolean,
+    continuesPreviousParagraph = false,
+  ) {
     if (await initSection()) {
       if (isPlaying) {
-        this.#speak(this.#getTts()?.start());
+        this.#speak(this.#getTts()?.start(), false, continuesPreviousParagraph);
       } else {
         this.#getTts()?.start();
       }
@@ -994,7 +1003,11 @@ export class TTSController extends EventTarget {
     return ssml;
   }
 
-  async #speak(ssml: string | undefined | Promise<string>, oneTime = false) {
+  async #speak(
+    ssml: string | undefined | Promise<string>,
+    oneTime = false,
+    continuesPreviousParagraph = false,
+  ) {
     await this.stop(true);
     this.#terminated = false;
     this.#currentSpeakAbortController = new AbortController();
@@ -1053,7 +1066,13 @@ export class TTSController extends EventTarget {
         // Only the native client surfaces an offline engine failure as a
         // terminal 'error' code (Edge/Web throw, which the catch below handles).
         const canSkipOnError = this.ttsClient === this.ttsNativeClient;
-        const iter = await this.ttsClient.speak(ssml, signal);
+        const iter = await this.ttsClient.speak(
+          ssml,
+          signal,
+          false,
+          undefined,
+          continuesPreviousParagraph,
+        );
         let lastCode;
         for await (const { code } of iter) {
           if (signal.aborted) {
@@ -1184,7 +1203,7 @@ export class TTSController extends EventTarget {
     if (this.#currentSpeakAbortController) {
       this.#currentSpeakAbortController.abort();
     }
-    await this.ttsClient.stop().catch((e) => this.error(e));
+    await this.ttsClient.stop(preserveSynthesis).catch((e) => this.error(e));
 
     if (this.#currentSpeakPromise) {
       const timeout = new Promise((_, reject) =>
@@ -1236,9 +1255,13 @@ export class TTSController extends EventTarget {
       if (isAutoAdvance && isPlaying && this.stopAtChapterEnd) {
         return await this.#stopAtChapterBoundary();
       }
-      await this.#handleNavigationWithoutSSML(() => this.#initTTSForNextSection(), isPlaying);
+      await this.#handleNavigationWithoutSSML(
+        () => this.#initTTSForNextSection(),
+        isPlaying,
+        isAutoAdvance,
+      );
     } else {
-      await this.#handleNavigationWithSSML(ssml, isPlaying);
+      await this.#handleNavigationWithSSML(ssml, isPlaying, isAutoAdvance);
     }
   }
 
@@ -1318,6 +1341,7 @@ export class TTSController extends EventTarget {
     if (this.#sentenceGapSec !== undefined) {
       this.ttsClient.setSentenceGap?.(this.#sentenceGapSec);
     }
+    this.ttsClient.setParagraphGap?.(this.#paragraphGapSec);
     TTSUtils.setPreferredClient(this.ttsClient.name);
     TTSUtils.setPreferredVoice(this.ttsClient.name, lang, voiceId);
     await this.ttsClient.setVoice(voiceId);

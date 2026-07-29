@@ -1,5 +1,6 @@
 import { TTSGranularity, TTSVoice, TTSVoicesGroup } from './types';
 import type { SynthesisCoordinatorMetrics } from './SynthesisCoordinator';
+import type { WebAudioPlayerDiagnostics } from './WebAudioPlayer';
 
 type TTSMessageCode = 'boundary' | 'error' | 'end';
 
@@ -7,6 +8,10 @@ export interface TTSMessageEvent {
   code: TTSMessageCode;
   message?: string;
   mark?: string;
+}
+
+export interface TTSRuntimeMetrics extends SynthesisCoordinatorMetrics {
+  playback?: WebAudioPlayerDiagnostics;
 }
 
 // What the active engine can actually do, so the controller and UI degrade
@@ -40,10 +45,11 @@ export interface TTSClient {
     signal: AbortSignal,
     preload?: boolean,
     preloadPriority?: 'next' | 'prefetch',
+    continuesPreviousParagraph?: boolean,
   ): AsyncIterable<TTSMessageEvent>;
   pause(): Promise<boolean>;
   resume(): Promise<boolean>;
-  stop(): Promise<void>;
+  stop(preserveSynthesis?: boolean): Promise<void>;
   // Drop queued/prepared synthesis after a logical navigation or acoustic
   // configuration change. Pause/resume and sequential auto-advance preserve it.
   invalidateSynthesis?(): void;
@@ -52,12 +58,15 @@ export interface TTSClient {
   // await this before applying the next client's mutable configuration.
   waitForSynthesisIdle?(): Promise<void>;
   // Structured, text-free counters for live buffer diagnostics.
-  getSynthesisMetrics?(): SynthesisCoordinatorMetrics;
+  getSynthesisMetrics?(): TTSRuntimeMetrics;
   setPrimaryLang(lang: string): void;
   setRate(rate: number): Promise<void>;
   setPitch(pitch: number): Promise<void>;
   setVoice(voice: string): Promise<void>;
   setSentenceGap?(sec: number): void;
+  // Diagnostic copy of the controller-owned inter-paragraph delay. Buffered
+  // players use it only to separate intentional silence from underrun.
+  setParagraphGap?(sec: number): void;
   getAllVoices(): Promise<TTSVoice[]>;
   getVoices(lang: string): Promise<TTSVoicesGroup[]>;
   getGranularities(): TTSGranularity[];

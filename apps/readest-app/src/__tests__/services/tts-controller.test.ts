@@ -16,7 +16,10 @@ vi.mock('@/services/tts/WebSpeechClient', () => ({
 
 vi.mock('@/services/tts/EdgeTTSClient', () => ({
   EdgeTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
-    Object.assign(this, createMockTTSClient('edge'), { setSentenceGap: vi.fn() });
+    Object.assign(this, createMockTTSClient('edge'), {
+      setSentenceGap: vi.fn(),
+      setParagraphGap: vi.fn(),
+    });
   }),
 }));
 
@@ -28,7 +31,9 @@ vi.mock('@/services/tts/NativeTTSClient', () => ({
 
 vi.mock('@/services/tts/BufferedTTSClient', () => ({
   BufferedTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
-    Object.assign(this, createMockTTSClient('android-system-buffered'));
+    Object.assign(this, createMockTTSClient('android-system-buffered'), {
+      setParagraphGap: vi.fn(),
+    });
   }),
 }));
 
@@ -486,6 +491,15 @@ describe('TTSController', () => {
     });
   });
 
+  describe('setParagraphGap', () => {
+    test('delegates to the active buffered client', () => {
+      controller.ttsClient = controller.ttsEdgeClient;
+      controller.setParagraphGap(0.75);
+
+      expect(controller.ttsEdgeClient.setParagraphGap).toHaveBeenCalledWith(0.75);
+    });
+  });
+
   describe('setVoice', () => {
     test('applies the stored sentence gap when switching buffered clients', async () => {
       controller.ttsClient = controller.ttsEdgeClient;
@@ -529,6 +543,7 @@ describe('TTSController', () => {
     test('switches to the buffered Android client for its namespaced voice', async () => {
       const c = new TTSController(createMockAppService(true), mockView);
       await c.init();
+      c.setParagraphGap(0.6);
       c.ttsAndroidBufferedVoices = [
         {
           id: 'android-buffered:engine_en_voice',
@@ -541,6 +556,7 @@ describe('TTSController', () => {
 
       expect(c.ttsClient.name).toBe('android-system-buffered');
       expect(c.ttsClient.setRate).toHaveBeenCalledWith(1);
+      expect(c.ttsClient.setParagraphGap).toHaveBeenCalledWith(0.6);
       expect(TTSUtils.setPreferredClient).toHaveBeenCalledWith('android-system-buffered');
     });
 
@@ -1329,6 +1345,9 @@ describe('TTSController', () => {
       // here since nothing was ever spoken for the new section.
       expect(controller.state).toBe('forward-paused');
       expect(stopKeepAlive).toHaveBeenCalled();
+      expect(
+        vi.mocked(controller.ttsClient.speak).mock.calls.some((call) => call[2] === false),
+      ).toBe(false);
     });
 
     test('auto-advance crosses the boundary normally when the mode is off', async () => {
@@ -1340,6 +1359,13 @@ describe('TTSController', () => {
       expect(sectionOpened(1)).toBe(true);
       expect(controller.state).toBe('playing');
       expect(controller.ttsClient.invalidateSynthesis).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() =>
+        expect(
+          vi
+            .mocked(controller.ttsClient.speak)
+            .mock.calls.some((call) => call[2] === false && call[4] === true),
+        ).toBe(true),
+      );
     });
 
     test('a user skip still crosses the boundary while the mode is armed', async () => {
@@ -1353,6 +1379,13 @@ describe('TTSController', () => {
 
       expect(sectionOpened(1)).toBe(true);
       expect(controller.state).toBe('playing');
+      await vi.waitFor(() =>
+        expect(
+          vi
+            .mocked(controller.ttsClient.speak)
+            .mock.calls.some((call) => call[2] === false && call[4] === false),
+        ).toBe(true),
+      );
     });
 
     test('a user next-sentence skip still crosses the boundary', async () => {
@@ -1496,6 +1529,13 @@ describe('TTSController', () => {
       await controller.forward(false, true);
 
       expect(controller.ttsClient.invalidateSynthesis).not.toHaveBeenCalled();
+      await vi.waitFor(() =>
+        expect(
+          vi
+            .mocked(controller.ttsClient.speak)
+            .mock.calls.some((call) => call[2] === false && call[4] === true),
+        ).toBe(true),
+      );
     });
 
     test('manual forward invalidates prepared synthesis', async () => {
@@ -1511,6 +1551,13 @@ describe('TTSController', () => {
       await controller.forward(false, false);
 
       expect(controller.ttsClient.invalidateSynthesis).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() =>
+        expect(
+          vi
+            .mocked(controller.ttsClient.speak)
+            .mock.calls.some((call) => call[2] === false && call[4] === false),
+        ).toBe(true),
+      );
     });
 
     test('forward sets forward-paused state when not playing', async () => {
@@ -1544,7 +1591,7 @@ describe('TTSController', () => {
   describe('stop', () => {
     test('calls ttsClient.stop', async () => {
       await controller.stop();
-      expect(controller.ttsClient.stop).toHaveBeenCalled();
+      expect(controller.ttsClient.stop).toHaveBeenCalledWith(false);
     });
 
     test('sets state to stopped', async () => {
@@ -1561,6 +1608,7 @@ describe('TTSController', () => {
     test('preserves prepared synthesis during a sequential transition', async () => {
       await controller.stop(true);
       expect(controller.ttsClient.invalidateSynthesis).not.toHaveBeenCalled();
+      expect(controller.ttsClient.stop).toHaveBeenCalledWith(true);
     });
 
     test('handles client stop errors gracefully', async () => {

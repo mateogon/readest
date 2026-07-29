@@ -75,13 +75,17 @@ const logSynthesisEvent = (
   operation: SpeechSynthesisContext,
   details: Record<string, string | number | boolean> = {},
 ): void => {
-  console.info('[TTS][AndroidBuffered]', {
-    event,
-    sessionId: operation.sessionId,
-    requestId: operation.requestId,
-    generation: operation.generation,
-    ...details,
-  });
+  // Android's WebView logger stringifies object arguments as "[object Object]".
+  // Emit one explicit JSON payload so ADB captures remain machine-readable.
+  console.info(
+    `[TTS][AndroidBuffered] ${JSON.stringify({
+      event,
+      sessionId: operation.sessionId,
+      requestId: operation.requestId,
+      generation: operation.generation,
+      ...details,
+    })}`,
+  );
 };
 
 // Android TextToSpeech as a rate-1.0 file-synthesis provider. Scheduling,

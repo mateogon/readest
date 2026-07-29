@@ -78,17 +78,55 @@ interface ScheduledChunk {
   startTime: number;
   duration: number;
   timing: ChunkTiming;
+  transitionKind: 'sentence' | 'paragraph' | null;
+  unplannedGapMs: number | null;
   ended: boolean;
 }
 
 interface PlayerSession {
   generation: number;
   onEvent: (event: WebAudioPlayerEvent) => void;
+  leadingGapSec: number;
+  continuesPreviousParagraph: boolean;
   chunks: ScheduledChunk[];
   nextStartTime: number;
   ended: boolean;
   endedEmitted: boolean;
   waiters: Array<(ready: boolean) => void>;
+}
+
+export interface TransitionGapDiagnostics {
+  transitions: number;
+  gapsOver50Ms: number;
+  gapsOver500Ms: number;
+  unplannedGapMsP50: number;
+  unplannedGapMsP95: number;
+  unplannedGapMsP99: number;
+  unplannedGapMsMax: number;
+}
+
+export interface WebAudioPlayerDiagnostics {
+  sessionsStarted: number;
+  sessionsCompleted: number;
+  sessionsAborted: number;
+  // Admission count; unlike transition samples, a later abort can make a
+  // scheduled chunk inaudible.
+  scheduledChunks: number;
+  // Samples are committed only from onended, after the target chunk played.
+  sentenceGaps: TransitionGapDiagnostics;
+  paragraphGaps: TransitionGapDiagnostics;
+  // Scheduled playout horizon through the end of the last audible buffer;
+  // intentionally excludes trailing silence and synthesis/cache lookahead.
+  currentBufferAheadMs: number;
+  maxBufferAheadMs: number;
+}
+
+export interface WebAudioSessionOptions {
+  // Controller-owned context: true only for uninterrupted automatic
+  // paragraph advance. Manual starts, seeks, and chapter resumes pass false.
+  continuesPreviousParagraph?: boolean;
+  // Intentional inter-paragraph silence, already scaled for playback rate.
+  leadingGapSec?: number;
 }
 
 // Small offset so start() never lands in the past between the read of
@@ -100,6 +138,24 @@ const MAX_PENDING_VISIBLE = 2;
 const MAX_PENDING_HIDDEN = 5;
 // Bounds decoded PCM at slow rates (0.2x stretches a 30s sentence to 150s).
 const MAX_AHEAD_SEC = 60;
+const MAX_GAP_SAMPLES = 2048;
+
+const nearestRank = (values: number[], percentile: number): number => {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.max(0, Math.ceil(sorted.length * percentile) - 1);
+  return sorted[index] ?? 0;
+};
+
+const summarizeGaps = (values: number[]): TransitionGapDiagnostics => ({
+  transitions: values.length,
+  gapsOver50Ms: values.filter((gap) => gap > 50).length,
+  gapsOver500Ms: values.filter((gap) => gap > 500).length,
+  unplannedGapMsP50: Math.round(nearestRank(values, 0.5)),
+  unplannedGapMsP95: Math.round(nearestRank(values, 0.95)),
+  unplannedGapMsP99: Math.round(nearestRank(values, 0.99)),
+  unplannedGapMsMax: Math.round(values.reduce((max, gap) => Math.max(max, gap), 0)),
+});
 
 let sharedContext: TTSAudioContext | null = null;
 
@@ -185,6 +241,14 @@ export class WebAudioPlayer implements TTSAudioPlayer {
   #generation = 0;
   #session: PlayerSession | null = null;
   #userPaused = false;
+  #sessionsStarted = 0;
+  #sessionsCompleted = 0;
+  #sessionsAborted = 0;
+  #scheduledChunks = 0;
+  #sentenceGapMs: number[] = [];
+  #paragraphGapMs: number[] = [];
+  #lastAudibleEndSec: number | null = null;
+  #maxBufferAheadMs = 0;
 
   constructor(createContext?: () => TTSAudioContext) {
     this.#createContext = createContext ?? getSharedContext;
@@ -214,12 +278,20 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     return buffer;
   }
 
-  startSession(onEvent: (event: WebAudioPlayerEvent) => void): number {
+  startSession(
+    onEvent: (event: WebAudioPlayerEvent) => void,
+    options: WebAudioSessionOptions = {},
+  ): number {
     this.abortSession();
     const generation = ++this.#generation;
+    this.#sessionsStarted += 1;
+    const continuesPreviousParagraph = options.continuesPreviousParagraph === true;
+    if (!continuesPreviousParagraph) this.#lastAudibleEndSec = null;
     this.#session = {
       generation,
       onEvent,
+      leadingGapSec: Math.max(0, options.leadingGapSec ?? 0),
+      continuesPreviousParagraph,
       chunks: [],
       nextStartTime: 0,
       ended: false,
@@ -234,7 +306,21 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const session = this.#session;
     const ctx = this.#ctx;
     if (!session || session.generation !== generation || !ctx) return;
+    const transitionKind =
+      session.chunks.length > 0
+        ? 'sentence'
+        : session.continuesPreviousParagraph && this.#lastAudibleEndSec !== null
+          ? 'paragraph'
+          : null;
+    const targetStart =
+      transitionKind === 'sentence'
+        ? session.nextStartTime
+        : transitionKind === 'paragraph'
+          ? this.#lastAudibleEndSec! + session.leadingGapSec
+          : null;
     const start = Math.max(session.nextStartTime, ctx.currentTime + SCHEDULE_SAFETY_SEC);
+    const unplannedGapMs = targetStart === null ? null : Math.max(0, start - targetStart) * 1000;
+    if (session.chunks.length === 0) this.#lastAudibleEndSec = null;
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
@@ -244,14 +330,37 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       startTime: start,
       duration: buffer.duration,
       timing,
+      transitionKind,
+      unplannedGapMs,
       ended: false,
     };
     source.onended = () => this.#handleChunkEnded(session, chunk);
     session.chunks.push(chunk);
     session.nextStartTime = start + buffer.duration + Math.max(0, timing.gapSec);
+    this.#scheduledChunks += 1;
+    const bufferAheadMs = Math.max(0, start + buffer.duration - ctx.currentTime) * 1000;
+    this.#maxBufferAheadMs = Math.max(this.#maxBufferAheadMs, bufferAheadMs);
     source.start(start);
-    console.log(
-      `[TTS] schedule ${generation}:${chunk.index} at ${start.toFixed(2)} dur ${buffer.duration.toFixed(2)}`,
+    console.info(
+      `[TTS][WebAudio] ${JSON.stringify({
+        event: 'scheduled',
+        generation,
+        chunkIndex: chunk.index,
+        startSec: Number(start.toFixed(3)),
+        durationSec: Number(buffer.duration.toFixed(3)),
+        transitionKind,
+        configuredGapMs:
+          transitionKind === null
+            ? null
+            : Math.round(
+                Math.max(
+                  0,
+                  transitionKind === 'paragraph' ? session.leadingGapSec : timing.gapSec,
+                ) * 1000,
+              ),
+        unplannedGapMs: unplannedGapMs === null ? null : Math.round(unplannedGapMs),
+        bufferAheadMs: Math.round(bufferAheadMs),
+      })}`,
     );
     if (chunk.index === 0) {
       session.onEvent({ type: 'chunk-start', chunkIndex: 0 });
@@ -272,6 +381,10 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const session = this.#session;
     if (!session) return;
     this.#session = null;
+    if (!session.endedEmitted) {
+      this.#sessionsAborted += 1;
+      this.#lastAudibleEndSec = null;
+    }
     for (const chunk of session.chunks) {
       chunk.source.onended = null;
       try {
@@ -288,7 +401,27 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const waiters = session.waiters;
     session.waiters = [];
     for (const waiter of waiters) waiter(false);
-    console.log(`[TTS] session ${session.generation} abort`);
+    console.log(
+      `[TTS] session ${session.generation} ${session.endedEmitted ? 'release' : 'abort'}`,
+    );
+  }
+
+  getDiagnostics(): WebAudioPlayerDiagnostics {
+    const lastChunk = this.#session?.chunks.at(-1);
+    const currentBufferAheadMs =
+      lastChunk && this.#ctx
+        ? Math.max(0, lastChunk.startTime + lastChunk.duration - this.#ctx.currentTime) * 1000
+        : 0;
+    return {
+      sessionsStarted: this.#sessionsStarted,
+      sessionsCompleted: this.#sessionsCompleted,
+      sessionsAborted: this.#sessionsAborted,
+      scheduledChunks: this.#scheduledChunks,
+      sentenceGaps: summarizeGaps(this.#sentenceGapMs),
+      paragraphGaps: summarizeGaps(this.#paragraphGapMs),
+      currentBufferAheadMs: Math.round(currentBufferAheadMs),
+      maxBufferAheadMs: Math.round(this.#maxBufferAheadMs),
+    };
   }
 
   async waitUntilReady(generation: number): Promise<boolean> {
@@ -373,6 +506,12 @@ export class WebAudioPlayer implements TTSAudioPlayer {
   #handleChunkEnded(session: PlayerSession, chunk: ScheduledChunk): void {
     if (this.#session !== session) return;
     chunk.ended = true;
+    this.#lastAudibleEndSec = chunk.startTime + chunk.duration;
+    if (chunk.transitionKind !== null && chunk.unplannedGapMs !== null) {
+      const gaps = chunk.transitionKind === 'sentence' ? this.#sentenceGapMs : this.#paragraphGapMs;
+      gaps.push(chunk.unplannedGapMs);
+      if (gaps.length > MAX_GAP_SAMPLES) gaps.shift();
+    }
     const waiters = session.waiters;
     session.waiters = [];
     for (const waiter of waiters) waiter(true);
@@ -387,6 +526,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     if (!session.ended || session.endedEmitted) return;
     if (session.chunks.some((c) => !c.ended)) return;
     session.endedEmitted = true;
+    this.#sessionsCompleted += 1;
     session.onEvent({ type: 'session-end' });
   }
 

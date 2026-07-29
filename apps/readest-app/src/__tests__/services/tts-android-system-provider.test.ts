@@ -118,6 +118,7 @@ describe('AndroidSystemSpeechProvider', () => {
   });
 
   test('performs one atomic native synthesis and reads the resulting asset as bytes', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
     const provider = new AndroidSystemSpeechProvider();
     await provider.init();
 
@@ -151,6 +152,26 @@ describe('AndroidSystemSpeechProvider', () => {
     expect(Array.from(new Uint8Array(result.audio))).toEqual([82, 73, 70, 70]);
     expect(result.durationSec).toBe(1);
     expect(result.boundaries).toEqual([{ offset: 0, duration: 10_000_000, text: 'Hello' }]);
+    const diagnosticCalls = info.mock.calls.filter(
+      ([message]) => typeof message === 'string' && message.startsWith('[TTS][AndroidBuffered] '),
+    );
+    const diagnosticPayloads = diagnosticCalls.map(([message]) =>
+      JSON.parse((message as string).slice('[TTS][AndroidBuffered] '.length)),
+    );
+    expect(diagnosticPayloads).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'native-start',
+          sessionId: context.sessionId,
+          requestId: context.requestId,
+          generation: context.generation,
+        }),
+        expect.objectContaining({ event: 'bridge-completed' }),
+      ]),
+    );
+    expect(diagnosticCalls.every((call) => call.length === 1)).toBe(true);
+    expect(diagnosticCalls.every(([message]) => !(message as string).includes('Hello'))).toBe(true);
+    info.mockRestore();
   });
 
   test('rejects oversized input permanently without starting native synthesis', async () => {
