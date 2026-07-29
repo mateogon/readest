@@ -135,6 +135,7 @@ export class TTSController extends EventTarget {
   #preloadAbortController: AbortController | null = null;
   #preloadRunning = false;
   #preloadRunId = 0;
+  #pendingPreloadCount: number | null = null;
 
   #ttsSectionIndex: number = -1;
 
@@ -931,6 +932,7 @@ export class TTSController extends EventTarget {
     this.#preloadAbortController?.abort();
     this.#preloadAbortController = null;
     this.#preloadRunning = false;
+    this.#pendingPreloadCount = null;
     this.#preloadRunId += 1;
   }
 
@@ -945,7 +947,11 @@ export class TTSController extends EventTarget {
   }
 
   async preloadNextSSML(count: number = 4) {
-    if (this.#preloadRunning) return;
+    if (this.#preloadRunning) {
+      this.#pendingPreloadCount =
+        this.#pendingPreloadCount === null ? count : Math.max(this.#pendingPreloadCount, count);
+      return;
+    }
     const tts = this.#getTts();
     if (!tts) return;
     this.#preloadRunning = true;
@@ -978,7 +984,14 @@ export class TTSController extends EventTarget {
       }
       await Promise.all(ssmls.map((ssml) => this.preloadSSML(ssml, signal, 'prefetch')));
     } finally {
-      if (runId === this.#preloadRunId) this.#preloadRunning = false;
+      if (runId === this.#preloadRunId) {
+        this.#preloadRunning = false;
+        const pendingCount = this.#pendingPreloadCount;
+        this.#pendingPreloadCount = null;
+        if (pendingCount !== null && !signal.aborted) {
+          await this.preloadNextSSML(pendingCount);
+        }
+      }
     }
   }
 

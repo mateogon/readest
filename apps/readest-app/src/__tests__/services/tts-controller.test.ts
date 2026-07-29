@@ -1831,6 +1831,86 @@ describe('TTSController', () => {
       await pending;
     });
 
+    test('coalesces refill requests and reruns from the current TTS cursor', async () => {
+      let cursor = 0;
+      const next = vi.fn().mockImplementation(() => `<speak>chunk-${cursor++}</speak>`);
+      mockView.tts = {
+        next,
+        prev: vi.fn().mockImplementation(() => {
+          cursor -= 1;
+        }),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      let releaseFirst!: () => void;
+      const firstPending = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* (ssml) {
+        if (ssml === '<speak>chunk-0</speak>') await firstPending;
+        yield { code: 'end' } as TTSMessageEvent;
+      });
+
+      const firstRun = controller.preloadNextSSML(1);
+      await vi.waitFor(() => expect(controller.ttsClient.speak).toHaveBeenCalledTimes(1));
+
+      // Playback advances while the first speculative synthesis is still in
+      // flight. Multiple refill requests collapse to one run using the larger
+      // requested window, starting from the cursor at refill time.
+      cursor = 10;
+      void controller.preloadNextSSML(2);
+      void controller.preloadNextSSML(3);
+      releaseFirst();
+      await firstRun;
+
+      expect(next).toHaveBeenCalledTimes(4);
+      expect(vi.mocked(controller.ttsClient.speak).mock.calls.map(([ssml]) => ssml)).toEqual([
+        '<speak>chunk-0</speak>',
+        '<speak>chunk-10</speak>',
+        '<speak>chunk-11</speak>',
+        '<speak>chunk-12</speak>',
+      ]);
+    });
+
+    test('terminal cancellation clears a queued refill and stale completion cannot restart it', async () => {
+      let cursor = 0;
+      mockView.tts = {
+        next: vi.fn().mockImplementation(() => `<speak>chunk-${cursor++}</speak>`),
+        prev: vi.fn().mockImplementation(() => {
+          cursor -= 1;
+        }),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      let firstSignal: AbortSignal | undefined;
+      let invocation = 0;
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* (_ssml, signal) {
+        invocation += 1;
+        if (invocation === 1) {
+          firstSignal = signal;
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) =>
+              signal.addEventListener('abort', () => resolve(), { once: true }),
+            );
+          }
+        }
+        yield { code: 'end' } as TTSMessageEvent;
+      });
+
+      const firstRun = controller.preloadNextSSML(1);
+      await vi.waitFor(() => expect(firstSignal).toBeDefined());
+      void controller.preloadNextSSML(3);
+
+      await controller.stop();
+      await firstRun;
+
+      expect(firstSignal!.aborted).toBe(true);
+      expect(controller.ttsClient.speak).toHaveBeenCalledTimes(1);
+
+      // A later explicit request starts cleanly; it must not inherit the
+      // cancelled refill count after the stale run's finally block executes.
+      await controller.preloadNextSSML(1);
+      expect(controller.ttsClient.speak).toHaveBeenCalledTimes(2);
+    });
+
     test('starts speculative SSML preloads concurrently after the range snapshot', async () => {
       mockView.tts = {
         next: vi.fn().mockReturnValue('<speak>chunk</speak>'),
