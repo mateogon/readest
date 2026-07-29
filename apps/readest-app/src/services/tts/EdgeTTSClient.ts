@@ -34,7 +34,7 @@ export class EdgeTTSClient extends BufferedTTSClient {
         () => controller?.bookKey?.split('-')[0] || null,
         cacheConfig.budgetMB * 1024 * 1024,
       );
-      provider = new CachingProvider(edgeProvider, store);
+      provider = new CachingProvider(edgeProvider, store, { readLegacyV1: true });
     }
     super(provider, controller, appService);
     this.#edgeProvider = edgeProvider;

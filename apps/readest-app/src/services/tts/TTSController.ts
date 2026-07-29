@@ -121,6 +121,7 @@ export class TTSController extends EventTarget {
   // continuation (see forward()'s isAutoAdvance), never user navigation.
   stopAtChapterEnd: boolean = false;
   #paragraphGapSec: number = DEFAULT_PARAGRAPH_GAP_SEC;
+  #sentenceGapSec: number | undefined;
   #nossmlCnt: number = 0;
   // Consecutive native-TTS utterances that ended in a terminal 'error' without
   // a successful 'end' in between. Reset on success; caps skip-on-error so a
@@ -128,6 +129,9 @@ export class TTSController extends EventTarget {
   #consecutiveSpeakErrors: number = 0;
   #currentSpeakAbortController: AbortController | null = null;
   #currentSpeakPromise: Promise<void> | null = null;
+  #preloadAbortController: AbortController | null = null;
+  #preloadRunning = false;
+  #preloadRunId = 0;
 
   #ttsSectionIndex: number = -1;
 
@@ -686,11 +690,13 @@ export class TTSController extends EventTarget {
     return this.ttsClient.getCapabilities().gapControl;
   }
 
-  // Passthrough to the Edge client's inter-sentence gap. ttsEdgeClient is
-  // always a constructed instance, whether or not it's the currently active
-  // client (same as supportsPlaybackInfo/supportsGapControl's comparison).
+  getSynthesisMetrics() {
+    return this.ttsClient.getSynthesisMetrics?.() ?? null;
+  }
+
   setSentenceGap(sec: number): void {
-    this.ttsEdgeClient.setSentenceGap(sec);
+    this.#sentenceGapSec = sec;
+    this.ttsClient.setSentenceGap?.(sec);
   }
 
   // Universal (not Edge-only) paragraph-to-paragraph gap. See
@@ -882,38 +888,59 @@ export class TTSController extends EventTarget {
     }
   }
 
-  async preloadSSML(ssml: string | undefined, signal: AbortSignal) {
+  #cancelPreloads(): void {
+    this.#preloadAbortController?.abort();
+    this.#preloadAbortController = null;
+    this.#preloadRunning = false;
+    this.#preloadRunId += 1;
+  }
+
+  async preloadSSML(
+    ssml: string | undefined,
+    signal: AbortSignal,
+    priority: 'next' | 'prefetch' = 'prefetch',
+  ) {
     if (!ssml) return;
-    const iter = await this.ttsClient.speak(ssml, signal, true);
+    const iter = await this.ttsClient.speak(ssml, signal, true, priority);
     for await (const _ of iter);
   }
 
   async preloadNextSSML(count: number = 4) {
+    if (this.#preloadRunning) return;
     const tts = this.#getTts();
     if (!tts) return;
+    this.#preloadRunning = true;
+    const runId = ++this.#preloadRunId;
+    this.#preloadAbortController ??= new AbortController();
+    const { signal } = this.#preloadAbortController;
 
-    // Gather all next SSMLs and rewind synchronously to avoid a race condition:
-    // tts.next() replaces TTS.#ranges (used by setMark() during playback).
-    // If async gaps exist between next()/prev() calls, a concurrent #speak()
-    // can dispatch marks against the wrong #ranges, causing incorrect highlights
-    // and accidental page turns.
-    const rawSsmls: string[] = [];
-    for (let i = 0; i < count; i++) {
-      const ssml = tts.next();
-      if (!ssml) break;
-      rawSsmls.push(ssml);
-    }
-    for (let i = 0; i < rawSsmls.length; i++) {
-      tts.prev();
-    }
+    try {
+      // Gather all next SSMLs and rewind synchronously to avoid a race condition:
+      // tts.next() replaces TTS.#ranges (used by setMark() during playback).
+      // If async gaps exist between next()/prev() calls, a concurrent #speak()
+      // can dispatch marks against the wrong #ranges, causing incorrect highlights
+      // and accidental page turns.
+      const rawSsmls: string[] = [];
+      for (let i = 0; i < count; i++) {
+        const ssml = tts.next();
+        if (!ssml) break;
+        rawSsmls.push(ssml);
+      }
+      for (let i = 0; i < rawSsmls.length; i++) {
+        tts.prev();
+      }
 
-    const ssmls: string[] = [];
-    for (const raw of rawSsmls) {
-      const ssml = await this.#preprocessSSML(raw);
-      if (!ssml) break;
-      ssmls.push(ssml);
+      const ssmls: string[] = [];
+      for (const raw of rawSsmls) {
+        if (signal.aborted) break;
+        const ssml = await this.#preprocessSSML(raw);
+        if (!ssml || signal.aborted) break;
+        ssmls.push(ssml);
+      }
+      await Promise.all(ssmls.map((ssml) => this.preloadSSML(ssml, signal, 'prefetch')));
+    } finally {
+      if (runId === this.#preloadRunId) this.#preloadRunning = false;
     }
-    await Promise.all(ssmls.map((ssml) => this.preloadSSML(ssml, new AbortController().signal)));
   }
 
   async #preprocessSSML(ssml?: string) {
@@ -939,7 +966,7 @@ export class TTSController extends EventTarget {
   }
 
   async #speak(ssml: string | undefined | Promise<string>, oneTime = false) {
-    await this.stop();
+    await this.stop(true);
     this.#terminated = false;
     this.#currentSpeakAbortController = new AbortController();
     const { signal } = this.#currentSpeakAbortController;
@@ -991,7 +1018,8 @@ export class TTSController extends EventTarget {
           } else {
             this.dispatchSpeakMark(marks[0]);
           }
-          await this.preloadSSML(ssml, signal);
+          await this.preloadSSML(ssml, signal, 'next');
+          void this.preloadNextSSML();
         }
         // Only the native client surfaces an offline engine failure as a
         // terminal 'error' code (Edge/Web throw, which the catch below handles).
@@ -1080,10 +1108,7 @@ export class TTSController extends EventTarget {
         }
       })
       .catch((e) => this.error(e));
-    if (!oneTime) {
-      this.preloadNextSSML();
-      this.dispatchSpeakMark();
-    }
+    if (!oneTime) this.dispatchSpeakMark();
   }
 
   play() {
@@ -1106,7 +1131,6 @@ export class TTSController extends EventTarget {
       this.resume();
     }
     this.#speak(ssml);
-    this.preloadNextSSML();
   }
 
   async pause() {
@@ -1123,7 +1147,11 @@ export class TTSController extends EventTarget {
     await this.ttsClient.resume().catch((e) => this.error(e));
   }
 
-  async stop() {
+  async stop(preserveSynthesis = false) {
+    if (!preserveSynthesis) {
+      this.#cancelPreloads();
+      this.ttsClient.invalidateSynthesis?.();
+    }
     if (this.#currentSpeakAbortController) {
       this.#currentSpeakAbortController.abort();
     }
@@ -1165,11 +1193,17 @@ export class TTSController extends EventTarget {
   async forward(byMark = false, isAutoAdvance = false) {
     await this.initViewTTS();
     const isPlaying = this.state === 'playing';
-    await this.stop();
+    await this.stop(isAutoAdvance);
     if (!isPlaying) this.state = 'forward-paused';
 
     const ssml = byMark ? this.#getTts()?.nextMark(!isPlaying) : this.#getTts()?.next(!isPlaying);
     if (!ssml) {
+      if (isAutoAdvance) {
+        // A new document/section has different mark ownership. Same-section
+        // auto-advance keeps its buffer, but cross-section work must not.
+        this.#cancelPreloads();
+        this.ttsClient.invalidateSynthesis?.();
+      }
       if (isAutoAdvance && isPlaying && this.stopAtChapterEnd) {
         return await this.#stopAtChapterBoundary();
       }
@@ -1177,10 +1211,10 @@ export class TTSController extends EventTarget {
     } else {
       await this.#handleNavigationWithSSML(ssml, isPlaying);
     }
-    if (isPlaying && !byMark) this.preloadNextSSML();
   }
 
   async setLang(lang: string) {
+    this.#cancelPreloads();
     this.ttsLang = lang;
     this.setPrimaryLang(lang);
   }
@@ -1209,6 +1243,9 @@ export class TTSController extends EventTarget {
 
   async setVoice(voiceId: string, lang: string) {
     this.state = 'setvoice-paused';
+    this.#cancelPreloads();
+    const previousClient = this.ttsClient;
+    previousClient.invalidateSynthesis?.();
     const useEdgeTTS = !!this.ttsEdgeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
@@ -1227,6 +1264,10 @@ export class TTSController extends EventTarget {
     } else {
       this.ttsClient = this.ttsWebClient;
       await this.ttsClient.setRate(this.ttsRate);
+    }
+    if (this.ttsClient !== previousClient) this.ttsClient.invalidateSynthesis?.();
+    if (this.#sentenceGapSec !== undefined) {
+      this.ttsClient.setSentenceGap?.(this.#sentenceGapSec);
     }
     TTSUtils.setPreferredClient(this.ttsClient.name);
     TTSUtils.setPreferredVoice(this.ttsClient.name, lang, voiceId);

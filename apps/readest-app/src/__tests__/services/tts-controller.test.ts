@@ -101,6 +101,7 @@ function createMockTTSClient(name: string): TTSClient {
     pause: vi.fn().mockResolvedValue(true),
     resume: vi.fn().mockResolvedValue(true),
     stop: vi.fn().mockResolvedValue(undefined),
+    invalidateSynthesis: vi.fn(),
     setPrimaryLang: vi.fn(),
     setRate: vi.fn().mockResolvedValue(undefined),
     setPitch: vi.fn().mockResolvedValue(undefined),
@@ -345,14 +346,61 @@ describe('TTSController', () => {
     });
   });
 
+  describe('getSynthesisMetrics', () => {
+    test('returns a text-free snapshot from the active buffered client', () => {
+      const metrics = {
+        hits: 2,
+        misses: 3,
+        joins: 1,
+        evictions: 0,
+        regenerations: 0,
+        attempts: 4,
+        retries: 1,
+        cancellations: 0,
+      };
+      controller.ttsClient = Object.assign(controller.ttsEdgeClient, {
+        getSynthesisMetrics: vi.fn(() => metrics),
+      });
+
+      expect(controller.getSynthesisMetrics()).toEqual(metrics);
+    });
+
+    test('returns null for a direct-speech client', () => {
+      controller.ttsClient = controller.ttsWebClient;
+      expect(controller.getSynthesisMetrics()).toBeNull();
+    });
+  });
+
   describe('setSentenceGap', () => {
-    test('delegates to ttsEdgeClient.setSentenceGap with the given value', () => {
+    test('delegates to the active buffered client', () => {
+      controller.ttsClient = controller.ttsEdgeClient;
       controller.setSentenceGap(0.5);
       expect(controller.ttsEdgeClient.setSentenceGap).toHaveBeenCalledWith(0.5);
+    });
+
+    test('does not mutate the Edge client while another client is active', () => {
+      const setSentenceGap = vi.fn();
+      controller.ttsClient = Object.assign(controller.ttsWebClient, { setSentenceGap });
+      controller.setSentenceGap(0.4);
+
+      expect(setSentenceGap).toHaveBeenCalledWith(0.4);
+      expect(controller.ttsEdgeClient.setSentenceGap).not.toHaveBeenCalled();
     });
   });
 
   describe('setVoice', () => {
+    test('applies the stored sentence gap when switching buffered clients', async () => {
+      controller.ttsClient = controller.ttsEdgeClient;
+      controller.setSentenceGap(0.4);
+      const setSentenceGap = vi.fn();
+      controller.ttsWebClient = Object.assign(controller.ttsWebClient, { setSentenceGap });
+
+      await controller.setVoice('unknown-voice', 'en');
+
+      expect(controller.ttsClient).toBe(controller.ttsWebClient);
+      expect(setSentenceGap).toHaveBeenCalledWith(0.4);
+    });
+
     test('switches to edge client when voice found in edge voices', async () => {
       controller.ttsEdgeVoices = [{ id: 'edge-voice-1', name: 'Edge Voice', lang: 'en-US' }];
       await controller.setVoice('edge-voice-1', 'en');
@@ -1120,6 +1168,7 @@ describe('TTSController', () => {
 
       expect(sectionOpened(1)).toBe(true);
       expect(controller.state).toBe('playing');
+      expect(controller.ttsClient.invalidateSynthesis).toHaveBeenCalledTimes(1);
     });
 
     test('a user skip still crosses the boundary while the mode is armed', async () => {
@@ -1263,6 +1312,36 @@ describe('TTSController', () => {
   });
 
   describe('forward and backward', () => {
+    test('same-section auto-advance preserves prepared synthesis', async () => {
+      mockView.tts = {
+        next: vi.fn().mockReturnValue('<speak>next</speak>'),
+        nextMark: vi.fn(),
+        start: vi.fn(),
+        doc: null,
+      } as unknown as FoliateView['tts'];
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* () {});
+      controller.state = 'playing';
+
+      await controller.forward(false, true);
+
+      expect(controller.ttsClient.invalidateSynthesis).not.toHaveBeenCalled();
+    });
+
+    test('manual forward invalidates prepared synthesis', async () => {
+      mockView.tts = {
+        next: vi.fn().mockReturnValue('<speak>next</speak>'),
+        nextMark: vi.fn(),
+        start: vi.fn(),
+        doc: null,
+      } as unknown as FoliateView['tts'];
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* () {});
+      controller.state = 'playing';
+
+      await controller.forward(false, false);
+
+      expect(controller.ttsClient.invalidateSynthesis).toHaveBeenCalledTimes(1);
+    });
+
     test('forward sets forward-paused state when not playing', async () => {
       // Set up controller with a mock tts on the view
       mockView.tts = {
@@ -1301,6 +1380,16 @@ describe('TTSController', () => {
       controller.state = 'playing';
       await controller.stop();
       expect(controller.state).toBe('stopped');
+    });
+
+    test('invalidates prepared synthesis on a terminal stop', async () => {
+      await controller.stop();
+      expect(controller.ttsClient.invalidateSynthesis).toHaveBeenCalledTimes(1);
+    });
+
+    test('preserves prepared synthesis during a sequential transition', async () => {
+      await controller.stop(true);
+      expect(controller.ttsClient.invalidateSynthesis).not.toHaveBeenCalled();
     });
 
     test('handles client stop errors gracefully', async () => {
@@ -1477,11 +1566,77 @@ describe('TTSController', () => {
         '<speak>hi</speak>',
         expect.anything(),
         true,
+        'prefetch',
       );
     });
   });
 
   describe('preloadNextSSML', () => {
+    const startPendingPreload = async () => {
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>chunk</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      let observedSignal: AbortSignal | undefined;
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* (_ssml, signal) {
+        observedSignal = signal;
+        if (!signal.aborted) {
+          await new Promise<void>((resolve) =>
+            signal.addEventListener('abort', () => resolve(), { once: true }),
+          );
+        }
+        yield { code: 'end' } as TTSMessageEvent;
+      });
+      const pending = controller.preloadNextSSML(1);
+      await vi.waitFor(() => expect(observedSignal).toBeDefined());
+      return { pending, signal: observedSignal! };
+    };
+
+    test('terminal stop aborts the active speculative preload run', async () => {
+      const { pending, signal } = await startPendingPreload();
+
+      await controller.stop();
+
+      expect(signal.aborted).toBe(true);
+      await pending;
+    });
+
+    test('sequential stop preserves the active speculative preload run', async () => {
+      const { pending, signal } = await startPendingPreload();
+
+      await controller.stop(true);
+
+      expect(signal.aborted).toBe(false);
+      await controller.stop();
+      await pending;
+    });
+
+    test('starts speculative SSML preloads concurrently after the range snapshot', async () => {
+      mockView.tts = {
+        next: vi.fn().mockReturnValue('<speak>chunk</speak>'),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      let releaseFirst!: () => void;
+      const firstPending = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let invocation = 0;
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* () {
+        invocation += 1;
+        if (invocation === 1) await firstPending;
+        yield { code: 'end' } as TTSMessageEvent;
+      });
+
+      const preload = controller.preloadNextSSML(2);
+      await vi.waitFor(() => expect(controller.ttsClient.speak).toHaveBeenCalledTimes(2));
+      releaseFirst();
+      await preload;
+
+      expect(controller.ttsClient.speak).toHaveBeenCalledTimes(2);
+    });
+
     test('calls tts.next() and tts.prev() synchronously without async gaps between them', async () => {
       // This test verifies the fix for a race condition where async gaps between
       // tts.next() calls in preloadNextSSML allowed #speak() to interleave and

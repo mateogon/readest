@@ -7,16 +7,44 @@ import { EDGE_TTS_PROTOCOL, EdgeSpeechTTS } from '@/libs/edgeTTS';
 import type { TTSVoice } from '../types';
 import {
   SpeechProvider,
+  SpeechRetryPolicy,
   SpeechSynthesisPermanentError,
   SpeechSynthesisRequest,
   SpeechSynthesisResult,
 } from './types';
+
+const awaitEdgeTransport = <T>(transport: Promise<T>, signal: AbortSignal): Promise<T> => {
+  if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    transport.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+};
 
 export class EdgeSpeechProvider implements SpeechProvider {
   readonly id = 'edge-tts';
   readonly label = 'Edge TTS';
   readonly fallbackVoiceId = 'en-US-AriaNeural';
   readonly cacheable = true;
+  readonly synthesisIdentity = 'edge-adapter-v1';
+  readonly synthesisConcurrency = 4;
+  readonly retryPolicy = {
+    maxAttempts: 3,
+    delayMs: (failedAttempt) => 200 * failedAttempt,
+  } satisfies SpeechRetryPolicy;
 
   #tts: EdgeSpeechTTS | null = null;
 
@@ -46,20 +74,26 @@ export class EdgeSpeechProvider implements SpeechProvider {
 
   async synthesize(
     req: SpeechSynthesisRequest,
-    _signal: AbortSignal,
+    signal: AbortSignal,
   ): Promise<SpeechSynthesisResult> {
     const tts = this.#tts;
     if (!tts) throw new Error('EdgeSpeechProvider not initialized');
     try {
       // Rate pinned to 1.0: keeps the audio cache rate-independent; the
       // playback rate is applied at playout.
-      const { data, boundaries } = await tts.createAudioData({
-        lang: req.lang,
-        text: req.text,
-        voice: req.voice,
-        rate: 1.0,
-        pitch: req.pitch,
-      });
+      // The shared Edge transport cannot always close its underlying request,
+      // but this provider lease must still settle promptly on navigation so a
+      // stale request cannot occupy the coordinator's only synthesis slot.
+      const { data, boundaries } = await awaitEdgeTransport(
+        tts.createAudioData({
+          lang: req.lang,
+          text: req.text,
+          voice: req.voice,
+          rate: 1.0,
+          pitch: req.pitch,
+        }),
+        signal,
+      );
       return { audio: data, boundaries };
     } catch (err) {
       // Permanent for this sentence: Edge answered without audio frames.

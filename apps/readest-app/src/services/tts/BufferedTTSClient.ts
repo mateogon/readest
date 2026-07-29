@@ -7,7 +7,7 @@ import { TTSWordBoundary } from '@/libs/edgeTTS';
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
 import { AppService } from '@/types/system';
 import { parseSSMLMarks } from '@/utils/ssml';
-import { TTSController } from './TTSController';
+import type { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
 import { applyEdgeFade, findSpeechBounds } from './pcm';
@@ -23,6 +23,7 @@ import {
   SpeechSynthesisPermanentError,
   SpeechSynthesisRequest,
 } from './providers/types';
+import { SynthesisCoordinator, SynthesisPriority } from './SynthesisCoordinator';
 import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
 
 // The generic buffered TTS client: one SpeechProvider synthesizes compressed
@@ -89,6 +90,7 @@ export class BufferedTTSClient implements TTSClient {
   appService?: AppService | null;
 
   protected readonly provider: SpeechProvider;
+  readonly #synthesisCoordinator: SynthesisCoordinator;
   protected voices: TTSVoice[] = [];
   #primaryLang = 'en';
   #speakingLang = '';
@@ -124,49 +126,41 @@ export class BufferedTTSClient implements TTSClient {
     appService?: AppService | null,
   ) {
     this.provider = provider;
+    this.#synthesisCoordinator = new SynthesisCoordinator(provider, {
+      concurrency: provider.synthesisConcurrency,
+    });
     this.name = provider.id;
     this.controller = controller;
     this.appService = appService;
   }
 
   async init(): Promise<boolean> {
-    this.voices = await this.provider.getAllVoices();
     this.initialized = await this.provider.init();
+    if (!this.initialized) {
+      this.voices = [];
+      return false;
+    }
+    this.voices = await this.provider.getAllVoices();
     return this.initialized;
   }
 
-  // Synthesis requests fail intermittently (network transports); retry a few
-  // times before giving up so a single transient failure doesn't stall
-  // playback. SpeechSynthesisPermanentError is permanent for a given
-  // sentence, so it rethrows immediately for the caller's skip path.
-  #synthesizeWithRetry = async (
-    lang: string,
-    text: string,
-    voiceId: string,
+  #synthesize = async (
+    req: SpeechSynthesisRequest,
     signal: AbortSignal,
-    maxAttempts = 3,
-  ): Promise<{ data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined> => {
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (signal.aborted) return undefined;
-      try {
-        // Rate is deliberately absent from the request: the provider
-        // synthesizes at rate 1.0 and playout applies the playback rate.
-        const { audio, boundaries } = await this.provider.synthesize(
-          { lang, text, voice: voiceId, pitch: this.#pitch },
-          signal,
-        );
-        return { data: audio, boundaries };
-      } catch (err) {
-        if (err instanceof SpeechSynthesisPermanentError) throw err;
-        lastError = err;
-        console.warn(`TTS synthesis attempt ${attempt}/${maxAttempts} failed`, err);
-        if (attempt < maxAttempts && !signal.aborted) {
-          await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+    priority: SynthesisPriority,
+    generation: number,
+  ): Promise<
+    { data: ArrayBuffer; boundaries: TTSWordBoundary[]; durationSec?: number } | undefined
+  > => {
+    const lease = this.#synthesisCoordinator.acquire(req, { priority, generation, signal });
+    const synthesized = await lease.result;
+    return synthesized
+      ? {
+          data: synthesized.audio,
+          boundaries: synthesized.boundaries,
+          durationSec: synthesized.durationSec,
         }
-      }
-    }
-    throw lastError;
+      : undefined;
   };
 
   #recordDurations = (
@@ -204,11 +198,16 @@ export class BufferedTTSClient implements TTSClient {
     );
   };
 
-  async *speak(ssml: string, signal: AbortSignal, preload = false) {
+  async *speak(
+    ssml: string,
+    signal: AbortSignal,
+    preload = false,
+    preloadPriority: 'next' | 'prefetch' = 'prefetch',
+  ) {
     const { marks } = parseSSMLMarks(ssml, this.#primaryLang);
 
     if (preload) {
-      yield* this.#preload(marks, signal);
+      yield* this.#preload(marks, signal, preloadPriority);
       return;
     }
 
@@ -289,42 +288,31 @@ export class BufferedTTSClient implements TTSClient {
     }
   }
 
-  async *#preload(marks: TTSMark[], signal: AbortSignal) {
-    // Fetch the first couple of marks immediately and the rest in the
-    // background; the provider's in-flight dedup keeps this from racing
-    // duplicate requests against the playback scheduler.
-    const maxImmediate = 2;
-    for (let i = 0; i < Math.min(maxImmediate, marks.length); i++) {
-      if (signal.aborted) break;
+  async *#preload(marks: TTSMark[], signal: AbortSignal, priority: 'next' | 'prefetch') {
+    // The first audible mark is prepared before returning. Remaining marks
+    // are enqueued under the coordinator and return immediately; playback can
+    // promote any queued job without re-synthesizing it.
+    const generation = this.#synthesisCoordinator.generation;
+    for (let i = 0; i < marks.length; i++) {
+      if (signal.aborted || generation !== this.#synthesisCoordinator.generation) break;
       const mark = marks[i]!;
       const voiceId = await this.getVoiceIdFromLang(mark.language);
       this.#currentVoiceId = voiceId;
-      try {
-        const audio = await this.#synthesizeWithRetry(mark.language, mark.text, voiceId, signal);
-        if (audio) this.#recordDurations(voiceId, mark.text, audio.boundaries);
-      } catch (err) {
-        console.warn('Error preloading mark', i, err);
-      }
-    }
-    if (marks.length > maxImmediate) {
-      (async () => {
-        for (let i = maxImmediate; i < marks.length; i++) {
-          const mark = marks[i]!;
-          try {
-            if (signal.aborted) break;
-            const voiceId = await this.getVoiceIdFromLang(mark.language);
-            const audio = await this.#synthesizeWithRetry(
-              mark.language,
-              mark.text,
-              voiceId,
-              signal,
-            );
-            if (audio) this.#recordDurations(voiceId, mark.text, audio.boundaries);
-          } catch (err) {
-            console.warn('Error preloading mark (bg)', i, err);
-          }
-        }
-      })();
+      const req: SpeechSynthesisRequest = {
+        lang: mark.language,
+        text: mark.text,
+        voice: voiceId,
+        pitch: this.#pitch,
+      };
+      const prepared = this.#synthesize(req, signal, priority, generation)
+        .then((audio) => {
+          if (audio) this.#recordDurations(voiceId, mark.text, audio.boundaries);
+        })
+        .catch((error) => {
+          console.warn('Error preloading TTS mark', mark.name, error);
+        });
+      if (i === 0) await prepared;
+      else void prepared;
     }
 
     yield {
@@ -344,9 +332,15 @@ export class BufferedTTSClient implements TTSClient {
     chunkMeta: ChunkMeta[],
   ): Promise<void> {
     const rate = this.#rate;
+    const synthesisGeneration = this.#synthesisCoordinator.generation;
     try {
       for (const mark of marks) {
-        if (signal.aborted || this.#activeGeneration !== generation) return;
+        if (
+          signal.aborted ||
+          this.#activeGeneration !== generation ||
+          synthesisGeneration !== this.#synthesisCoordinator.generation
+        )
+          return;
         // Voices resolve per mark: mixed-language sections speak (and record
         // durations under) the voice actually used for each sentence.
         const voiceId = await this.getVoiceIdFromLang(mark.language);
@@ -359,15 +353,17 @@ export class BufferedTTSClient implements TTSClient {
           voice: voiceId,
           pitch: this.#pitch,
         };
-        let audio: { data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined;
+        let audio:
+          | { data: ArrayBuffer; boundaries: TTSWordBoundary[]; durationSec?: number }
+          | undefined;
         try {
-          audio = await this.#synthesizeWithRetry(mark.language, mark.text, voiceId, signal);
+          audio = await this.#synthesize(req, signal, 'playback', synthesisGeneration);
         } catch (error) {
           if (error instanceof SpeechSynthesisPermanentError) {
             // Genuinely unsynthesizable sentence (server returned no audio):
             // skip it and keep going — a few bad sentences must not stop a
             // chapter. These don't count toward the offline stop budget.
-            console.warn('No audio data received for:', mark.text);
+            console.warn('No TTS audio data received for mark', mark.name);
             queue.push({ kind: 'chunk-skip', markName: mark.name });
             continue;
           }
@@ -384,11 +380,17 @@ export class BufferedTTSClient implements TTSClient {
             queue.push({ kind: 'error', message });
             return;
           }
-          console.warn('TTS skipping unreachable sentence:', mark.text, message);
+          console.warn('TTS skipping unreachable mark', mark.name, message);
           queue.push({ kind: 'chunk-skip', markName: mark.name });
           continue;
         }
-        if (!audio || signal.aborted || this.#activeGeneration !== generation) return;
+        if (
+          !audio ||
+          signal.aborted ||
+          this.#activeGeneration !== generation ||
+          synthesisGeneration !== this.#synthesisCoordinator.generation
+        )
+          return;
         this.#consecutiveSkips = 0;
         this.#recordDurations(voiceId, mark.text, audio.boundaries);
 
@@ -417,7 +419,7 @@ export class BufferedTTSClient implements TTSClient {
             meta.trimmedDurationSec = durationSec;
             this.#recordDurations(voiceId, mark.text, audio.boundaries, durationSec);
           } catch (error) {
-            console.warn('Failed to enqueue TTS audio for:', mark.text, error);
+            console.warn('Failed to enqueue TTS audio for mark', mark.name, error);
             queue.push({ kind: 'chunk-skip', markName: mark.name });
           }
           continue;
@@ -433,7 +435,7 @@ export class BufferedTTSClient implements TTSClient {
           prepared = await this.#prepareChunkBuffer(webPlayer, audio.data, rate);
         } catch (error) {
           // Malformed MP3 must not dead-end the session: same UX as no-audio.
-          console.warn('Failed to decode TTS audio for:', mark.text, error);
+          console.warn('Failed to decode TTS audio for mark', mark.name, error);
           queue.push({ kind: 'chunk-skip', markName: mark.name });
           continue;
         }
@@ -546,6 +548,14 @@ export class BufferedTTSClient implements TTSClient {
     await this.stopInternal();
   }
 
+  invalidateSynthesis(): void {
+    this.#synthesisCoordinator.advanceGeneration();
+  }
+
+  getSynthesisMetrics() {
+    return this.#synthesisCoordinator.getMetrics();
+  }
+
   protected async stopInternal() {
     this.#stopWordTracking();
     this.#isPlaying = false;
@@ -585,12 +595,14 @@ export class BufferedTTSClient implements TTSClient {
   async setPitch(pitch: number) {
     // Passed through to the provider per synthesis request (Edge accepts
     // pitch in [0.5 .. 1.5]).
+    if (pitch !== this.#pitch) this.invalidateSynthesis();
     this.#pitch = pitch;
   }
 
   async setVoice(voice: string) {
     const selectedVoice = this.voices.find((v) => v.id === voice);
     if (selectedVoice) {
+      if (selectedVoice.id !== this.#currentVoiceId) this.invalidateSynthesis();
       this.#currentVoiceId = selectedVoice.id;
     }
   }
@@ -633,7 +645,11 @@ export class BufferedTTSClient implements TTSClient {
     const voiceId = await this.getVoiceIdFromLang(lang);
     const req = { lang, text, voice: voiceId, pitch: this.#pitch };
     try {
-      await this.provider.synthesize(req, new AbortController().signal);
+      const lease = this.#synthesisCoordinator.acquire(req, {
+        priority: 'warmup',
+        generation: this.#synthesisCoordinator.generation,
+      });
+      if (!(await lease.result)) return false;
     } catch {
       // Offline / permanent failure: leave the ordinal unrecorded so the
       // section stays incomplete and can be retried later.
@@ -685,6 +701,7 @@ export class BufferedTTSClient implements TTSClient {
   }
 
   setPrimaryLang(lang: string) {
+    if (lang !== this.#primaryLang) this.invalidateSynthesis();
     this.#primaryLang = lang;
   }
 
@@ -713,6 +730,7 @@ export class BufferedTTSClient implements TTSClient {
 
   async shutdown(): Promise<void> {
     await this.stopInternal();
+    this.#synthesisCoordinator.shutdown();
     await this.#player.shutdown();
     await this.provider.shutdown?.();
     this.initialized = false;

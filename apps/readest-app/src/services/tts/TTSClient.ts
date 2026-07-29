@@ -1,4 +1,5 @@
 import { TTSGranularity, TTSVoice, TTSVoicesGroup } from './types';
+import type { SynthesisCoordinatorMetrics } from './SynthesisCoordinator';
 
 type TTSMessageCode = 'boundary' | 'error' | 'end';
 
@@ -28,14 +29,25 @@ export interface TTSClient {
   initialized: boolean;
   init(): Promise<boolean>;
   shutdown(): Promise<void>;
-  speak(ssml: string, signal: AbortSignal, preload?: boolean): AsyncIterable<TTSMessageEvent>;
+  speak(
+    ssml: string,
+    signal: AbortSignal,
+    preload?: boolean,
+    preloadPriority?: 'next' | 'prefetch',
+  ): AsyncIterable<TTSMessageEvent>;
   pause(): Promise<boolean>;
   resume(): Promise<boolean>;
   stop(): Promise<void>;
+  // Drop queued/prepared synthesis after a logical navigation or acoustic
+  // configuration change. Pause/resume and sequential auto-advance preserve it.
+  invalidateSynthesis?(): void;
+  // Structured, text-free counters for live buffer diagnostics.
+  getSynthesisMetrics?(): SynthesisCoordinatorMetrics;
   setPrimaryLang(lang: string): void;
   setRate(rate: number): Promise<void>;
   setPitch(pitch: number): Promise<void>;
   setVoice(voice: string): Promise<void>;
+  setSentenceGap?(sec: number): void;
   getAllVoices(): Promise<TTSVoice[]>;
   getVoices(lang: string): Promise<TTSVoicesGroup[]>;
   getGranularities(): TTSGranularity[];
