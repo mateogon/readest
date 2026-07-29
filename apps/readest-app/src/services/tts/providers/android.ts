@@ -28,6 +28,8 @@ interface AndroidTTSBoundary {
   offset: number;
   duration: number;
   text: string;
+  textStart?: number;
+  textEnd?: number;
 }
 
 interface AndroidTTSSynthesisResponse {

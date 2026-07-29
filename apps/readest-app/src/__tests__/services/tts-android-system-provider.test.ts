@@ -50,7 +50,17 @@ describe('AndroidSystemSpeechProvider', () => {
           enginePackage: initResponse.enginePackage,
           engineVersion: initResponse.engineVersion,
           maxInputLength: initResponse.maxInputLength,
-          boundaries: [{ offset: 0, duration: 10_000_000, text: 'Hello' }],
+          boundaries: [
+            { offset: 0, duration: 3_000_000, text: 'Hi', textStart: 0, textEnd: 2 },
+            { offset: 3_000_000, duration: 3_000_000, text: '😀', textStart: 3, textEnd: 5 },
+            {
+              offset: 6_000_000,
+              duration: 4_000_000,
+              text: 'cafe\u{301}',
+              textStart: 6,
+              textEnd: 11,
+            },
+          ],
         });
       }
       if (command === 'plugin:native-tts|read_synthesis_audio') {
@@ -125,7 +135,7 @@ describe('AndroidSystemSpeechProvider', () => {
     const result = await provider.synthesize(
       {
         lang: 'en_us',
-        text: 'Hello',
+        text: 'Hi 😀 cafe\u{301}',
         voice: `${ANDROID_BUFFERED_VOICE_PREFIX}engine_en_voice`,
         pitch: 1.1,
       },
@@ -135,7 +145,7 @@ describe('AndroidSystemSpeechProvider', () => {
 
     expect(h.invoke).toHaveBeenCalledWith('plugin:native-tts|synthesize_to_file', {
       payload: {
-        text: 'Hello',
+        text: 'Hi 😀 cafe\u{301}',
         enginePackage: 'dev.example.engine',
         voice: 'engine_en_voice',
         locale: 'en-US',
@@ -151,7 +161,19 @@ describe('AndroidSystemSpeechProvider', () => {
     });
     expect(Array.from(new Uint8Array(result.audio))).toEqual([82, 73, 70, 70]);
     expect(result.durationSec).toBe(1);
-    expect(result.boundaries).toEqual([{ offset: 0, duration: 10_000_000, text: 'Hello' }]);
+    expect(result.boundaries).toEqual([
+      { offset: 0, duration: 3_000_000, text: 'Hi', textStart: 0, textEnd: 2 },
+      { offset: 3_000_000, duration: 3_000_000, text: '😀', textStart: 3, textEnd: 5 },
+      {
+        offset: 6_000_000,
+        duration: 4_000_000,
+        text: 'cafe\u{301}',
+        textStart: 6,
+        textEnd: 11,
+      },
+    ]);
+    expect(result.boundaries[1]!.textStart).toBe(3);
+    expect(result.boundaries[1]!.textEnd).toBe(5);
     const diagnosticCalls = info.mock.calls.filter(
       ([message]) => typeof message === 'string' && message.startsWith('[TTS][AndroidBuffered] '),
     );
@@ -170,7 +192,9 @@ describe('AndroidSystemSpeechProvider', () => {
       ]),
     );
     expect(diagnosticCalls.every((call) => call.length === 1)).toBe(true);
-    expect(diagnosticCalls.every(([message]) => !(message as string).includes('Hello'))).toBe(true);
+    expect(
+      diagnosticCalls.every(([message]) => !(message as string).includes('Hi 😀 cafe\u{301}')),
+    ).toBe(true);
     info.mockRestore();
   });
 

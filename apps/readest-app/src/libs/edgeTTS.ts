@@ -283,6 +283,10 @@ export interface TTSWordBoundary {
   offset: number;
   duration: number;
   text: string;
+  // Optional UTF-16 code-unit span in the provider request text. Android
+  // supplies it; Edge boundaries remain valid without source-text offsets.
+  textStart?: number;
+  textEnd?: number;
 }
 
 interface AudioMetadataEntry {

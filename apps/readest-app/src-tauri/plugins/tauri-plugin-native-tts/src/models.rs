@@ -147,6 +147,10 @@ pub struct SynthesisBoundary {
     pub offset: u64,
     pub duration: u64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_start: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_end: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,16 +284,18 @@ fn normalize_ranges(
         }
 
         let range_text = String::from_utf16(&utf16[start..end]).ok()?;
-        validated.push((frame, range_text));
+        let text_start = u32::try_from(start).ok()?;
+        let text_end = u32::try_from(end).ok()?;
+        validated.push((frame, text_start, text_end, range_text));
         previous_end = end;
         previous_frame = Some(frame);
     }
 
     let mut boundaries = Vec::with_capacity(validated.len());
-    for (index, (frame, range_text)) in validated.iter().enumerate() {
+    for (index, (frame, text_start, text_end, range_text)) in validated.iter().enumerate() {
         let end_frame = validated
             .get(index + 1)
-            .map(|(next_frame, _)| *next_frame)
+            .map(|(next_frame, _, _, _)| *next_frame)
             .unwrap_or(frame_count);
         let offset = frame_to_ticks(*frame, sample_rate)?;
         let end = frame_to_ticks(end_frame, sample_rate)?;
@@ -301,6 +307,8 @@ fn normalize_ranges(
             offset,
             duration,
             text: range_text.clone(),
+            text_start: Some(*text_start),
+            text_end: Some(*text_end),
         });
     }
     Some(boundaries)
@@ -656,18 +664,79 @@ mod tests {
                     offset: 0,
                     duration: 10_000_000,
                     text: "Hola".to_owned(),
+                    text_start: Some(0),
+                    text_end: Some(4),
                 },
                 SynthesisBoundary {
                     offset: 10_000_000,
                     duration: 10_000_000,
                     text: "😀".to_owned(),
+                    text_start: Some(5),
+                    text_end: Some(7),
                 },
                 SynthesisBoundary {
                     offset: 20_000_000,
                     duration: 10_000_000,
                     text: "cafe\u{301}".to_owned(),
+                    text_start: Some(8),
+                    text_end: Some(13),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn serializes_android_utf16_offsets_in_the_public_boundary_contract() {
+        let text = "A😀e\u{301}";
+        let (args, mut native) = native_result(text);
+        native.ranges = vec![
+            NativeSynthesisRange {
+                start: 0,
+                end: 1,
+                frame: 0,
+            },
+            NativeSynthesisRange {
+                start: 1,
+                end: 3,
+                frame: 100,
+            },
+            NativeSynthesisRange {
+                start: 3,
+                end: 5,
+                frame: 200,
+            },
+        ];
+
+        let result = native
+            .validate_for(&args)
+            .expect("valid synthesis metadata");
+        let serialized = serde_json::to_value(result).expect("serialize public response");
+
+        assert_eq!(
+            serialized["boundaries"],
+            serde_json::json!([
+                {
+                    "offset": 0,
+                    "duration": 10_000_000,
+                    "text": "A",
+                    "textStart": 0,
+                    "textEnd": 1
+                },
+                {
+                    "offset": 10_000_000,
+                    "duration": 10_000_000,
+                    "text": "😀",
+                    "textStart": 1,
+                    "textEnd": 3
+                },
+                {
+                    "offset": 20_000_000,
+                    "duration": 10_000_000,
+                    "text": "e\u{301}",
+                    "textStart": 3,
+                    "textEnd": 5
+                }
+            ])
         );
     }
 
