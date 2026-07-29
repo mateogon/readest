@@ -15,6 +15,28 @@ const DEFAULT_SILENCE_THRESHOLD = 0.005;
 const HEAD_PAD_SEC = 0.02;
 const TAIL_PAD_SEC = 0.05;
 
+const TICKS_PER_SECOND = 10_000_000;
+const CUT_SEARCH_BACK_SEC = 0.4;
+const MAX_SILENCE_TO_SEED_SEC = 0.05;
+const MIN_SAFE_SILENCE_SEC = 0.03;
+const CUT_GUARD_SEC = 0.006;
+const MIN_SLICE_SEC = 0.03;
+// A peak-only gate can mistake sustained weak speech for silence. Until a
+// captured engine fixture justifies a looser value, require near-noise-floor
+// RMS across the guarded interior of every accepted quiet run.
+const MAX_SAFE_SILENCE_RMS = 0.0015;
+
+export type PcmCutFailure =
+  | 'invalid-audio'
+  | 'invalid-seeds'
+  | 'no-safe-silence'
+  | 'conflicting-cuts'
+  | 'silent-slice';
+
+export type PcmCutPlan =
+  | { ok: true; cutFrames: readonly number[] }
+  | { ok: false; reason: PcmCutFailure; cutIndex?: number };
+
 export const findSpeechBounds = (
   samples: Float32Array,
   sampleRate: number,
@@ -44,6 +66,139 @@ export const findSpeechBounds = (
   const startSec = Math.max(0, first / sampleRate - HEAD_PAD_SEC);
   const endSec = Math.min(samples.length / sampleRate, (last + 1) / sampleRate + TAIL_PAD_SEC);
   return { startSec, endSec };
+};
+
+// Converts estimated Android word-boundary timestamps into conservative PCM
+// split points. A timestamp is only a search anchor: a cut is accepted solely
+// inside a sustained quiet run, never at an isolated low-energy sample or zero
+// crossing. The function returns no partial plan, so callers can fall back to
+// individual synthesis before scheduling any part of a composite request.
+export const planSafePcmCuts = (
+  samples: Float32Array,
+  sampleRate: number,
+  seedOffsetsTicks: readonly number[],
+): PcmCutPlan => {
+  if (samples.length === 0 || !Number.isFinite(sampleRate) || sampleRate <= 0) {
+    return { ok: false, reason: 'invalid-audio' };
+  }
+
+  let hasVoice = false;
+  for (const sample of samples) {
+    if (!Number.isFinite(sample)) return { ok: false, reason: 'invalid-audio' };
+    if (Math.abs(sample) > DEFAULT_SILENCE_THRESHOLD) hasVoice = true;
+  }
+  if (!hasVoice) return { ok: false, reason: 'silent-slice' };
+
+  const seedFrames: number[] = [];
+  let previousTicks = 0;
+  let previousFrame = 0;
+  for (const ticks of seedOffsetsTicks) {
+    if (!Number.isSafeInteger(ticks) || ticks <= previousTicks) {
+      return { ok: false, reason: 'invalid-seeds' };
+    }
+    const frame = Math.round((ticks / TICKS_PER_SECOND) * sampleRate);
+    if (frame <= previousFrame || frame >= samples.length) {
+      return { ok: false, reason: 'invalid-seeds' };
+    }
+    seedFrames.push(frame);
+    previousTicks = ticks;
+    previousFrame = frame;
+  }
+
+  const searchBackFrames = Math.ceil(CUT_SEARCH_BACK_SEC * sampleRate);
+  const maximumSilenceToSeedFrames = Math.floor(MAX_SILENCE_TO_SEED_SEC * sampleRate);
+  const minimumSilenceFrames = Math.ceil(MIN_SAFE_SILENCE_SEC * sampleRate);
+  const guardFrames = Math.ceil(CUT_GUARD_SEC * sampleRate);
+  const minimumSliceFrames = Math.ceil(MIN_SLICE_SEC * sampleRate);
+  const cutFrames: number[] = [];
+
+  for (let cutIndex = 0; cutIndex < seedFrames.length; cutIndex++) {
+    const seedFrame = seedFrames[cutIndex]!;
+    const precedingSeedFrame = cutIndex === 0 ? 0 : seedFrames[cutIndex - 1]!;
+    // Partition neighbouring searches at their seed midpoint. This prevents
+    // two short logical marks from claiming the same quiet run.
+    const cellStart = Math.floor((precedingSeedFrame + seedFrame) / 2);
+    const searchStart = Math.max(0, seedFrame - searchBackFrames, cellStart);
+    const searchEndExclusive = seedFrame + 1;
+
+    let quietRunStart = -1;
+    let candidateStart = -1;
+    let candidateEnd = -1;
+    let candidateDistance = Number.POSITIVE_INFINITY;
+
+    const considerQuietRun = (runStart: number, runEndExclusive: number) => {
+      if (runEndExclusive - runStart < minimumSilenceFrames) return;
+      const safeStart = runStart + guardFrames;
+      const safeEndExclusive = runEndExclusive - guardFrames;
+      if (safeStart >= safeEndExclusive) return;
+      const distance = Math.max(0, seedFrame - runEndExclusive);
+      if (distance > maximumSilenceToSeedFrames) return;
+      let squareSum = 0;
+      for (let frame = safeStart; frame < safeEndExclusive; frame++) {
+        squareSum += samples[frame]! * samples[frame]!;
+      }
+      const rms = Math.sqrt(squareSum / (safeEndExclusive - safeStart));
+      if (rms > MAX_SAFE_SILENCE_RMS) return;
+      if (distance < candidateDistance) {
+        candidateStart = safeStart;
+        candidateEnd = safeEndExclusive;
+        candidateDistance = distance;
+      }
+    };
+
+    for (let frame = searchStart; frame < searchEndExclusive; frame++) {
+      if (Math.abs(samples[frame]!) <= DEFAULT_SILENCE_THRESHOLD) {
+        if (quietRunStart < 0) quietRunStart = frame;
+      } else if (quietRunStart >= 0) {
+        considerQuietRun(quietRunStart, frame);
+        quietRunStart = -1;
+      }
+    }
+    if (quietRunStart >= 0) considerQuietRun(quietRunStart, searchEndExclusive);
+
+    if (candidateStart < 0 || candidateEnd <= candidateStart) {
+      return { ok: false, reason: 'no-safe-silence', cutIndex };
+    }
+    cutFrames.push(Math.floor((candidateStart + candidateEnd) / 2));
+  }
+
+  const sliceEdges = [0, ...cutFrames, samples.length];
+  for (let index = 1; index < sliceEdges.length; index++) {
+    const start = sliceEdges[index - 1]!;
+    const end = sliceEdges[index]!;
+    if (end <= start || end - start < minimumSliceFrames) {
+      return { ok: false, reason: 'conflicting-cuts', cutIndex: Math.max(0, index - 1) };
+    }
+    let sliceHasVoice = false;
+    for (let frame = start; frame < end; frame++) {
+      if (Math.abs(samples[frame]!) > DEFAULT_SILENCE_THRESHOLD) {
+        sliceHasVoice = true;
+        break;
+      }
+    }
+    if (!sliceHasVoice) {
+      return { ok: false, reason: 'silent-slice', cutIndex: Math.max(0, index - 1) };
+    }
+  }
+
+  for (let cutIndex = 0; cutIndex < cutFrames.length; cutIndex++) {
+    const cut = cutFrames[cutIndex]!;
+    const previousCut = cutIndex === 0 ? 0 : cutFrames[cutIndex - 1]!;
+    if (cut <= previousCut) {
+      return { ok: false, reason: 'conflicting-cuts', cutIndex };
+    }
+    for (let frame = cut - guardFrames; frame < cut + guardFrames; frame++) {
+      if (
+        frame < 0 ||
+        frame >= samples.length ||
+        Math.abs(samples[frame]!) > DEFAULT_SILENCE_THRESHOLD
+      ) {
+        return { ok: false, reason: 'conflicting-cuts', cutIndex };
+      }
+    }
+  }
+
+  return { ok: true, cutFrames };
 };
 
 // ~3ms: below one syllable so it is inaudible on speech, but far longer than a

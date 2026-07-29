@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'vitest';
 
-import { applyEdgeFade, findSpeechBounds } from '@/services/tts/pcm';
+import { applyEdgeFade, findSpeechBounds, planSafePcmCuts } from '@/services/tts/pcm';
 
 const SR = 24000;
+const TICKS_PER_SECOND = 10_000_000;
 
 const makeSignal = (
   leadingSilenceSec: number,
@@ -102,5 +103,166 @@ describe('applyEdgeFade', () => {
     const one = new Float32Array([0.5]);
     applyEdgeFade(one, 48000);
     expect(one[0]).toBe(0.5);
+  });
+});
+
+const makeCutSignal = (
+  sampleRate: number,
+  durationSec: number,
+  silences: Array<{ startSec: number; endSec: number; amplitude?: number }> = [],
+) => {
+  const samples = new Float32Array(Math.round(durationSec * sampleRate)).fill(0.2);
+  for (const silence of silences) {
+    const start = Math.round(silence.startSec * sampleRate);
+    const end = Math.round(silence.endSec * sampleRate);
+    samples.fill(silence.amplitude ?? 0, start, end);
+  }
+  return samples;
+};
+
+const ticksAt = (seconds: number) => Math.round(seconds * TICKS_PER_SECOND);
+
+describe('planSafePcmCuts', () => {
+  test('maps ticks with the decoded sample rate and cuts at the center of sustained silence', () => {
+    const decodedSampleRate = 48_000;
+    const samples = makeCutSignal(decodedSampleRate, 2, [
+      { startSec: 0.92, endSec: 0.98, amplitude: 0.0008 },
+    ]);
+
+    const result = planSafePcmCuts(samples, decodedSampleRate, [ticksAt(1)]);
+
+    expect(result).toEqual({ ok: true, cutFrames: [Math.round(0.95 * decodedSampleRate)] });
+  });
+
+  test('accepts exactly 30ms of quiet audio but rejects a shorter amplitude valley', () => {
+    const exact = makeCutSignal(SR, 2, [{ startSec: 0.95, endSec: 0.98 }]);
+    const short = makeCutSignal(SR, 2, [{ startSec: 0.96, endSec: 0.98 }]);
+
+    expect(planSafePcmCuts(exact, SR, [ticksAt(1)])).toEqual({
+      ok: true,
+      cutFrames: [Math.round(0.965 * SR)],
+    });
+    expect(planSafePcmCuts(short, SR, [ticksAt(1)])).toMatchObject({
+      ok: false,
+      reason: 'no-safe-silence',
+    });
+  });
+
+  test('does not reach a silence more than 400ms before the estimated boundary', () => {
+    const samples = makeCutSignal(SR, 2, [{ startSec: 0.5, endSec: 0.56 }]);
+
+    expect(planSafePcmCuts(samples, SR, [ticksAt(1)])).toMatchObject({
+      ok: false,
+      reason: 'no-safe-silence',
+    });
+  });
+
+  test('rejects a quiet run that ends more than 50ms before the estimated boundary', () => {
+    const samples = makeCutSignal(SR, 2, [{ startSec: 0.61, endSec: 0.65 }]);
+
+    expect(planSafePcmCuts(samples, SR, [ticksAt(1)])).toMatchObject({
+      ok: false,
+      reason: 'no-safe-silence',
+    });
+  });
+
+  test('rejects sustained weak signal even when every sample is below the peak threshold', () => {
+    const samples = makeCutSignal(SR, 2, [{ startSec: 0.94, endSec: 0.99, amplitude: 0.0049 }]);
+
+    expect(planSafePcmCuts(samples, SR, [ticksAt(1)])).toMatchObject({
+      ok: false,
+      reason: 'no-safe-silence',
+    });
+  });
+
+  test('does not mistake waveform zero crossings for a safe cut', () => {
+    const samples = new Float32Array(2 * SR);
+    for (let i = 0; i < samples.length; i++) {
+      samples[i] = 0.3 * Math.sin((2 * Math.PI * 220 * i) / SR);
+    }
+
+    expect(planSafePcmCuts(samples, SR, [ticksAt(1)])).toMatchObject({
+      ok: false,
+      reason: 'no-safe-silence',
+    });
+  });
+
+  test('returns multiple strictly increasing cuts from distinct quiet runs', () => {
+    const samples = makeCutSignal(SR, 3, [
+      { startSec: 0.94, endSec: 1.0 },
+      { startSec: 1.94, endSec: 2.0 },
+    ]);
+
+    const result = planSafePcmCuts(samples, SR, [ticksAt(1.04), ticksAt(2.04)]);
+
+    expect(result).toEqual({
+      ok: true,
+      cutFrames: [Math.round(0.97 * SR), Math.round(1.97 * SR)],
+    });
+    if (result.ok) expect(result.cutFrames[1]!).toBeGreaterThan(result.cutFrames[0]!);
+  });
+
+  test('fails atomically when adjacent seed windows cannot produce distinct cuts', () => {
+    const samples = makeCutSignal(SR, 2, [{ startSec: 0.95, endSec: 1.05 }]);
+
+    const result = planSafePcmCuts(samples, SR, [ticksAt(1.06), ticksAt(1.08)]);
+
+    expect(result).toMatchObject({ ok: false });
+    expect('cutFrames' in result).toBe(false);
+  });
+
+  test('rejects a cut that would leave a logical slice shorter than 30ms', () => {
+    const samples = makeCutSignal(SR, 1, [{ startSec: 0.96, endSec: 0.99 }]);
+
+    expect(planSafePcmCuts(samples, SR, [ticksAt(0.995)])).toMatchObject({
+      ok: false,
+      reason: 'conflicting-cuts',
+    });
+  });
+
+  test('rejects all-silence and non-finite PCM instead of manufacturing cuts', () => {
+    const nonFinite = makeCutSignal(SR, 2, [{ startSec: 0.95, endSec: 1.0 }]);
+    nonFinite[100] = Number.NaN;
+
+    expect(planSafePcmCuts(new Float32Array(2 * SR), SR, [ticksAt(1)])).toMatchObject({
+      ok: false,
+      reason: 'silent-slice',
+    });
+    expect(planSafePcmCuts(nonFinite, SR, [ticksAt(1)])).toMatchObject({
+      ok: false,
+      reason: 'invalid-audio',
+    });
+  });
+
+  test.each([
+    { name: 'empty audio', samples: new Float32Array(), sampleRate: SR, seeds: [ticksAt(1)] },
+    { name: 'zero sample rate', samples: new Float32Array(SR), sampleRate: 0, seeds: [] },
+    {
+      name: 'non-finite sample rate',
+      samples: new Float32Array(SR),
+      sampleRate: Number.NaN,
+      seeds: [],
+    },
+  ])('rejects invalid audio metadata: $name', ({ samples, sampleRate, seeds }) => {
+    expect(planSafePcmCuts(samples, sampleRate, seeds)).toMatchObject({
+      ok: false,
+      reason: 'invalid-audio',
+    });
+  });
+
+  test.each([
+    { name: 'zero', seeds: [0] },
+    { name: 'negative', seeds: [-1] },
+    { name: 'non-finite', seeds: [Number.POSITIVE_INFINITY] },
+    { name: 'outside audio', seeds: [ticksAt(3)] },
+    { name: 'non-increasing', seeds: [ticksAt(1), ticksAt(0.9)] },
+    { name: 'equal decoded frame', seeds: [1, 2] },
+  ])('rejects invalid cut seeds: $name', ({ seeds }) => {
+    const samples = makeCutSignal(SR, 2, [{ startSec: 0.95, endSec: 1 }]);
+
+    expect(planSafePcmCuts(samples, SR, seeds)).toMatchObject({
+      ok: false,
+      reason: 'invalid-seeds',
+    });
   });
 });
