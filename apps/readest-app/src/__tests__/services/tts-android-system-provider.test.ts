@@ -79,6 +79,10 @@ describe('AndroidSystemSpeechProvider', () => {
     expect(provider.cacheable).toBe(false);
     expect(provider.synthesisConcurrency).toBe(1);
     expect(provider.retryPolicy?.maxAttempts).toBe(2);
+    expect(provider.compositeBoundaries).toEqual({
+      textOffsets: 'utf16',
+      audioTiming: 'estimated',
+    });
   });
 
   test('initializes before exposing a runtime engine identity', async () => {

@@ -98,6 +98,10 @@ export class AndroidSystemSpeechProvider implements SpeechProvider {
   readonly label = 'System TTS — Buffered (Experimental)';
   readonly cacheable = false;
   readonly synthesisConcurrency = 1;
+  readonly compositeBoundaries = {
+    textOffsets: 'utf16',
+    audioTiming: 'estimated',
+  } as const;
   readonly retryPolicy = {
     maxAttempts: 2,
     shouldRetry: (error) => error instanceof AndroidSpeechConnectionError && error.retryable,

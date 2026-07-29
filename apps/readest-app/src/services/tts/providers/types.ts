@@ -104,6 +104,13 @@ export interface SpeechProvider {
   // Maximum independent synthesis jobs for this engine. Local/mobile engines
   // default to one; network providers may opt into bounded parallelism.
   readonly synthesisConcurrency?: number;
+  // Composite synthesis is safe only when the provider reports exact text
+  // spans in JavaScript's UTF-16 coordinate system. Audio cuts remain an
+  // estimate derived from the corresponding boundary timing.
+  readonly compositeBoundaries?: {
+    textOffsets: 'utf16';
+    audioTiming: 'estimated';
+  };
   // Release provider resources (network handles, cache databases) when the
   // owning client shuts down.
   shutdown?(): Promise<void>;
