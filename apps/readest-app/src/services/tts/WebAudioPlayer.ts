@@ -94,6 +94,7 @@ interface PlayerSession {
   leadingGapSec: number;
   transitionFromPrevious: TTSPlaybackTransition;
   chunks: ScheduledChunk[];
+  nextChunkIndex: number;
   nextStartTime: number;
   ended: boolean;
   endedEmitted: boolean;
@@ -125,6 +126,9 @@ export interface WebAudioPlayerDiagnostics {
   // intentionally excludes trailing silence and synthesis/cache lookahead.
   currentBufferAheadMs: number;
   maxBufferAheadMs: number;
+  // Only unfinished chunks plus, during an underrun, the latest completed
+  // timing anchor remain owned by the session.
+  retainedChunks: number;
 }
 
 export interface WebAudioSessionOptions {
@@ -300,6 +304,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       leadingGapSec: Math.max(0, options.leadingGapSec ?? 0),
       transitionFromPrevious,
       chunks: [],
+      nextChunkIndex: 0,
       nextStartTime: 0,
       ended: false,
       endedEmitted: false,
@@ -347,7 +352,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     source.buffer = buffer;
     source.connect(ctx.destination);
     const chunk: ScheduledChunk = {
-      index: session.chunks.length,
+      index: session.nextChunkIndex++,
       source,
       startTime: start,
       duration: buffer.duration,
@@ -384,6 +389,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       // (cursor/highlight) remain one chunk behind the audio.
       session.onEvent({ type: 'chunk-start', chunkIndex: chunk.index });
     }
+    if (previousChunk?.ended) this.#discardEndedBefore(session, chunk.index);
   }
 
   endSession(generation: number): void {
@@ -441,6 +447,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       chapterGaps: summarizeGaps(this.#chapterGapMs),
       currentBufferAheadMs: Math.round(currentBufferAheadMs),
       maxBufferAheadMs: Math.round(this.#maxBufferAheadMs),
+      retainedChunks: this.#session?.chunks.length ?? 0,
     };
   }
 
@@ -540,11 +547,28 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const waiters = session.waiters;
     session.waiters = [];
     for (const waiter of waiters) waiter(true);
-    const next = session.chunks[chunk.index + 1];
+    const next = session.chunks.find((candidate) => candidate.index === chunk.index + 1);
     if (next) {
       session.onEvent({ type: 'chunk-start', chunkIndex: next.index });
+      this.#discardEndedBefore(session, next.index);
     }
     this.#maybeEmitSessionEnd(session);
+  }
+
+  #discardEndedBefore(session: PlayerSession, retainedIndex: number): void {
+    let discardCount = 0;
+    while (discardCount < session.chunks.length) {
+      const candidate = session.chunks[discardCount]!;
+      if (!candidate.ended || candidate.index >= retainedIndex) break;
+      candidate.source.onended = null;
+      try {
+        candidate.source.disconnect();
+      } catch {
+        // A completed source may already be disconnected by the platform.
+      }
+      discardCount += 1;
+    }
+    if (discardCount > 0) session.chunks.splice(0, discardCount);
   }
 
   #maybeEmitSessionEnd(session: PlayerSession): void {

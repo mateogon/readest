@@ -384,6 +384,27 @@ describe('WebAudioPlayer scheduling', () => {
     ]);
   });
 
+  test('releases completed chunk sources while retaining absolute event indexes', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+
+    for (let index = 0; index < 100; index++) {
+      expect(await player.waitUntilReady(gen)).toBe(true);
+      player.scheduleChunk(gen, makeBuffer(0.05), {
+        trimStartSec: 0,
+        mediaScale: 1,
+        gapSec: 0,
+      });
+      await ctx.advanceTo(ctx.sources.at(-1)!.endTime);
+    }
+
+    expect(events.filter((event) => event.type === 'chunk-start')).toEqual(
+      Array.from({ length: 100 }, (_, chunkIndex) => ({ type: 'chunk-start', chunkIndex })),
+    );
+    expect(player.getDiagnostics()).toMatchObject({ scheduledChunks: 100, retainedChunks: 1 });
+  });
+
   test('stale-generation scheduleChunk is a no-op', async () => {
     const { ctx, player, events, onEvent } = setup();
     await player.ensureContext();
