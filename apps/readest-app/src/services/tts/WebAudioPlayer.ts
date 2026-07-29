@@ -377,8 +377,12 @@ export class WebAudioPlayer implements TTSAudioPlayer {
         bufferAheadMs: Math.round(bufferAheadMs),
       })}`,
     );
-    if (chunk.index === 0) {
-      session.onEvent({ type: 'chunk-start', chunkIndex: 0 });
+    if (chunk.index === 0 || previousChunk?.ended) {
+      // Normally the previous source announces this chunk from its onended
+      // callback. After a real underrun that callback has already fired, so a
+      // late admission must announce itself here or logical playback events
+      // (cursor/highlight) remain one chunk behind the audio.
+      session.onEvent({ type: 'chunk-start', chunkIndex: chunk.index });
     }
   }
 

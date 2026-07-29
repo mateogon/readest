@@ -361,6 +361,29 @@ describe('WebAudioPlayer scheduling', () => {
     ]);
   });
 
+  test('a chunk admitted after an underrun announces its own start', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+    });
+    await ctx.advanceTo(SAFETY + 1);
+
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+    });
+
+    expect(events).toEqual([
+      { type: 'chunk-start', chunkIndex: 0 },
+      { type: 'chunk-start', chunkIndex: 1 },
+    ]);
+  });
+
   test('stale-generation scheduleChunk is a no-op', async () => {
     const { ctx, player, events, onEvent } = setup();
     await player.ensureContext();
