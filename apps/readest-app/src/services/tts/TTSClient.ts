@@ -1,4 +1,4 @@
-import { TTSGranularity, TTSPlaybackTransition, TTSVoice, TTSVoicesGroup } from './types';
+import { TTSGranularity, TTSMark, TTSPlaybackTransition, TTSVoice, TTSVoicesGroup } from './types';
 import type { SynthesisCoordinatorMetrics } from './SynthesisCoordinator';
 import type { WebAudioPlayerDiagnostics } from './WebAudioPlayer';
 
@@ -8,6 +8,26 @@ export interface TTSMessageEvent {
   code: TTSMessageCode;
   message?: string;
   mark?: string;
+  // Valid only on `code: 'boundary'`; emitted when playback reaches a logical
+  // mark transition in a streamed block. It may precede audio samples by an
+  // intentional configured gap.
+  // Block labels are local to each SSML fragment, so blockOffset is part of
+  // the identity even when adjacent blocks both contain a mark named "0".
+  logicalBoundary?: {
+    blockOffset: number;
+    mark: TTSMark;
+  };
+  // On a successful terminal `end`, the last block fully consumed by the
+  // client. This lets the controller commit trailing empty/skipped blocks
+  // without moving the live document cursor for merely planned audio.
+  consumedBlockOffset?: number;
+}
+
+export interface TTSBlockInput {
+  // Current block is zero; future blocks increase monotonically within the
+  // same document section.
+  blockOffset: number;
+  ssml: string;
 }
 
 export interface TTSRuntimeMetrics extends SynthesisCoordinatorMetrics {
@@ -45,6 +65,16 @@ export interface TTSClient {
     signal: AbortSignal,
     preload?: boolean,
     preloadPriority?: 'next' | 'prefetch',
+    transitionFromPrevious?: TTSPlaybackTransition,
+  ): AsyncIterable<TTSMessageEvent>;
+  // Paired optional methods: a client opts into streamed logical blocks only
+  // when it explicitly advertises support and implements speakBlocks. The
+  // returned stream must finish with one terminal `end` or `error` event.
+  // Established clients retain the single-SSML path.
+  supportsBlockStreaming?(): boolean;
+  speakBlocks?(
+    blocks: AsyncIterable<TTSBlockInput>,
+    signal: AbortSignal,
     transitionFromPrevious?: TTSPlaybackTransition,
   ): AsyncIterable<TTSMessageEvent>;
   pause(): Promise<boolean>;

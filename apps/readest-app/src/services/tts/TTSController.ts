@@ -20,7 +20,7 @@ import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { hydrateProvisionalDurations } from './ttsDuration';
 import { DownloadableSentence, SectionEnumerator, TTSDownloader } from './TTSDownloader';
 import { TTSUtils } from './TTSUtils';
-import { TTSClient } from './TTSClient';
+import { TTSBlockInput, TTSClient } from './TTSClient';
 import { startAudioKeepAlive, stopAudioKeepAlive } from './WebAudioPlayer';
 import { isValidLang } from '@/utils/lang';
 import {
@@ -1013,6 +1013,78 @@ export class TTSController extends EventTarget {
     }
   }
 
+  #supportsBlockStreaming(): boolean {
+    return !!this.ttsClient.speakBlocks && this.ttsClient.supportsBlockStreaming?.() === true;
+  }
+
+  async *#streamSSMLBlocks(
+    currentSSML: string,
+    doc: Document | null | undefined,
+    anchor: Range | undefined,
+    signal: AbortSignal,
+    streamState: { highestYieldedBlockOffset: number },
+  ): AsyncGenerator<TTSBlockInput> {
+    if (signal.aborted) return;
+    streamState.highestYieldedBlockOffset = 0;
+    yield { blockOffset: 0, ssml: currentSSML };
+    if (!doc || !anchor || signal.aborted) return;
+
+    try {
+      const { TTS } = await import('foliate-js/tts.js');
+      const { textWalker } = await import('foliate-js/text-walker.js');
+      if (signal.aborted) return;
+      const shadow = new TTS(
+        doc,
+        textWalker,
+        createTTSNodeFilter(),
+        () => {},
+        this.#ttsGranularity,
+      );
+      // Position on the live block without using the returned current SSML:
+      // currentSSML above may be a preprocessed selection tail and is the
+      // authoritative current input for this speak session.
+      if (!shadow.from(anchor)) return;
+      for (let blockOffset = 1; ; blockOffset++) {
+        if (signal.aborted) return;
+        const rawSSML = shadow.next();
+        if (rawSSML === undefined) return;
+        const ssml = await this.#preprocessSSML(rawSSML);
+        if (signal.aborted) return;
+        // Preserve empty preprocessed blocks in the logical stream. A client
+        // may skip their synthesis, then report consumedBlockOffset so the
+        // live cursor commits them only after successful playback.
+        streamState.highestYieldedBlockOffset = blockOffset;
+        yield { blockOffset, ssml: ssml ?? '' };
+      }
+    } catch (error) {
+      console.warn('[TTS] Unable to enumerate streamed SSML blocks', error);
+    }
+  }
+
+  #commitStreamedBlockOffset(
+    liveTts: FoliateView['tts'],
+    committedBlockOffset: number,
+    nextBlockOffset: number,
+    maxBlockOffset: number,
+  ): number {
+    if (
+      !Number.isInteger(nextBlockOffset) ||
+      nextBlockOffset < committedBlockOffset ||
+      nextBlockOffset > maxBlockOffset
+    ) {
+      throw new Error(`Invalid streamed TTS block offset: ${nextBlockOffset}`);
+    }
+    if (!liveTts || this.#getTts() !== liveTts) {
+      throw new Error('Stale streamed TTS cursor');
+    }
+    for (let offset = committedBlockOffset; offset < nextBlockOffset; offset++) {
+      if (liveTts.next() === undefined) {
+        throw new Error(`Unable to advance streamed TTS cursor to block ${nextBlockOffset}`);
+      }
+    }
+    return nextBlockOffset;
+  }
+
   async #preprocessSSML(ssml?: string) {
     if (!ssml) return;
     ssml = ssml
@@ -1085,34 +1157,88 @@ export class TTSController extends EventTarget {
         }
 
         const { plainText, marks } = parseSSMLMarks(ssml);
+        const streamsBlocks = !oneTime && this.#supportsBlockStreaming();
+        let streamedBlocks: AsyncIterable<TTSBlockInput> | null = null;
+        let streamedLiveTts: FoliateView['tts'] = null;
+        const blockStreamState = { highestYieldedBlockOffset: -1 };
         if (!oneTime) {
           if (!plainText || marks.length === 0) {
             resolve();
             return await this.forward(false, true);
+          } else if (streamsBlocks) {
+            // setMark establishes a stable current-block range for the shadow
+            // iterator but emits no logical position. The actual mark is
+            // dispatched only when playback reaches its logical boundary.
+            this.#suppressMarkHighlight = true;
+            try {
+              this.#getTts()?.setMark(marks[0]!.name);
+            } finally {
+              this.#suppressMarkHighlight = false;
+            }
+            const liveTts = this.#getTts();
+            streamedLiveTts = liveTts;
+            streamedBlocks = this.#streamSSMLBlocks(
+              ssml,
+              liveTts?.doc,
+              liveTts?.getLastRange?.(),
+              signal,
+              blockStreamState,
+            );
           } else {
             this.dispatchSpeakMark(marks[0]);
+            await this.preloadSSML(ssml, signal, 'next');
+            void this.preloadNextSSML();
           }
-          await this.preloadSSML(ssml, signal, 'next');
-          void this.preloadNextSSML();
         }
         // Only the native client surfaces an offline engine failure as a
         // terminal 'error' code (Edge/Web throw, which the catch below handles).
         const canSkipOnError = this.ttsClient === this.ttsNativeClient;
-        const iter = await this.ttsClient.speak(
-          ssml,
-          signal,
-          false,
-          undefined,
-          transitionFromPrevious,
-        );
-        let lastCode;
-        for await (const { code } of iter) {
+        const iter =
+          streamsBlocks && streamedBlocks
+            ? await this.ttsClient.speakBlocks!(streamedBlocks, signal, transitionFromPrevious)
+            : await this.ttsClient.speak(ssml, signal, false, undefined, transitionFromPrevious);
+        let lastEvent;
+        let committedBlockOffset = 0;
+        for await (const event of iter) {
           if (signal.aborted) {
             resolve();
             return;
           }
-          lastCode = code;
+          if (streamsBlocks) {
+            if (event.code === 'boundary' && !event.logicalBoundary) {
+              throw new Error('Streamed TTS boundary is missing its logical boundary');
+            }
+            if (event.code !== 'boundary' && event.logicalBoundary) {
+              throw new Error(`Streamed TTS ${event.code} event has a logical boundary`);
+            }
+            if (event.logicalBoundary) {
+              committedBlockOffset = this.#commitStreamedBlockOffset(
+                streamedLiveTts,
+                committedBlockOffset,
+                event.logicalBoundary.blockOffset,
+                blockStreamState.highestYieldedBlockOffset,
+              );
+              this.dispatchSpeakMark(event.logicalBoundary.mark);
+            }
+          }
+          lastEvent = event;
         }
+        if (streamsBlocks && lastEvent?.code !== 'end' && lastEvent?.code !== 'error') {
+          throw new Error('Streamed TTS ended without a terminal event');
+        }
+        if (
+          streamsBlocks &&
+          lastEvent?.code === 'end' &&
+          lastEvent.consumedBlockOffset !== undefined
+        ) {
+          committedBlockOffset = this.#commitStreamedBlockOffset(
+            streamedLiveTts,
+            committedBlockOffset,
+            lastEvent.consumedBlockOffset,
+            blockStreamState.highestYieldedBlockOffset,
+          );
+        }
+        const lastCode = lastEvent?.code;
 
         if (lastCode === 'end' && this.state === 'playing' && !oneTime) {
           this.#consecutiveSpeakErrors = 0;
