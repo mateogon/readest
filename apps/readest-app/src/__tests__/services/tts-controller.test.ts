@@ -114,6 +114,9 @@ function createMockTTSClient(name: string): TTSClient {
       mediaClock: name === 'edge',
       gapControl: name === 'edge',
       liveRateChange: false,
+      cacheable: name === 'edge',
+      downloadable: name === 'edge',
+      measurableDurations: name === 'edge',
     })),
     getVoiceId: vi.fn().mockReturnValue('voice-1'),
     getSpeakingLang: vi.fn().mockReturnValue('en'),
@@ -343,6 +346,34 @@ describe('TTSController', () => {
     test('returns false when ttsClient is not the edge client', () => {
       controller.ttsClient = controller.ttsWebClient;
       expect(controller.supportsGapControl()).toBe(false);
+    });
+  });
+
+  describe('download capability', () => {
+    test('is hidden when the active client is not downloadable', () => {
+      controller.ttsClient = controller.ttsWebClient;
+      expect(controller.canDownload()).toBe(false);
+    });
+
+    test('follows the active client capability', () => {
+      controller.ttsClient = controller.ttsEdgeClient;
+      expect(controller.canDownload()).toBe(true);
+    });
+
+    test('does not claim a downloader for a non-Edge client', () => {
+      controller.ttsClient = controller.ttsWebClient;
+      vi.mocked(controller.ttsWebClient.getCapabilities).mockReturnValue({
+        wordBoundaries: true,
+        mediaClock: true,
+        gapControl: true,
+        liveRateChange: false,
+        cacheable: true,
+        downloadable: true,
+        measurableDurations: true,
+      });
+
+      expect(controller.canDownload()).toBe(false);
+      expect(controller.getTTSDownloader()).toBeNull();
     });
   });
 

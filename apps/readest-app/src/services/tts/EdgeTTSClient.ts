@@ -7,6 +7,7 @@ import { CachingProvider } from './providers/cache';
 import { EdgeSpeechProvider } from './providers/edge';
 import { SpeechProvider } from './providers/types';
 import { TTSController } from './TTSController';
+import type { TTSCapabilities } from './TTSClient';
 
 // Everything engine-independent (scheduler, playout, word tracking, preload)
 // lives in BufferedTTSClient; the Edge specifics live in EdgeSpeechProvider.
@@ -72,5 +73,9 @@ export class EdgeTTSClient extends BufferedTTSClient {
     }
     this.initialized = false;
     return false;
+  }
+
+  override getCapabilities(): TTSCapabilities {
+    return { ...super.getCapabilities(), downloadable: this.canDownload() };
   }
 }

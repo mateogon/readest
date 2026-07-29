@@ -114,6 +114,10 @@ export class CachingProvider implements SpeechProvider {
     return this.#inner.synthesisConcurrency;
   }
 
+  get cacheable(): boolean | undefined {
+    return this.#inner.cacheable;
+  }
+
   init(): Promise<boolean> {
     return this.#inner.init();
   }

@@ -7,6 +7,7 @@ vi.mock('@/utils/misc', () => ({
 }));
 
 import { BufferedTTSClient } from '@/services/tts/BufferedTTSClient';
+import { CachingProvider } from '@/services/tts/providers/cache';
 import type { SpeechProvider } from '@/services/tts/providers/types';
 
 describe('BufferedTTSClient initialization', () => {
@@ -49,5 +50,24 @@ describe('BufferedTTSClient initialization', () => {
     await expect(client.init()).resolves.toBe(false);
 
     expect(provider.getAllVoices).not.toHaveBeenCalled();
+  });
+
+  test('does not advertise downloads when the wrapped provider forbids persistence', () => {
+    const inner: SpeechProvider = {
+      id: 'non-persistent-provider',
+      label: 'Non-persistent provider',
+      cacheable: false,
+      init: vi.fn(async () => true),
+      getAllVoices: vi.fn(async () => []),
+      synthesize: vi.fn(async () => ({ audio: new ArrayBuffer(1), boundaries: [] })),
+    };
+    const cached = new CachingProvider(inner, {
+      get: vi.fn(async () => null),
+      put: vi.fn(async () => undefined),
+    });
+    const client = new BufferedTTSClient(cached);
+
+    expect(client.canDownload()).toBe(false);
+    expect(client.getCapabilities()).toMatchObject({ cacheable: false, downloadable: false });
   });
 });

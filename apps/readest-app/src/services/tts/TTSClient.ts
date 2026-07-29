@@ -22,6 +22,12 @@ export interface TTSCapabilities {
   gapControl: boolean;
   // Rate changes apply to in-flight audio without restarting the session.
   liveRateChange: boolean;
+  // Provider permits prepared audio to be persisted under a safe identity.
+  cacheable: boolean;
+  // Active client exposes a real headless download/cache workflow.
+  downloadable: boolean;
+  // Sentence durations can be measured/refined for a section timeline.
+  measurableDurations: boolean;
 }
 
 export interface TTSClient {

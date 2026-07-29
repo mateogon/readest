@@ -628,7 +628,7 @@ export class BufferedTTSClient implements TTSClient {
 
   // Whether this client has a persistent cache to download into.
   canDownload(): boolean {
-    return this.provider instanceof CachingProvider;
+    return this.provider instanceof CachingProvider && this.provider.cacheable !== false;
   }
 
   // Synthesize one sentence into the cache (a hit is a no-op) and record its
@@ -713,6 +713,9 @@ export class BufferedTTSClient implements TTSClient {
       // The native player time-stretches live; the web path bakes the rate
       // into the scheduled buffers, so it needs a session restart.
       liveRateChange: this.#player instanceof NativeAudioPlayer,
+      cacheable: this.provider.cacheable !== false,
+      downloadable: false,
+      measurableDurations: true,
     };
   }
 

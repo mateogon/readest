@@ -73,6 +73,13 @@ describe('CachingProvider', () => {
     expect(provider.synthesisConcurrency).toBe(4);
   });
 
+  test('delegates whether the inner provider permits persistent caching', () => {
+    inner = makeInner({ cacheable: false });
+    provider = new CachingProvider(inner, store);
+
+    expect(provider.cacheable).toBe(false);
+  });
+
   test('cache miss synthesizes once and stores the result', async () => {
     const result = await provider.synthesize(req(), signal());
     expect(result.boundaries).toEqual(BOUNDARIES);

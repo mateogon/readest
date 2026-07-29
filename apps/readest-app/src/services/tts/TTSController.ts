@@ -520,11 +520,12 @@ export class TTSController extends EventTarget {
     return true;
   }
 
-  // Build (or return) the virtual timeline for the current section. Edge-only:
-  // it is the only client with measurable audio durations and a chunk clock.
+  // Build (or return) the virtual timeline for the current section when the
+  // active client owns both a media clock and measurable sentence durations.
   // Callers invoke this off the playback path (panel poll, media session).
   async ensureTimeline(): Promise<SectionTimeline | null> {
-    if (this.ttsClient !== this.ttsEdgeClient) return null;
+    const capabilities = this.ttsClient.getCapabilities();
+    if (!capabilities.mediaClock || !capabilities.measurableDurations) return null;
     if (this.#sectionTimeline && this.#timelineSectionIndex === this.#ttsSectionIndex) {
       return this.#sectionTimeline;
     }
@@ -593,12 +594,12 @@ export class TTSController extends EventTarget {
   // and labels sentences identically to ensureTimeline so packs written here
   // and by playback share one manifest.
   canDownload(): boolean {
-    return this.ttsEdgeClient.canDownload();
+    return this.ttsClient === this.ttsEdgeClient && this.ttsClient.getCapabilities().downloadable;
   }
 
   getTTSDownloader(): TTSDownloader | null {
     const edge = this.ttsEdgeClient;
-    if (!edge.canDownload()) return null;
+    if (this.ttsClient !== edge || !this.ttsClient.getCapabilities().downloadable) return null;
     const enumerator: SectionEnumerator = {
       enumerateSection: async (sectionIndex: number) => {
         const sections = this.view.book.sections;
@@ -678,11 +679,12 @@ export class TTSController extends EventTarget {
     return this.ttsEdgeClient.getCacheBytes();
   }
 
-  // Whether the active client can ever produce a timeline (Edge only). The
+  // Whether the active client can ever produce a timeline. The
   // scrubber renders a reserved disabled slot while true and info is still
   // null, and hides entirely while false.
   supportsPlaybackInfo(): boolean {
-    return this.ttsClient === this.ttsEdgeClient;
+    const capabilities = this.ttsClient.getCapabilities();
+    return capabilities.mediaClock && capabilities.measurableDurations;
   }
 
   // Whether the active client supports the inter-sentence gap control.
@@ -729,7 +731,7 @@ export class TTSController extends EventTarget {
   // Null while no timeline exists (non-Edge client, timeline not yet built,
   // or nothing located yet) — the UI reserves a disabled slot for that state.
   getPlaybackInfo(): { position: number; duration: number; measuredFraction: number } | null {
-    if (this.ttsClient !== this.ttsEdgeClient) return null;
+    if (!this.supportsPlaybackInfo()) return null;
     const timeline = this.#sectionTimeline;
     if (!timeline || this.#timelineSectionIndex !== this.#ttsSectionIndex) return null;
     const duration = timeline.getDuration();
