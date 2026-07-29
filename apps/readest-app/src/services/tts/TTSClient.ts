@@ -47,6 +47,10 @@ export interface TTSClient {
   // Drop queued/prepared synthesis after a logical navigation or acoustic
   // configuration change. Pause/resume and sequential auto-advance preserve it.
   invalidateSynthesis?(): void;
+  // Resolve only after provider-side cancellation has completed and no native
+  // synthesis lease remains active. Client switches sharing one OS engine must
+  // await this before applying the next client's mutable configuration.
+  waitForSynthesisIdle?(): Promise<void>;
   // Structured, text-free counters for live buffer diagnostics.
   getSynthesisMetrics?(): SynthesisCoordinatorMetrics;
   setPrimaryLang(lang: string): void;

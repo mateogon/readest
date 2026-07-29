@@ -69,7 +69,8 @@
       }
     },
     "android": {
-      "minSdkVersion": 26
+      "minSdkVersion": 26,
+      "debugApplicationIdSuffix": ".buffered"
     },
     "iOS": {
       "developmentTeam": "J5W48D69VR",

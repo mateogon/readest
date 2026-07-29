@@ -114,6 +114,7 @@ export class SynthesisCoordinator {
   readonly #concurrency: number;
   readonly #jobs = new Map<string, SynthesisJob>();
   readonly #queue: SynthesisJob[] = [];
+  readonly #idleResolvers: Array<() => void> = [];
   readonly #cache = new Map<string, CacheEntry>();
   // Metrics-only history: bounded fingerprints rather than request keys that
   // contain raw book text. It never participates in synthesis correctness.
@@ -242,11 +243,17 @@ export class SynthesisCoordinator {
     this.#cacheBytes = 0;
     this.#cacheDurationSec = 0;
     this.#history.clear();
+    this.#resolveIdleIfNeeded();
     return this.#generation;
   }
 
   getMetrics(): SynthesisCoordinatorMetrics {
     return { ...this.#metrics };
+  }
+
+  waitForIdle(): Promise<void> {
+    if (this.#activeCount === 0 && this.#queue.length === 0) return Promise.resolve();
+    return new Promise((resolve) => this.#idleResolvers.push(resolve));
   }
 
   shutdown(): void {
@@ -324,7 +331,10 @@ export class SynthesisCoordinator {
   #pump(): void {
     while (this.#activeCount < this.#concurrency) {
       const job = this.#queue.shift();
-      if (!job) return;
+      if (!job) {
+        this.#resolveIdleIfNeeded();
+        return;
+      }
       if (
         job.state !== 'queued' ||
         job.generation !== this.#generation ||
@@ -340,6 +350,11 @@ export class SynthesisCoordinator {
         this.#pump();
       });
     }
+  }
+
+  #resolveIdleIfNeeded(): void {
+    if (this.#activeCount !== 0 || this.#queue.length !== 0) return;
+    for (const resolve of this.#idleResolvers.splice(0)) resolve();
   }
 
   async #run(job: SynthesisJob): Promise<void> {

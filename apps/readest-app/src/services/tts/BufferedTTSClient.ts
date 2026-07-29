@@ -552,6 +552,10 @@ export class BufferedTTSClient implements TTSClient {
     this.#synthesisCoordinator.advanceGeneration();
   }
 
+  waitForSynthesisIdle(): Promise<void> {
+    return this.#synthesisCoordinator.waitForIdle();
+  }
+
   getSynthesisMetrics() {
     return this.#synthesisCoordinator.getMetrics();
   }
@@ -734,6 +738,7 @@ export class BufferedTTSClient implements TTSClient {
   async shutdown(): Promise<void> {
     await this.stopInternal();
     this.#synthesisCoordinator.shutdown();
+    await this.#synthesisCoordinator.waitForIdle();
     await this.#player.shutdown();
     await this.provider.shutdown?.();
     this.initialized = false;

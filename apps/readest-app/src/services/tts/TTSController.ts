@@ -13,6 +13,8 @@ import { createRejectFilter } from '@/utils/node';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
+import { BufferedTTSClient } from './BufferedTTSClient';
+import { AndroidSystemSpeechProvider } from './providers/android';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { hydrateProvisionalDurations } from './ttsDuration';
 import { DownloadableSentence, SectionEnumerator, TTSDownloader } from './TTSDownloader';
@@ -135,7 +137,8 @@ export class TTSController extends EventTarget {
 
   #ttsSectionIndex: number = -1;
 
-  // Virtual section timeline for position/duration/seek (Edge client only).
+  // Virtual section timeline for clients with a media clock and measurable
+  // sentence durations.
   // Built lazily OFF the playback critical path: enumerating a 2000-sentence
   // chapter must never delay first audio.
   #sectionTimeline: SectionTimeline | null = null;
@@ -158,7 +161,7 @@ export class TTSController extends EventTarget {
   #wordHighlightActive = false;
   #lastSpeakWordRange: Range | null = null;
   // User-chosen highlight granularity. 'word' (default) highlights word-by-word
-  // when the active client reports word boundaries (Edge); 'sentence' keeps the
+  // when the active client reports word boundaries; 'sentence' keeps the
   // highlight at the sentence level even then. Sentence highlighting is assumed
   // supported by every client, so 'word' falls back to it automatically.
   #highlightGranularity: TTSHighlightGranularity = 'word';
@@ -181,9 +184,11 @@ export class TTSController extends EventTarget {
   ttsWebClient: TTSClient;
   ttsEdgeClient: EdgeTTSClient;
   ttsNativeClient: TTSClient | null = null;
+  ttsAndroidBufferedClient: TTSClient | null = null;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
   ttsNativeVoices: TTSVoice[] = [];
+  ttsAndroidBufferedVoices: TTSVoice[] = [];
   ttsTargetLang: string = '';
 
   options: TTSHighlightOptions = { style: 'highlight', color: 'gray' };
@@ -202,6 +207,13 @@ export class TTSController extends EventTarget {
     // TODO: implement native TTS client for desktop platforms.
     if (appService?.isAndroidApp || appService?.isIOSApp) {
       this.ttsNativeClient = new NativeTTSClient(this);
+    }
+    if (appService?.isAndroidApp) {
+      this.ttsAndroidBufferedClient = new BufferedTTSClient(
+        new AndroidSystemSpeechProvider(),
+        this,
+        appService,
+      );
     }
     this.ttsClient = this.ttsWebClient;
     this.appService = appService;
@@ -363,6 +375,21 @@ export class TTSController extends EventTarget {
     }
     if (await this.ttsWebClient.init()) {
       availableClients.push(this.ttsWebClient);
+    }
+    // Experimental and opt-in: initialize it so its voices appear, but append
+    // after the established engines so it never becomes the implicit default.
+    if (this.ttsAndroidBufferedClient) {
+      try {
+        if (await this.ttsAndroidBufferedClient.init()) {
+          availableClients.push(this.ttsAndroidBufferedClient);
+          this.ttsAndroidBufferedVoices = await this.ttsAndroidBufferedClient.getAllVoices();
+        }
+      } catch (error) {
+        // Experimental capability discovery must never take down the existing
+        // Edge/direct/web clients before the user has opted into this mode.
+        console.warn('[TTS] Buffered Android system TTS unavailable', error);
+        this.ttsAndroidBufferedVoices = [];
+      }
     }
     this.ttsClient = availableClients[0] || this.ttsWebClient;
     const preferredClientName = TTSUtils.getPreferredClient();
@@ -1225,6 +1252,9 @@ export class TTSController extends EventTarget {
     if (this.ttsEdgeClient.initialized) this.ttsEdgeClient.setPrimaryLang(lang);
     if (this.ttsWebClient.initialized) this.ttsWebClient.setPrimaryLang(lang);
     if (this.ttsNativeClient?.initialized) this.ttsNativeClient?.setPrimaryLang(lang);
+    if (this.ttsAndroidBufferedClient?.initialized) {
+      this.ttsAndroidBufferedClient.setPrimaryLang(lang);
+    }
   }
 
   async setRate(rate: number) {
@@ -1238,8 +1268,14 @@ export class TTSController extends EventTarget {
     const ttsWebVoices = await this.ttsWebClient.getVoices(lang);
     const ttsEdgeVoices = await this.ttsEdgeClient.getVoices(lang);
     const ttsNativeVoices = (await this.ttsNativeClient?.getVoices(lang)) ?? [];
+    const ttsAndroidBufferedVoices = (await this.ttsAndroidBufferedClient?.getVoices(lang)) ?? [];
 
-    const voicesGroups = [...ttsNativeVoices, ...ttsEdgeVoices, ...ttsWebVoices];
+    const voicesGroups = [
+      ...ttsNativeVoices,
+      ...ttsAndroidBufferedVoices,
+      ...ttsEdgeVoices,
+      ...ttsWebVoices,
+    ];
     return voicesGroups;
   }
 
@@ -1247,15 +1283,26 @@ export class TTSController extends EventTarget {
     this.state = 'setvoice-paused';
     this.#cancelPreloads();
     const previousClient = this.ttsClient;
+    await previousClient.stop();
     previousClient.invalidateSynthesis?.();
+    await previousClient.waitForSynthesisIdle?.();
     const useEdgeTTS = !!this.ttsEdgeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
     const useNativeTTS = !!this.ttsNativeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
+    const useAndroidBufferedTTS =
+      voiceId !== '' &&
+      !!this.ttsAndroidBufferedVoices.find((voice) => voice.id === voiceId && !voice.disabled);
     if (useEdgeTTS) {
       this.ttsClient = this.ttsEdgeClient;
+      await this.ttsClient.setRate(this.ttsRate);
+    } else if (useAndroidBufferedTTS) {
+      if (!this.ttsAndroidBufferedClient) {
+        throw new Error('Buffered Android TTS client is not available');
+      }
+      this.ttsClient = this.ttsAndroidBufferedClient;
       await this.ttsClient.setRate(this.ttsRate);
     } else if (useNativeTTS) {
       if (!this.ttsNativeClient) {
@@ -1439,7 +1486,7 @@ export class TTSController extends EventTarget {
   }
 
   // Word-level highlighting within the chunk of the last dispatched mark,
-  // driven by TTS clients that report word boundaries (Edge TTS). It only
+  // driven by TTS clients that report word boundaries. It only
   // swaps the visual highlight from the sentence to the spoken word —
   // ttsLocation, media-session metadata and mark navigation keep their
   // sentence-level semantics.
@@ -1525,6 +1572,9 @@ export class TTSController extends EventTarget {
     }
     if (this.ttsEdgeClient.initialized) {
       await this.ttsEdgeClient.shutdown();
+    }
+    if (this.ttsAndroidBufferedClient?.initialized) {
+      await this.ttsAndroidBufferedClient.shutdown();
     }
     if (this.ttsNativeClient?.initialized) {
       await this.ttsNativeClient.shutdown();

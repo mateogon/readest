@@ -131,6 +131,40 @@ describe('SynthesisCoordinator', () => {
     expect(synthesize.mock.calls[0]?.[1].aborted).toBe(true);
   });
 
+  test('waitForIdle does not resolve until an aborted native provider has drained', async () => {
+    const cancellationFinished = deferred<void>();
+    const synthesize = vi.fn(
+      (_req: SpeechSynthesisRequest, signal: AbortSignal): Promise<SpeechSynthesisResult> =>
+        new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              void cancellationFinished.promise.then(() =>
+                reject(new DOMException('Aborted', 'AbortError')),
+              );
+            },
+            { once: true },
+          );
+        }),
+    );
+    const coordinator = new SynthesisCoordinator(makeProvider(synthesize));
+    const lease = coordinator.acquire(request('slow native cancel'), { priority: 'playback' });
+    await waitForCallCount(synthesize, 1);
+
+    coordinator.advanceGeneration();
+    const idle = coordinator.waitForIdle();
+    let drained = false;
+    void idle.then(() => {
+      drained = true;
+    });
+    await expect(lease.result).resolves.toBeUndefined();
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    cancellationFinished.resolve();
+    await expect(idle).resolves.toBeUndefined();
+  });
+
   test('playback starts before queued prefetch work', async () => {
     const pending = new Map<string, Deferred<SpeechSynthesisResult>>();
     const order: string[] = [];

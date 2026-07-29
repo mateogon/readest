@@ -26,6 +26,16 @@ vi.mock('@/services/tts/NativeTTSClient', () => ({
   }),
 }));
 
+vi.mock('@/services/tts/BufferedTTSClient', () => ({
+  BufferedTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
+    Object.assign(this, createMockTTSClient('android-system-buffered'));
+  }),
+}));
+
+vi.mock('@/services/tts/providers/android', () => ({
+  AndroidSystemSpeechProvider: vi.fn(),
+}));
+
 // Track the inaudible background keep-alive (WebAudio) toggled for direct-speak
 // engines. Arrow closures so the vi.mock hoist never hits a TDZ on these consts.
 const startKeepAlive = vi.fn();
@@ -102,6 +112,7 @@ function createMockTTSClient(name: string): TTSClient {
     resume: vi.fn().mockResolvedValue(true),
     stop: vi.fn().mockResolvedValue(undefined),
     invalidateSynthesis: vi.fn(),
+    waitForSynthesisIdle: vi.fn().mockResolvedValue(undefined),
     setPrimaryLang: vi.fn(),
     setRate: vi.fn().mockResolvedValue(undefined),
     setPitch: vi.fn().mockResolvedValue(undefined),
@@ -110,13 +121,13 @@ function createMockTTSClient(name: string): TTSClient {
     getVoices: vi.fn().mockResolvedValue([]),
     getGranularities: vi.fn().mockReturnValue(['word', 'sentence'] as TTSGranularity[]),
     getCapabilities: vi.fn().mockImplementation(() => ({
-      wordBoundaries: name === 'edge',
-      mediaClock: name === 'edge',
-      gapControl: name === 'edge',
+      wordBoundaries: name === 'edge' || name === 'android-system-buffered',
+      mediaClock: name === 'edge' || name === 'android-system-buffered',
+      gapControl: name === 'edge' || name === 'android-system-buffered',
       liveRateChange: false,
       cacheable: name === 'edge',
       downloadable: name === 'edge',
-      measurableDurations: name === 'edge',
+      measurableDurations: name === 'edge' || name === 'android-system-buffered',
     })),
     getVoiceId: vi.fn().mockReturnValue('voice-1'),
     getSpeakingLang: vi.fn().mockReturnValue('en'),
@@ -258,6 +269,15 @@ describe('TTSController', () => {
       expect(c.ttsNativeClient).not.toBeNull();
     });
 
+    test('creates a separate buffered system client only on Android', () => {
+      const android = new TTSController(createMockAppService(true), mockView);
+      const ios = new TTSController(createMockAppService(false, true), mockView);
+
+      expect(android.ttsAndroidBufferedClient?.name).toBe('android-system-buffered');
+      expect(ios.ttsAndroidBufferedClient).toBeNull();
+      expect(controller.ttsAndroidBufferedClient).toBeNull();
+    });
+
     test('creates native client when isIOSApp', () => {
       const iosService = createMockAppService(false, true);
       const c = new TTSController(iosService, mockView);
@@ -321,6 +341,53 @@ describe('TTSController', () => {
       await c.init();
       expect(c.ttsNativeClient!.init).toHaveBeenCalled();
       expect(c.ttsNativeClient!.getAllVoices).toHaveBeenCalled();
+    });
+
+    test('initializes and records buffered system voices on Android', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      const bufferedVoice = {
+        id: 'android-buffered:engine_en_voice',
+        name: 'English voice',
+        lang: 'en-US',
+      };
+      vi.mocked(c.ttsAndroidBufferedClient!.getAllVoices).mockResolvedValue([bufferedVoice]);
+
+      await c.init();
+
+      expect(c.ttsAndroidBufferedClient!.init).toHaveBeenCalled();
+      expect(c.ttsAndroidBufferedVoices).toEqual([bufferedVoice]);
+    });
+
+    test('restores an explicitly preferred buffered Android client', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValue('android-system-buffered');
+      const c = new TTSController(createMockAppService(true), mockView);
+
+      await c.init();
+
+      expect(c.ttsClient.name).toBe('android-system-buffered');
+    });
+
+    test('does not make the experimental buffered client the implicit Android default', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValue(null);
+      const c = new TTSController(createMockAppService(true), mockView);
+      vi.mocked(c.ttsEdgeClient.init).mockResolvedValue(false);
+
+      await c.init();
+
+      expect(c.ttsClient.name).toBe('native');
+    });
+
+    test('keeps established TTS available when experimental Android init rejects', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValue(null);
+      const c = new TTSController(createMockAppService(true), mockView);
+      vi.mocked(c.ttsAndroidBufferedClient!.init).mockRejectedValue(
+        new Error('experimental bridge unavailable'),
+      );
+
+      await expect(c.init()).resolves.toBeUndefined();
+
+      expect(c.ttsClient.name).toBe('edge');
+      expect(c.ttsAndroidBufferedVoices).toEqual([]);
     });
   });
 
@@ -459,6 +526,46 @@ describe('TTSController', () => {
       expect(c.ttsClient.name).toBe('native');
     });
 
+    test('switches to the buffered Android client for its namespaced voice', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      c.ttsAndroidBufferedVoices = [
+        {
+          id: 'android-buffered:engine_en_voice',
+          name: 'Buffered voice',
+          lang: 'en-US',
+        },
+      ];
+
+      await c.setVoice('android-buffered:engine_en_voice', 'en');
+
+      expect(c.ttsClient.name).toBe('android-system-buffered');
+      expect(c.ttsClient.setRate).toHaveBeenCalledWith(1);
+      expect(TTSUtils.setPreferredClient).toHaveBeenCalledWith('android-system-buffered');
+    });
+
+    test('waits for buffered native cancellation to drain before selecting direct speech', async () => {
+      let finishDrain!: () => void;
+      const drain = new Promise<void>((resolve) => {
+        finishDrain = resolve;
+      });
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      c.ttsClient = c.ttsAndroidBufferedClient!;
+      c.ttsNativeVoices = [{ id: 'native-v', name: 'Native', lang: 'en-US' }];
+      vi.mocked(c.ttsAndroidBufferedClient!.waitForSynthesisIdle!).mockReturnValue(drain);
+
+      const switching = c.setVoice('native-v', 'en');
+      await vi.waitFor(() =>
+        expect(c.ttsAndroidBufferedClient!.waitForSynthesisIdle).toHaveBeenCalled(),
+      );
+      expect(c.ttsNativeClient!.setRate).not.toHaveBeenCalled();
+
+      finishDrain();
+      await switching;
+      expect(c.ttsNativeClient!.setRate).toHaveBeenCalledWith(1);
+    });
+
     test('throws when native voice found but native client unavailable', async () => {
       // non-android, ttsNativeClient is null, but we force nativeVoices
       controller.ttsNativeVoices = [{ id: 'native-v', name: 'Native', lang: 'en-US' }];
@@ -522,6 +629,30 @@ describe('TTSController', () => {
       const result = await c.getVoices('en');
       expect(result).toEqual(nativeVoices);
     });
+
+    test('lists buffered Android voices in their own experimental group', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      const bufferedVoices: TTSVoicesGroup[] = [
+        {
+          id: 'android-system-buffered',
+          name: 'System TTS — Buffered (Experimental)',
+          voices: [
+            {
+              id: 'android-buffered:engine_en_voice',
+              name: 'Buffered voice',
+              lang: 'en-US',
+            },
+          ],
+        },
+      ];
+      vi.mocked(c.ttsAndroidBufferedClient!.getVoices).mockResolvedValue(bufferedVoices);
+      vi.mocked(c.ttsNativeClient!.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsEdgeClient.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsWebClient.getVoices).mockResolvedValue([]);
+
+      await expect(c.getVoices('en')).resolves.toEqual(bufferedVoices);
+    });
   });
 
   describe('getVoiceId', () => {
@@ -564,6 +695,15 @@ describe('TTSController', () => {
 
       expect(controller.ttsEdgeClient.setPrimaryLang).toHaveBeenCalledWith('fr');
       expect(controller.ttsWebClient.setPrimaryLang).toHaveBeenCalledWith('fr');
+    });
+
+    test('updates the initialized buffered Android client language', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      c.ttsAndroidBufferedClient!.initialized = true;
+
+      await c.setPrimaryLang('es');
+
+      expect(c.ttsAndroidBufferedClient!.setPrimaryLang).toHaveBeenCalledWith('es');
     });
 
     test('skips uninitialised clients', async () => {
