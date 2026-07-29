@@ -960,19 +960,37 @@ export class TTSController extends EventTarget {
     const { signal } = this.#preloadAbortController;
 
     try {
-      // Gather all next SSMLs and rewind synchronously to avoid a race condition:
-      // tts.next() replaces TTS.#ranges (used by setMark() during playback).
-      // If async gaps exist between next()/prev() calls, a concurrent #speak()
-      // can dispatch marks against the wrong #ranges, causing incorrect highlights
-      // and accidental page turns.
+      // Speculative enumeration must never use the live iterator: next()/prev()
+      // replace its #ranges and reset #lastMark, so even a balanced rewind can
+      // corrupt sentence navigation while playback continues. Anchor a fresh
+      // no-op TTS instance at the live mark and walk that shadow cursor instead.
+      const doc = tts.doc;
+      const anchor = tts.getLastRange?.();
+      if (!doc || !anchor || signal.aborted) return;
+
       const rawSsmls: string[] = [];
-      for (let i = 0; i < count; i++) {
-        const ssml = tts.next();
-        if (!ssml) break;
-        rawSsmls.push(ssml);
-      }
-      for (let i = 0; i < rawSsmls.length; i++) {
-        tts.prev();
+      try {
+        const { TTS } = await import('foliate-js/tts.js');
+        const { textWalker } = await import('foliate-js/text-walker.js');
+        if (signal.aborted) return;
+        const shadow = new TTS(
+          doc,
+          textWalker,
+          createTTSNodeFilter(),
+          () => {},
+          this.#ttsGranularity,
+        );
+        // from() positions the shadow on the live block. Its returned SSML is
+        // the current block, while speculative preload starts with the next.
+        if (!shadow.from(anchor)) return;
+        for (let i = 0; i < count; i++) {
+          const ssml = shadow.next();
+          if (!ssml) break;
+          rawSsmls.push(ssml);
+        }
+      } catch (error) {
+        console.warn('[TTS] Unable to enumerate speculative preload blocks', error);
+        return;
       }
 
       const ssmls: string[] = [];

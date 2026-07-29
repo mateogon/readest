@@ -5,6 +5,7 @@ import { TTSGranularity, TTSVoicesGroup } from '@/services/tts/types';
 import { TTSUtils } from '@/services/tts/TTSUtils';
 import { FoliateView } from '@/types/view';
 import { AppService } from '@/types/system';
+import { TTS } from 'foliate-js/tts.js';
 
 // --- Mock all heavy dependencies so we never import real TTS clients ---
 
@@ -1791,12 +1792,62 @@ describe('TTSController', () => {
   });
 
   describe('preloadNextSSML', () => {
-    const startPendingPreload = async () => {
+    const installLiveCursor = (options: { doc?: Document | null; anchor?: Range | null } = {}) => {
+      const doc = options.doc === undefined ? document : options.doc;
+      const anchor = options.anchor === undefined ? document.createRange() : options.anchor;
+      let currentMark: string | null = '1';
+      const next = vi.fn().mockImplementation(() => {
+        currentMark = null;
+        return '<speak>live-next</speak>';
+      });
+      const prev = vi.fn().mockImplementation(() => {
+        currentMark = null;
+        return '<speak>live-prev</speak>';
+      });
+      const nextMark = vi
+        .fn()
+        .mockImplementation(() =>
+          currentMark === '1' ? '<speak>same-block-next</speak>' : '<speak>next-block</speak>',
+        );
+      const getLastRange = vi.fn().mockImplementation(() => anchor ?? undefined);
       mockView.tts = {
-        next: vi.fn().mockReturnValueOnce('<speak>chunk</speak>').mockReturnValue(undefined),
-        prev: vi.fn(),
-        doc: {},
+        next,
+        prev,
+        nextMark,
+        getLastRange,
+        doc,
       } as unknown as FoliateView['tts'];
+      return {
+        anchor,
+        getLastRange,
+        next,
+        prev,
+        nextMark,
+        currentMark: () => currentMark,
+      };
+    };
+
+    const queueShadowCursor = (
+      chunks: string[],
+      fromResult: string | null = '<speak>current</speak>',
+    ) => {
+      const from = vi.fn().mockReturnValue(fromResult);
+      const next = vi.fn();
+      for (const chunk of chunks) next.mockReturnValueOnce(chunk);
+      next.mockReturnValue(undefined);
+      vi.mocked(TTS).mockImplementationOnce(function () {
+        return {
+          from,
+          next,
+          doc: document,
+        } as unknown as InstanceType<typeof TTS>;
+      });
+      return { from, next };
+    };
+
+    const startPendingPreload = async () => {
+      const live = installLiveCursor();
+      queueShadowCursor(['<speak>chunk</speak>']);
       let observedSignal: AbortSignal | undefined;
       vi.mocked(controller.ttsClient.speak).mockImplementation(async function* (_ssml, signal) {
         observedSignal = signal;
@@ -1809,7 +1860,7 @@ describe('TTSController', () => {
       });
       const pending = controller.preloadNextSSML(1);
       await vi.waitFor(() => expect(observedSignal).toBeDefined());
-      return { pending, signal: observedSignal! };
+      return { live, pending, signal: observedSignal! };
     };
 
     test('terminal stop aborts the active speculative preload run', async () => {
@@ -1831,16 +1882,16 @@ describe('TTSController', () => {
       await pending;
     });
 
-    test('coalesces refill requests and reruns from the current TTS cursor', async () => {
-      let cursor = 0;
-      const next = vi.fn().mockImplementation(() => `<speak>chunk-${cursor++}</speak>`);
-      mockView.tts = {
-        next,
-        prev: vi.fn().mockImplementation(() => {
-          cursor -= 1;
-        }),
-        doc: {},
-      } as unknown as FoliateView['tts'];
+    test('coalesces refill requests and reruns from the current live anchor', async () => {
+      const firstAnchor = document.createRange();
+      const secondAnchor = document.createRange();
+      const live = installLiveCursor({ anchor: firstAnchor });
+      const firstShadow = queueShadowCursor(['<speak>chunk-0</speak>']);
+      const secondShadow = queueShadowCursor([
+        '<speak>chunk-10</speak>',
+        '<speak>chunk-11</speak>',
+        '<speak>chunk-12</speak>',
+      ]);
       let releaseFirst!: () => void;
       const firstPending = new Promise<void>((resolve) => {
         releaseFirst = resolve;
@@ -1855,14 +1906,17 @@ describe('TTSController', () => {
 
       // Playback advances while the first speculative synthesis is still in
       // flight. Multiple refill requests collapse to one run using the larger
-      // requested window, starting from the cursor at refill time.
-      cursor = 10;
+      // requested window, anchored at the live range when the refill starts.
+      live.getLastRange.mockReturnValue(secondAnchor);
       void controller.preloadNextSSML(2);
       void controller.preloadNextSSML(3);
       releaseFirst();
       await firstRun;
 
-      expect(next).toHaveBeenCalledTimes(4);
+      expect(firstShadow.from).toHaveBeenCalledWith(firstAnchor);
+      expect(secondShadow.from).toHaveBeenCalledWith(secondAnchor);
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
       expect(vi.mocked(controller.ttsClient.speak).mock.calls.map(([ssml]) => ssml)).toEqual([
         '<speak>chunk-0</speak>',
         '<speak>chunk-10</speak>',
@@ -1872,14 +1926,9 @@ describe('TTSController', () => {
     });
 
     test('terminal cancellation clears a queued refill and stale completion cannot restart it', async () => {
-      let cursor = 0;
-      mockView.tts = {
-        next: vi.fn().mockImplementation(() => `<speak>chunk-${cursor++}</speak>`),
-        prev: vi.fn().mockImplementation(() => {
-          cursor -= 1;
-        }),
-        doc: {},
-      } as unknown as FoliateView['tts'];
+      const live = installLiveCursor();
+      queueShadowCursor(['<speak>chunk-0</speak>']);
+      queueShadowCursor(['<speak>chunk-1</speak>']);
       let firstSignal: AbortSignal | undefined;
       let invocation = 0;
       vi.mocked(controller.ttsClient.speak).mockImplementation(async function* (_ssml, signal) {
@@ -1909,14 +1958,13 @@ describe('TTSController', () => {
       // cancelled refill count after the stale run's finally block executes.
       await controller.preloadNextSSML(1);
       expect(controller.ttsClient.speak).toHaveBeenCalledTimes(2);
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
     });
 
-    test('starts speculative SSML preloads concurrently after the range snapshot', async () => {
-      mockView.tts = {
-        next: vi.fn().mockReturnValue('<speak>chunk</speak>'),
-        prev: vi.fn(),
-        doc: {},
-      } as unknown as FoliateView['tts'];
+    test('starts speculative SSML preloads concurrently after shadow enumeration', async () => {
+      const live = installLiveCursor();
+      queueShadowCursor(['<speak>chunk-0</speak>', '<speak>chunk-1</speak>']);
       let releaseFirst!: () => void;
       const firstPending = new Promise<void>((resolve) => {
         releaseFirst = resolve;
@@ -1934,54 +1982,57 @@ describe('TTSController', () => {
       await preload;
 
       expect(controller.ttsClient.speak).toHaveBeenCalledTimes(2);
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
     });
 
-    test('calls tts.next() and tts.prev() synchronously without async gaps between them', async () => {
-      // This test verifies the fix for a race condition where async gaps between
-      // tts.next() calls in preloadNextSSML allowed #speak() to interleave and
-      // read corrupted #ranges state (replaced by next() for a different block).
-      const callOrder: string[] = [];
-      let asyncOpHappened = false;
-
-      mockView.tts = {
-        next: vi.fn().mockImplementation(() => {
-          if (asyncOpHappened) {
-            callOrder.push('next-after-async');
-          } else {
-            callOrder.push('next');
-          }
-          return '<speak>chunk</speak>';
-        }),
-        prev: vi.fn().mockImplementation(() => {
-          callOrder.push('prev');
-        }),
-        doc: {},
-      } as unknown as FoliateView['tts'];
-
-      // Use preprocessCallback to detect when async processing happens
+    test('never mutates the live cursor or erases its current local mark', async () => {
+      const live = installLiveCursor();
+      const shadow = queueShadowCursor(['<speak>chunk-0</speak>', '<speak>chunk-1</speak>']);
       controller.preprocessCallback = async (ssml: string) => {
-        asyncOpHappened = true;
-        callOrder.push('preprocess');
+        await Promise.resolve();
         return ssml;
       };
 
       await controller.preloadNextSSML(2);
 
-      // All next() calls should happen before any preprocess (async operation)
-      const firstPreprocessIdx = callOrder.indexOf('preprocess');
-      const nextIndices = callOrder.map((op, i) => (op === 'next' ? i : -1)).filter((i) => i >= 0);
-      const prevIndices = callOrder.map((op, i) => (op === 'prev' ? i : -1)).filter((i) => i >= 0);
+      expect(shadow.from).toHaveBeenCalledWith(live.anchor);
+      expect(shadow.next).toHaveBeenCalledTimes(2);
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
+      expect(live.currentMark()).toBe('1');
+      expect(live.nextMark()).toBe('<speak>same-block-next</speak>');
+    });
 
-      // All next() calls must come before any async preprocessing
-      for (const idx of nextIndices) {
-        expect(idx).toBeLessThan(firstPreprocessIdx);
-      }
-      // All prev() calls must come before any async preprocessing
-      for (const idx of prevIndices) {
-        expect(idx).toBeLessThan(firstPreprocessIdx);
-      }
-      // No next() should happen after an async operation
-      expect(callOrder).not.toContain('next-after-async');
+    test.each([
+      'document',
+      'range',
+    ] as const)('fails safely without a live %s anchor and never falls back to live enumeration', async (missing) => {
+      const live = installLiveCursor({
+        doc: missing === 'document' ? null : document,
+        anchor: missing === 'range' ? null : document.createRange(),
+      });
+
+      await expect(controller.preloadNextSSML(2)).resolves.toBeUndefined();
+
+      expect(TTS).not.toHaveBeenCalled();
+      expect(controller.ttsClient.speak).not.toHaveBeenCalled();
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
+      expect(live.currentMark()).toBe('1');
+    });
+
+    test('fails safely when the shadow cannot position at the live range', async () => {
+      const live = installLiveCursor();
+      const shadow = queueShadowCursor([], null);
+
+      await expect(controller.preloadNextSSML(2)).resolves.toBeUndefined();
+
+      expect(shadow.from).toHaveBeenCalledWith(live.anchor);
+      expect(shadow.next).not.toHaveBeenCalled();
+      expect(controller.ttsClient.speak).not.toHaveBeenCalled();
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
     });
   });
 
