@@ -8,6 +8,12 @@ pub enum Error {
     UnsupportedPlatformError,
     #[error("Native tts error: {0}")]
     NativeTTSError(String),
+    #[error("Invalid request: {0}")]
+    InvalidSynthesisRequest(String),
+    #[error("Invalid metadata: {0}")]
+    InvalidSynthesisMetadata(String),
+    #[error("Invalid WAV: {0}")]
+    InvalidSynthesisAudio(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[cfg(mobile)]

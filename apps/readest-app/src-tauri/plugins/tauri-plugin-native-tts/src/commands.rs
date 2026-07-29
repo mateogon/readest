@@ -53,6 +53,31 @@ pub(crate) async fn get_all_voices<R: Runtime>(app: AppHandle<R>) -> Result<GetV
 }
 
 #[command]
+pub(crate) async fn synthesize_to_file<R: Runtime>(
+    app: AppHandle<R>,
+    payload: SynthesizeToFileArgs,
+) -> Result<SynthesizeToFileResponse> {
+    app.native_tts().synthesize_to_file(payload).await
+}
+
+#[command]
+pub(crate) async fn read_synthesis_audio<R: Runtime>(
+    app: AppHandle<R>,
+    payload: ReadSynthesisAudioArgs,
+) -> Result<tauri::ipc::Response> {
+    let audio = app.native_tts().read_synthesis_audio(payload).await?;
+    Ok(tauri::ipc::Response::new(audio))
+}
+
+#[command]
+pub(crate) async fn cancel_synthesis<R: Runtime>(
+    app: AppHandle<R>,
+    payload: CancelSynthesisArgs,
+) -> Result<()> {
+    app.native_tts().cancel_synthesis(payload).await
+}
+
+#[command]
 pub(crate) async fn set_media_session_active<R: Runtime>(
     app: AppHandle<R>,
     payload: SetMediaSessionActiveRequest,
@@ -101,6 +126,8 @@ pub(crate) async fn playout_control<R: Runtime>(
 }
 
 #[command]
-pub(crate) async fn playout_position<R: Runtime>(app: AppHandle<R>) -> Result<PlayoutPositionResponse> {
+pub(crate) async fn playout_position<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<PlayoutPositionResponse> {
     app.native_tts().playout_position()
 }

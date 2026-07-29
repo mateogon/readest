@@ -89,6 +89,63 @@ impl<R: Runtime> NativeTts<R> {
 }
 
 impl<R: Runtime> NativeTts<R> {
+    pub async fn synthesize_to_file(
+        &self,
+        payload: SynthesizeToFileArgs,
+    ) -> crate::Result<SynthesizeToFileResponse> {
+        payload.validate()?;
+        let cleanup = CancelSynthesisArgs {
+            session_id: payload.session_id.clone(),
+            request_id: payload.request_id.clone(),
+            generation: payload.generation,
+        };
+        let native = self
+            .0
+            .run_mobile_plugin_async::<NativeSynthesizeToFileResponse>(
+                "synthesize_to_file",
+                payload.clone(),
+            )
+            .await
+            .map_err(crate::Error::from)?;
+        match native.validate_for(&payload) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                // Validation happens after Android created a private ready asset,
+                // so discard it before surfacing the typed failure. A rejected
+                // native invoke has already settled and cleaned its request; it
+                // returns above without a second cancellation, which would poison
+                // a coordinator retry that intentionally reuses the request ID.
+                let _ = self
+                    .0
+                    .run_mobile_plugin_async::<()>("cancel_synthesis", cleanup)
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn read_synthesis_audio(
+        &self,
+        payload: ReadSynthesisAudioArgs,
+    ) -> crate::Result<Vec<u8>> {
+        payload.validate()?;
+        let response: NativeReadSynthesisAudioResponse = self
+            .0
+            .run_mobile_plugin_async("read_synthesis_audio", payload)
+            .await?;
+        decode_synthesis_audio(&response.data)
+    }
+
+    pub async fn cancel_synthesis(&self, payload: CancelSynthesisArgs) -> crate::Result<()> {
+        payload.validate()?;
+        self.0
+            .run_mobile_plugin_async("cancel_synthesis", payload)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+impl<R: Runtime> NativeTts<R> {
     pub fn set_media_session_active(
         &self,
         payload: SetMediaSessionActiveRequest,
