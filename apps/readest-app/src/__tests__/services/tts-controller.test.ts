@@ -1363,7 +1363,7 @@ describe('TTSController', () => {
         expect(
           vi
             .mocked(controller.ttsClient.speak)
-            .mock.calls.some((call) => call[2] === false && call[4] === true),
+            .mock.calls.some((call) => call[2] === false && call[4] === 'chapter'),
         ).toBe(true),
       );
     });
@@ -1383,7 +1383,7 @@ describe('TTSController', () => {
         expect(
           vi
             .mocked(controller.ttsClient.speak)
-            .mock.calls.some((call) => call[2] === false && call[4] === false),
+            .mock.calls.some((call) => call[2] === false && call[4] === null),
         ).toBe(true),
       );
     });
@@ -1533,7 +1533,7 @@ describe('TTSController', () => {
         expect(
           vi
             .mocked(controller.ttsClient.speak)
-            .mock.calls.some((call) => call[2] === false && call[4] === true),
+            .mock.calls.some((call) => call[2] === false && call[4] === 'paragraph'),
         ).toBe(true),
       );
     });
@@ -1555,7 +1555,7 @@ describe('TTSController', () => {
         expect(
           vi
             .mocked(controller.ttsClient.speak)
-            .mock.calls.some((call) => call[2] === false && call[4] === false),
+            .mock.calls.some((call) => call[2] === false && call[4] === null),
         ).toBe(true),
       );
     });

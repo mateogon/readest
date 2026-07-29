@@ -1,4 +1,4 @@
-import { TTSGranularity, TTSVoice, TTSVoicesGroup } from './types';
+import { TTSGranularity, TTSPlaybackTransition, TTSVoice, TTSVoicesGroup } from './types';
 import type { SynthesisCoordinatorMetrics } from './SynthesisCoordinator';
 import type { WebAudioPlayerDiagnostics } from './WebAudioPlayer';
 
@@ -45,7 +45,7 @@ export interface TTSClient {
     signal: AbortSignal,
     preload?: boolean,
     preloadPriority?: 'next' | 'prefetch',
-    continuesPreviousParagraph?: boolean,
+    transitionFromPrevious?: TTSPlaybackTransition,
   ): AsyncIterable<TTSMessageEvent>;
   pause(): Promise<boolean>;
   resume(): Promise<boolean>;

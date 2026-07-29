@@ -4,7 +4,7 @@ import { isSameLang } from '@/utils/lang';
 import { NativeAudioPlayer } from './NativeAudioPlayer';
 import { TTSClient, TTSCapabilities, TTSMessageEvent } from './TTSClient';
 import { TTSWordBoundary } from '@/libs/edgeTTS';
-import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
+import { TTSGranularity, TTSMark, TTSPlaybackTransition, TTSVoice, TTSVoicesGroup } from './types';
 import { AppService } from '@/types/system';
 import { parseSSMLMarks } from '@/utils/ssml';
 import type { TTSController } from './TTSController';
@@ -204,7 +204,7 @@ export class BufferedTTSClient implements TTSClient {
     signal: AbortSignal,
     preload = false,
     preloadPriority: 'next' | 'prefetch' = 'prefetch',
-    continuesPreviousParagraph = false,
+    transitionFromPrevious: TTSPlaybackTransition = null,
   ) {
     const { marks } = parseSSMLMarks(ssml, this.#primaryLang);
 
@@ -233,7 +233,7 @@ export class BufferedTTSClient implements TTSClient {
         }
       },
       {
-        continuesPreviousParagraph,
+        transitionFromPrevious,
         leadingGapSec: this.#paragraphGapSec / this.#rate,
       },
     );

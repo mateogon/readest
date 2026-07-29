@@ -95,7 +95,7 @@ describe('WebAudioPlayer scheduling', () => {
 
     ctx.currentTime = 2;
     const second = player.startSession(onEvent, {
-      continuesPreviousParagraph: true,
+      transitionFromPrevious: 'paragraph',
       leadingGapSec: 0.2,
     });
     player.scheduleChunk(second, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.1 });
@@ -110,6 +110,42 @@ describe('WebAudioPlayer scheduling', () => {
         unplannedGapMsP95: 800,
       },
     });
+  });
+
+  test('keeps chapter startup separate from ordinary paragraph transitions', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const first = player.startSession(onEvent);
+    player.scheduleChunk(first, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.endSession(first);
+    await ctx.advanceTo(SAFETY + 1);
+
+    ctx.currentTime = 2;
+    const chapter = player.startSession(onEvent, {
+      transitionFromPrevious: 'chapter',
+      leadingGapSec: 0.2,
+    });
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+    });
+    await ctx.advanceTo(3 + SAFETY);
+
+    expect(player.getDiagnostics()).toMatchObject({
+      paragraphGaps: { transitions: 0 },
+      chapterGaps: {
+        transitions: 1,
+        gapsOver500Ms: 1,
+        unplannedGapMsP95: 800,
+      },
+    });
+    const chapterSchedule = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)))
+      .find((payload) => payload.transitionKind === 'chapter');
+    expect(chapterSchedule).toMatchObject({ configuredGapMs: 200, unplannedGapMs: 800 });
   });
 
   test('does not classify a manual restart after natural completion as a paragraph gap', async () => {
@@ -129,7 +165,10 @@ describe('WebAudioPlayer scheduling', () => {
     });
     await ctx.advanceTo(31 + SAFETY);
 
-    expect(player.getDiagnostics().paragraphGaps.transitions).toBe(0);
+    expect(player.getDiagnostics()).toMatchObject({
+      paragraphGaps: { transitions: 0 },
+      chapterGaps: { transitions: 0 },
+    });
   });
 
   test('reports only audible buffer ahead and clears it after abort', async () => {

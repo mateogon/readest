@@ -7,6 +7,7 @@ import {
   TTSHighlightGranularity,
   TTSHighlightOptions,
   TTSMark,
+  TTSPlaybackTransition,
   TTSVoice,
 } from './types';
 import { createRejectFilter } from '@/utils/node';
@@ -864,10 +865,10 @@ export class TTSController extends EventTarget {
   async #handleNavigationWithSSML(
     ssml: string | undefined,
     isPlaying: boolean,
-    continuesPreviousParagraph = false,
+    transitionFromPrevious: TTSPlaybackTransition = null,
   ) {
     if (isPlaying) {
-      this.#speak(ssml, false, continuesPreviousParagraph);
+      this.#speak(ssml, false, transitionFromPrevious);
     } else {
       if (ssml) {
         const { marks } = parseSSMLMarks(ssml);
@@ -910,11 +911,11 @@ export class TTSController extends EventTarget {
   async #handleNavigationWithoutSSML(
     initSection: () => Promise<boolean>,
     isPlaying: boolean,
-    continuesPreviousParagraph = false,
+    transitionFromPrevious: TTSPlaybackTransition = null,
   ) {
     if (await initSection()) {
       if (isPlaying) {
-        this.#speak(this.#getTts()?.start(), false, continuesPreviousParagraph);
+        this.#speak(this.#getTts()?.start(), false, transitionFromPrevious);
       } else {
         this.#getTts()?.start();
       }
@@ -1006,7 +1007,7 @@ export class TTSController extends EventTarget {
   async #speak(
     ssml: string | undefined | Promise<string>,
     oneTime = false,
-    continuesPreviousParagraph = false,
+    transitionFromPrevious: TTSPlaybackTransition = null,
   ) {
     await this.stop(true);
     this.#terminated = false;
@@ -1071,7 +1072,7 @@ export class TTSController extends EventTarget {
           signal,
           false,
           undefined,
-          continuesPreviousParagraph,
+          transitionFromPrevious,
         );
         let lastCode;
         for await (const { code } of iter) {
@@ -1258,10 +1259,10 @@ export class TTSController extends EventTarget {
       await this.#handleNavigationWithoutSSML(
         () => this.#initTTSForNextSection(),
         isPlaying,
-        isAutoAdvance,
+        isAutoAdvance ? 'chapter' : null,
       );
     } else {
-      await this.#handleNavigationWithSSML(ssml, isPlaying, isAutoAdvance);
+      await this.#handleNavigationWithSSML(ssml, isPlaying, isAutoAdvance ? 'paragraph' : null);
     }
   }
 
