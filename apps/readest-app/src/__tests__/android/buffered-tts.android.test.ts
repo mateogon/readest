@@ -208,6 +208,28 @@ const selectSpeed = async (page: CdpPage, rate: number): Promise<void> => {
   });
 };
 
+const gotoDialogueRegression = async (page: CdpPage): Promise<boolean> => {
+  const found = await page.evaluate<boolean>(`
+    const view = document.querySelector('foliate-view');
+    if (!view?.renderer) return false;
+    const target = 'Ah! that accounts for it';
+    const content = view.renderer.getContents().find((candidate) =>
+      candidate.doc && (candidate.doc.body?.textContent ?? '').includes(target),
+    );
+    if (!content) return false;
+    const block = [...content.doc.querySelectorAll('p')].find((candidate) =>
+      (candidate.textContent ?? '').includes(target),
+    );
+    if (!block) return false;
+    const range = content.doc.createRange();
+    range.selectNodeContents(block);
+    await view.renderer.goTo({ index: content.index, anchor: range });
+    return true;
+  `);
+  if (found) await new Promise((resolve) => setTimeout(resolve, 1000));
+  return found;
+};
+
 interface AndroidProcessSample {
   elapsedMs: number;
   appPid: string;
@@ -328,9 +350,16 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
             (content) => content.doc && content.index === view.renderer.primaryIndex,
           );
           return (primary?.doc?.body?.textContent ?? '').trim().length > 200;
-        `),
+      `),
       { timeoutMs: 30_000, label: `${dialogueE2E ? 'Chapter 7' : 'Chapter 4'} text content` },
     );
+    if (dialogueE2E) {
+      await waitFor(() => gotoDialogueRegression(page), {
+        timeoutMs: 30_000,
+        intervalMs: 500,
+        label: 'Chapter 7 dialogue regression paragraph',
+      });
+    }
   }, 120_000);
 
   afterAll(async () => {
