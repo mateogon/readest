@@ -2,6 +2,12 @@ import { TTSGranularity, TTSMark, TTSPlaybackTransition, TTSVoice, TTSVoicesGrou
 import type { SynthesisCoordinatorMetrics } from './SynthesisCoordinator';
 import type { WebAudioPlayerDiagnostics } from './WebAudioPlayer';
 
+// A semantic sentence may be arbitrarily long (or become long after a broken
+// abbreviation heuristic). Keep every engine request acoustically bounded at
+// real DOM ranges so navigation, highlighting, and timelines share the same
+// segments instead of inventing invisible transport-only continuations.
+export const DEFAULT_TTS_MAX_SEGMENT_CHARS = 200;
+
 type TTSMessageCode = 'boundary' | 'error' | 'end';
 
 export interface TTSMessageEvent {

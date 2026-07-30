@@ -20,7 +20,7 @@ import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { hydrateProvisionalDurations } from './ttsDuration';
 import { DownloadableSentence, SectionEnumerator, TTSDownloader } from './TTSDownloader';
 import { TTSUtils } from './TTSUtils';
-import { TTSBlockInput, TTSClient } from './TTSClient';
+import { DEFAULT_TTS_MAX_SEGMENT_CHARS, TTSBlockInput, TTSClient } from './TTSClient';
 import { startAudioKeepAlive, stopAudioKeepAlive } from './WebAudioPlayer';
 import { isValidLang } from '@/utils/lang';
 import {
@@ -331,6 +331,7 @@ export class TTSController extends EventTarget {
       createTTSNodeFilter(),
       this.#getHighlighter(),
       this.#ttsGranularity,
+      DEFAULT_TTS_MAX_SEGMENT_CHARS,
     );
 
     // A detach (new view closed) or a newer attach superseded this one.
@@ -542,6 +543,7 @@ export class TTSController extends EventTarget {
       createTTSNodeFilter(),
       this.#getHighlighter(),
       granularity,
+      DEFAULT_TTS_MAX_SEGMENT_CHARS,
     );
     this.view.tts = this.#tts;
     console.log(`[TTS] Initialized TTS for section ${sectionIndex}`);
@@ -568,6 +570,7 @@ export class TTSController extends EventTarget {
       textWalker,
       createTTSNodeFilter(),
       this.#ttsGranularity,
+      DEFAULT_TTS_MAX_SEGMENT_CHARS,
     )) {
       sentences.push({ ...entry, text: entry.range.toString() });
     }
@@ -660,7 +663,13 @@ export class TTSController extends EventTarget {
             return trimmed.length > 0 && !/^[\p{P}\p{S}]+$/u.test(trimmed);
           };
           const speakableSegs: { blockIndex: number; markName: string }[] = [];
-          for (const entry of getSentences(doc, textWalker, nodeFilter, granularity)) {
+          for (const entry of getSentences(
+            doc,
+            textWalker,
+            nodeFilter,
+            granularity,
+            DEFAULT_TTS_MAX_SEGMENT_CHARS,
+          )) {
             if (isSpeakable(entry.range.toString())) {
               speakableSegs.push({ blockIndex: entry.blockIndex, markName: entry.markName });
             }
@@ -669,7 +678,14 @@ export class TTSController extends EventTarget {
           // playback synthesizes, so the computed cache keys match. A no-op
           // highlighter: this throwaway instance only generates SSML and must
           // never draw on the live view.
-          const tts = new TTS(doc, textWalker, nodeFilter, () => {}, granularity);
+          const tts = new TTS(
+            doc,
+            textWalker,
+            nodeFilter,
+            () => {},
+            granularity,
+            DEFAULT_TTS_MAX_SEGMENT_CHARS,
+          );
           const marks: { language: string; text: string }[] = [];
           let raw = tts.start();
           while (raw) {
@@ -979,6 +995,7 @@ export class TTSController extends EventTarget {
           createTTSNodeFilter(),
           () => {},
           this.#ttsGranularity,
+          DEFAULT_TTS_MAX_SEGMENT_CHARS,
         );
         // from() positions the shadow on the live block. Its returned SSML is
         // the current block, while speculative preload starts with the next.
@@ -1039,6 +1056,7 @@ export class TTSController extends EventTarget {
         createTTSNodeFilter(),
         () => {},
         this.#ttsGranularity,
+        DEFAULT_TTS_MAX_SEGMENT_CHARS,
       );
       // Position on the live block without using the returned current SSML:
       // currentSSML above may be a preprocessed selection tail and is the

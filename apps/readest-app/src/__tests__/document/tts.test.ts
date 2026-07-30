@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { textWalker } from 'foliate-js/text-walker.js';
-import { TTS } from 'foliate-js/tts.js';
+import { getSentences, TTS } from 'foliate-js/tts.js';
 import { createRejectFilter } from '@/utils/node';
 import { filterSSMLWithLang, parseSSMLMarks } from '@/utils/ssml';
 
@@ -50,6 +50,82 @@ const ttsNodeFilter = createRejectFilter({
 });
 
 describe('TTS', () => {
+  describe('sentence segmentation', () => {
+    it('does not merge ordinary short words with the following sentence', () => {
+      const doc = createHTMLDoc(
+        '<p>No. Continúa la conversación. Terminó con que. Luego respondió claramente.</p>',
+        { lang: 'es' },
+      );
+      const tts = new TTS(doc, textWalker, undefined, highlight, 'sentence');
+
+      const { marks } = parseSSMLMarks(tts.start()!, 'es');
+
+      expect(marks.map(({ text }) => text.trim())).toEqual([
+        'No.',
+        'Continúa la conversación.',
+        'Terminó con que.',
+        'Luego respondió claramente.',
+      ]);
+    });
+
+    it('still keeps a known honorific with the name that follows it', () => {
+      const doc = createHTMLDoc('<p>El Sr. Pérez llegó temprano. Después saludó.</p>', {
+        lang: 'es',
+      });
+      const tts = new TTS(doc, textWalker, undefined, highlight, 'sentence');
+
+      const { marks } = parseSSMLMarks(tts.start()!, 'es');
+
+      expect(marks.map(({ text }) => text.trim())).toEqual([
+        'El Sr. Pérez llegó temprano.',
+        'Después saludó.',
+      ]);
+    });
+
+    it('bounds an unusually long sentence at natural phrase boundaries', () => {
+      const text =
+        'Cuando llegó la mañana, todos siguieron conversando con calma, ' +
+        'aunque nadie entendía todavía la razón del retraso, ' +
+        'y cada nueva explicación añadía otro detalle inesperado, ' +
+        'mientras el tren permanecía inmóvil junto al andén silencioso.';
+      const doc = createHTMLDoc(`<p>${text}</p>`, { lang: 'es' });
+      const tts = new TTS(doc, textWalker, undefined, highlight, 'sentence', 80);
+
+      const { marks } = parseSSMLMarks(tts.start()!, 'es');
+      const ranges = [...getSentences(doc, textWalker, undefined, 'sentence', 80)].map(
+        ({ range }) => range.toString(),
+      );
+
+      expect(marks.length).toBeGreaterThan(1);
+      expect(marks.every(({ text }) => text.length <= 80)).toBe(true);
+      expect(marks.map(({ text }) => text).join('')).toBe(text);
+      expect(ranges).toEqual(marks.map(({ text }) => text));
+    });
+
+    it('never cuts through a UTF-16 surrogate pair when no whitespace is available', () => {
+      const text = 'aaaa😀bbbb😀cccc.';
+      const doc = createHTMLDoc(`<p>${text}</p>`, { lang: 'es' });
+      const tts = new TTS(doc, textWalker, undefined, highlight, 'sentence', 7);
+
+      const { marks } = parseSSMLMarks(tts.start()!, 'es');
+
+      expect(marks.every(({ text }) => text.length <= 7)).toBe(true);
+      expect(marks.map(({ text }) => text).join('')).toBe(text);
+      expect(marks.every(({ text }) => !text.includes('\uFFFD'))).toBe(true);
+    });
+
+    it('does not loop or split a surrogate pair when the requested cap is one', () => {
+      const text = '😀a.';
+      const doc = createHTMLDoc(`<p>${text}</p>`, { lang: 'es' });
+      const ranges = [...getSentences(doc, textWalker, undefined, 'sentence', 1)].map(({ range }) =>
+        range.toString(),
+      );
+
+      expect(ranges.join('')).toBe(text);
+      expect(ranges[0]).toBe('😀');
+    });
+  });
+
   describe('plain HTML document', () => {
     it('should init and generate SSML for a plain HTML doc without doctype or lang', () => {
       const doc = createPlainHTMLDoc(`<html><head></head><body><p>Hello world</p></body></html>`);

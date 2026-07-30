@@ -1,5 +1,6 @@
 import { normalizeSynthesisLocale, type SpeechSynthesisRequest } from './providers/types';
 import type { TTSMark, TTSPlaybackTransition } from './types';
+import { DEFAULT_TTS_MAX_SEGMENT_CHARS } from './TTSClient';
 
 export interface TTSCompositePolicy {
   startupTargetChars: number;
@@ -14,7 +15,7 @@ export const DEFAULT_TTS_COMPOSITE_POLICY = {
   startupTargetChars: 60,
   steadyTargetChars: 150,
   targetDurationSec: 8,
-  maxChars: 200,
+  maxChars: DEFAULT_TTS_MAX_SEGMENT_CHARS,
   maxDurationSec: 15,
   maxUnits: 32,
 } as const satisfies TTSCompositePolicy;
