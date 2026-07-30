@@ -90,6 +90,7 @@ interface ScheduledChunk {
   duration: number;
   timing: ChunkTiming;
   transitionKind: 'sentence' | TTSPlaybackTransition;
+  diagnosticKind: 'sentence' | 'paragraph' | 'chapter' | 'cold-start' | null;
   unplannedGapMs: number | null;
   logicalMarkers: TTSAudioBufferSourceNode[];
   logicalMarkerEnded: boolean[];
@@ -102,6 +103,7 @@ interface PlayerSession {
   onEvent: (event: WebAudioPlayerEvent) => void;
   leadingGapSec: number;
   transitionFromPrevious: TTSPlaybackTransition;
+  coldStartPending: boolean;
   chunks: ScheduledChunk[];
   nextChunkIndex: number;
   nextStartTime: number;
@@ -131,6 +133,9 @@ export interface WebAudioPlayerDiagnostics {
   sentenceGaps: TransitionGapDiagnostics;
   paragraphGaps: TransitionGapDiagnostics;
   chapterGaps: TransitionGapDiagnostics;
+  // Refill transitions after the first chapter chunk remain cold-start work
+  // until one chunk is admitted within the steady-state latency target.
+  coldStartGaps: TransitionGapDiagnostics;
   // Scheduled playout horizon through the end of the last audible buffer;
   // intentionally excludes trailing silence and synthesis/cache lookahead.
   currentBufferAheadMs: number;
@@ -158,6 +163,7 @@ const MAX_PENDING_HIDDEN = 5;
 // Bounds decoded PCM at slow rates (0.2x stretches a 30s sentence to 150s).
 const MAX_AHEAD_SEC = 60;
 const MAX_GAP_SAMPLES = 2048;
+const STEADY_STATE_GAP_THRESHOLD_MS = 50;
 
 const nearestRank = (values: number[], percentile: number): number => {
   if (values.length === 0) return 0;
@@ -267,6 +273,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
   #sentenceGapMs: number[] = [];
   #paragraphGapMs: number[] = [];
   #chapterGapMs: number[] = [];
+  #coldStartGapMs: number[] = [];
   #lastAudibleEndSec: number | null = null;
   #maxBufferAheadMs = 0;
 
@@ -312,6 +319,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       onEvent,
       leadingGapSec: Math.max(0, options.leadingGapSec ?? 0),
       transitionFromPrevious,
+      coldStartPending: false,
       chunks: [],
       nextChunkIndex: 0,
       nextStartTime: 0,
@@ -368,6 +376,22 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const start = Math.max(session.nextStartTime, ctx.currentTime + SCHEDULE_SAFETY_SEC);
     const unplannedGapMs =
       targetStartTime === null ? null : Math.max(0, start - targetStartTime) * 1000;
+    const chapterStart = previousChunk === undefined && transitionKind === 'chapter';
+    const diagnosticKind =
+      transitionKind === null
+        ? null
+        : session.coldStartPending && previousChunk !== undefined
+          ? 'cold-start'
+          : transitionKind;
+    if (chapterStart) {
+      session.coldStartPending = true;
+    } else if (
+      diagnosticKind === 'cold-start' &&
+      unplannedGapMs !== null &&
+      unplannedGapMs <= STEADY_STATE_GAP_THRESHOLD_MS
+    ) {
+      session.coldStartPending = false;
+    }
     if (session.chunks.length === 0) this.#lastAudibleEndSec = null;
     const source = ctx.createBufferSource();
     source.buffer = buffer;
@@ -387,6 +411,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       duration: buffer.duration,
       timing,
       transitionKind,
+      diagnosticKind,
       unplannedGapMs,
       logicalMarkers,
       logicalMarkerEnded: logicalMarkers.map(() => false),
@@ -425,6 +450,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
         startSec: Number(start.toFixed(3)),
         durationSec: Number(buffer.duration.toFixed(3)),
         transitionKind,
+        diagnosticKind,
         configuredGapMs:
           configuredGapSec === null ? null : Math.round(Math.max(0, configuredGapSec) * 1000),
         unplannedGapMs: unplannedGapMs === null ? null : Math.round(unplannedGapMs),
@@ -507,6 +533,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       sentenceGaps: summarizeGaps(this.#sentenceGapMs),
       paragraphGaps: summarizeGaps(this.#paragraphGapMs),
       chapterGaps: summarizeGaps(this.#chapterGapMs),
+      coldStartGaps: summarizeGaps(this.#coldStartGapMs),
       currentBufferAheadMs: Math.round(currentBufferAheadMs),
       maxBufferAheadMs: Math.round(this.#maxBufferAheadMs),
       retainedChunks: this.#session?.chunks.length ?? 0,
@@ -610,13 +637,15 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       }
     }
     this.#lastAudibleEndSec = chunk.startTime + chunk.duration;
-    if (chunk.transitionKind !== null && chunk.unplannedGapMs !== null) {
+    if (chunk.diagnosticKind !== null && chunk.unplannedGapMs !== null) {
       const gaps =
-        chunk.transitionKind === 'sentence'
+        chunk.diagnosticKind === 'sentence'
           ? this.#sentenceGapMs
-          : chunk.transitionKind === 'paragraph'
+          : chunk.diagnosticKind === 'paragraph'
             ? this.#paragraphGapMs
-            : this.#chapterGapMs;
+            : chunk.diagnosticKind === 'chapter'
+              ? this.#chapterGapMs
+              : this.#coldStartGapMs;
       gaps.push(chunk.unplannedGapMs);
       if (gaps.length > MAX_GAP_SAMPLES) gaps.shift();
     }

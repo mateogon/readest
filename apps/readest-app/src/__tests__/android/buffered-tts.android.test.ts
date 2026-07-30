@@ -30,6 +30,7 @@ interface StructuredPayload {
   [key: string]: unknown;
   event?: unknown;
   marks?: unknown;
+  chars?: unknown;
   requestId?: unknown;
   sessionId?: unknown;
   generation?: unknown;
@@ -40,6 +41,18 @@ interface StructuredPayload {
   compositesScheduled?: unknown;
   fallbackSessions?: unknown;
   logicalMarksStarted?: unknown;
+  misses?: unknown;
+  attempts?: unknown;
+  regenerations?: unknown;
+  retries?: unknown;
+  sentenceGaps?: unknown;
+  paragraphGaps?: unknown;
+  chapterGaps?: unknown;
+  coldStartGaps?: unknown;
+  transitions?: unknown;
+  gapsOver500Ms?: unknown;
+  unplannedGapMsP50?: unknown;
+  unplannedGapMsP95?: unknown;
   currentBufferAheadMs?: unknown;
   retainedChunks?: unknown;
 }
@@ -137,7 +150,16 @@ const findBufferedVoiceTarget = (page: CdpPage) =>
 
 const bufferedE2E = process.env['READEST_ANDROID_BUFFERED_E2E'] === '1';
 const backgroundE2E = process.env['READEST_ANDROID_BUFFERED_BACKGROUND_E2E'] === '1';
+const soakE2E = process.env['READEST_ANDROID_BUFFERED_SOAK_E2E'] === '1';
+const dialogueE2E = process.env['READEST_ANDROID_BUFFERED_DIALOGUE_E2E'] === '1';
 const androidEnv = bufferedE2E ? await detectAndroidEnv() : null;
+const SOAK_DURATION_MS = 30 * 60 * 1000;
+const SOAK_POLL_MS = 60 * 1000;
+const BUFFERED_TEST_TIMEOUT_MS = soakE2E
+  ? SOAK_DURATION_MS + 5 * 60 * 1000
+  : dialogueE2E
+    ? 360_000
+    : 240_000;
 
 const getWakefulness = async (): Promise<string | null> => {
   const output = await adbShell('dumpsys power');
@@ -153,6 +175,104 @@ const wakeAndUnlock = async (): Promise<void> => {
   });
 };
 
+const selectSpeed = async (page: CdpPage, rate: number): Promise<void> => {
+  await tapAria(page, 'Speed', '#tts_player_sheet');
+  await waitFor(
+    () =>
+      page.evaluate<boolean>(`
+        return !!document.querySelector('#tts_player_sheet input[aria-label="Speed"]');
+      `),
+    { label: 'Speed slider' },
+  );
+  await page.evaluate<void>(`
+    const slider = document.querySelector('#tts_player_sheet input[aria-label="Speed"]');
+    if (!(slider instanceof HTMLInputElement)) throw new Error('Speed slider not found');
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (!setter) throw new Error('Native input value setter unavailable');
+    setter.call(slider, ${JSON.stringify(String(rate))});
+    slider.dispatchEvent(new Event('input', { bubbles: true }));
+    slider.dispatchEvent(new Event('change', { bubbles: true }));
+    slider.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+  `);
+  await waitFor(
+    () =>
+      page.evaluate<boolean>(`
+        const slider = document.querySelector('#tts_player_sheet input[aria-label="Speed"]');
+        return slider?.getAttribute('aria-valuetext') === ${JSON.stringify(`${rate}×`)};
+      `),
+    { label: `${rate.toFixed(1)}x Speed selection` },
+  );
+  await tapAria(page, 'Go Back', '#tts_player_sheet');
+  await waitFor(() => visibleAriaTarget(page, 'Voice', '#tts_player_sheet'), {
+    label: 'TTS player main view after Speed selection',
+  });
+};
+
+interface AndroidProcessSample {
+  elapsedMs: number;
+  appPid: string;
+  appTotalPssKb: number | null;
+  enginePid: string;
+  engineTotalPssKb: number | null;
+}
+
+let ttsEnginePackage = '';
+
+const readPackageMemory = async (
+  packageName: string,
+): Promise<{ pid: string; totalPssKb: number | null }> => {
+  const pid = (await adbShell(`pidof ${packageName}`)).trim().split(/\s+/)[0];
+  if (!pid) throw new Error(`${packageName} process is not running`);
+  const meminfo = await adbShell(`dumpsys meminfo ${packageName}`);
+  const totalPss = meminfo.match(/TOTAL PSS:\s*([\d,]+)/)?.[1]?.replaceAll(',', '');
+  return { pid, totalPssKb: totalPss === undefined ? null : Number(totalPss) };
+};
+
+const readAndroidProcessSample = async (startedAt: number): Promise<AndroidProcessSample> => {
+  const [app, engine] = await Promise.all([
+    readPackageMemory(APP_PKG),
+    readPackageMemory(ttsEnginePackage),
+  ]);
+  return {
+    elapsedMs: Date.now() - startedAt,
+    appPid: app.pid,
+    appTotalPssKb: app.totalPssKb,
+    enginePid: engine.pid,
+    engineTotalPssKb: engine.totalPssKb,
+  };
+};
+
+const runBackgroundSoak = async (startedAt: number): Promise<AndroidProcessSample[]> => {
+  const samples = [await readAndroidProcessSample(startedAt)];
+  const expectedAppPid = samples[0]!.appPid;
+  const expectedEnginePid = samples[0]!.enginePid;
+  let lastReportedMinute = 0;
+  while (Date.now() - startedAt < SOAK_DURATION_MS) {
+    const remainingMs = SOAK_DURATION_MS - (Date.now() - startedAt);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(SOAK_POLL_MS, remainingMs)));
+    const sample = await readAndroidProcessSample(startedAt);
+    if (sample.appPid !== expectedAppPid) {
+      throw new Error(`Readest process changed during soak: ${expectedAppPid} -> ${sample.appPid}`);
+    }
+    if (sample.enginePid !== expectedEnginePid) {
+      throw new Error(
+        `TTS engine process changed during soak: ${expectedEnginePid} -> ${sample.enginePid}`,
+      );
+    }
+    samples.push(sample);
+    const elapsedMinutes = Math.floor(sample.elapsedMs / 60_000);
+    if (elapsedMinutes >= lastReportedMinute + 5) {
+      lastReportedMinute = elapsedMinutes;
+      console.info(
+        `[test:android] soak progress: ${String(elapsedMinutes)} min, ` +
+          `Readest pid/PSS ${sample.appPid}/${String(sample.appTotalPssKb)} KiB, ` +
+          `engine pid/PSS ${sample.enginePid}/${String(sample.engineTotalPssKb)} KiB`,
+      );
+    }
+  }
+  return samples;
+};
+
 describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP lane', () => {
   let page: CdpPage;
 
@@ -165,8 +285,14 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
     if (!androidEnv) {
       throw new Error(`Android buffered E2E prerequisites missing for ${APP_PKG}`);
     }
-    if (backgroundE2E && !androidEnv.serial.startsWith('emulator-')) {
+    if ((backgroundE2E || soakE2E || dialogueE2E) && !androidEnv.serial.startsWith('emulator-')) {
       throw new Error('Buffered background E2E is restricted to an Android emulator');
+    }
+    if (soakE2E && !backgroundE2E) {
+      throw new Error('Buffered soak E2E requires READEST_ANDROID_BUFFERED_BACKGROUND_E2E=1');
+    }
+    if (dialogueE2E && !backgroundE2E) {
+      throw new Error('Buffered dialogue E2E requires READEST_ANDROID_BUFFERED_BACKGROUND_E2E=1');
     }
     if (!existsSync(FIXTURE)) throw new Error(`fixture not found: ${FIXTURE}`);
 
@@ -180,15 +306,19 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
     if (!services.includes(`packageName=${defaultEngine}`)) {
       throw new Error(`default TextToSpeech engine is not registered: ${defaultEngine}`);
     }
+    ttsEnginePackage = defaultEngine;
 
     page = await openFixtureBook(FIXTURE);
-    const chapterOpened = await waitFor(() => gotoChapter(page, 'chapter\\s*4'), {
+    const chapterPattern = dialogueE2E ? 'chapter\\s*7' : 'chapter\\s*4';
+    const chapterOpened = await waitFor(() => gotoChapter(page, chapterPattern), {
       timeoutMs: 30_000,
       intervalMs: 500,
-      label: 'stable Chapter 4 navigation',
+      label: `stable ${dialogueE2E ? 'Chapter 7' : 'Chapter 4'} navigation`,
     });
     if (!chapterOpened) {
-      throw new Error('sample-alice.epub has no Chapter 4 text section');
+      throw new Error(
+        `sample-alice.epub has no ${dialogueE2E ? 'Chapter 7' : 'Chapter 4'} text section`,
+      );
     }
     await waitFor(
       () =>
@@ -199,7 +329,7 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
           );
           return (primary?.doc?.body?.textContent ?? '').trim().length > 200;
         `),
-      { timeoutMs: 30_000, label: 'Chapter 4 text content' },
+      { timeoutMs: 30_000, label: `${dialogueE2E ? 'Chapter 7' : 'Chapter 4'} text content` },
     );
   }, 120_000);
 
@@ -212,7 +342,7 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
         if (stop) await page.tap(stop.x, stop.y);
       }
     } finally {
-      if (backgroundE2E && androidEnv) await wakeAndUnlock();
+      if ((backgroundE2E || soakE2E || dialogueE2E) && androidEnv) await wakeAndUnlock();
       page?.close();
       // The package is an isolated debug build. Always terminate it even when
       // a failed assertion leaves the sheet covering Stop, otherwise native
@@ -221,65 +351,68 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
     }
   });
 
-  it('selects, persists, schedules, and stops the buffered provider without retaining audio', async () => {
-    const existingStop = await visibleAriaTarget(page, 'Stop reading aloud');
-    if (existingStop) {
-      await page.tap(existingStop.x, existingStop.y);
-      await waitFor(
-        async () => (!(await visibleAriaTarget(page, 'Stop reading aloud')) ? true : null),
-        {
-          label: 'existing TTS session stopped',
-        },
-      );
-    }
+  it(
+    'selects, persists, schedules, and stops the buffered provider without retaining audio',
+    async () => {
+      const existingStop = await visibleAriaTarget(page, 'Stop reading aloud');
+      if (existingStop) {
+        await page.tap(existingStop.x, existingStop.y);
+        await waitFor(
+          async () => (!(await visibleAriaTarget(page, 'Stop reading aloud')) ? true : null),
+          {
+            label: 'existing TTS session stopped',
+          },
+        );
+      }
 
-    // This is a dedicated debug package, so seed a deterministic established
-    // provider before each run. A prior successful run leaves Buffered
-    // preferred; without this reset the test would re-select the active voice
-    // instead of exercising a real native -> buffered transition.
-    await page.evaluate<void>(`
+      // This is a dedicated debug package, so seed a deterministic established
+      // provider before each run. A prior successful run leaves Buffered
+      // preferred; without this reset the test would re-select the active voice
+      // instead of exercising a real native -> buffered transition.
+      await page.evaluate<void>(`
       localStorage.setItem(
         'ttsPreferredVoices',
         JSON.stringify({ preferredClient: 'native-tts' }),
       );
     `);
 
-    // A real touch gesture is required to unlock WebAudio. Do not replace this
-    // with element.click() or an app-bus dispatch: those do not carry browser
-    // user activation.
-    await revealReaderChrome(page);
-    await tapAria(page, 'Speak');
-    await waitFor(() => visibleAriaTarget(page, 'Open Read Aloud player'), {
-      timeoutMs: 60_000,
-      label: 'Read Aloud mini player',
-    });
+      // A real touch gesture is required to unlock WebAudio. Do not replace this
+      // with element.click() or an app-bus dispatch: those do not carry browser
+      // user activation.
+      await revealReaderChrome(page);
+      await tapAria(page, 'Speak');
+      await waitFor(() => visibleAriaTarget(page, 'Open Read Aloud player'), {
+        timeoutMs: 60_000,
+        label: 'Read Aloud mini player',
+      });
 
-    // The mini player appears before client initialization finishes. Retry the
-    // real tap until the supported player sheet exposes its Voice control.
-    await waitFor(
-      async () => {
-        const open = await visibleAriaTarget(page, 'Open Read Aloud player');
-        if (!open) return null;
-        await page.tap(open.x, open.y);
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        return (await visibleAriaTarget(page, 'Voice', '#tts_player_sheet')) ? true : null;
-      },
-      { timeoutMs: 60_000, intervalMs: 500, label: 'initialized Read Aloud player sheet' },
-    );
-    await tapAria(page, 'Voice', '#tts_player_sheet');
-    const bufferedVoice = await waitFor(() => findBufferedVoiceTarget(page), {
-      timeoutMs: 30_000,
-      label: 'enabled buffered Android voice',
-    });
+      // The mini player appears before client initialization finishes. Retry the
+      // real tap until the supported player sheet exposes its Voice control.
+      await waitFor(
+        async () => {
+          const open = await visibleAriaTarget(page, 'Open Read Aloud player');
+          if (!open) return null;
+          await page.tap(open.x, open.y);
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          return (await visibleAriaTarget(page, 'Voice', '#tts_player_sheet')) ? true : null;
+        },
+        { timeoutMs: 60_000, intervalMs: 500, label: 'initialized Read Aloud player sheet' },
+      );
+      if (soakE2E || dialogueE2E) await selectSpeed(page, 1.5);
+      await tapAria(page, 'Voice', '#tts_player_sheet');
+      const bufferedVoice = await waitFor(() => findBufferedVoiceTarget(page), {
+        timeoutMs: 30_000,
+        label: 'enabled buffered Android voice',
+      });
 
-    page.clearRuntimeEvents();
-    // Selecting a voice is the supported UI path into TTSController.setVoice;
-    // the same real gesture also owns the ensuing stop -> switch -> start.
-    await page.tap(bufferedVoice.x, bufferedVoice.y);
+      page.clearRuntimeEvents();
+      // Selecting a voice is the supported UI path into TTSController.setVoice;
+      // the same real gesture also owns the ensuing stop -> switch -> start.
+      await page.tap(bufferedVoice.x, bufferedVoice.y);
 
-    const persisted = await waitFor(
-      () =>
-        page.evaluate<{ client: string; voice: string } | null>(`
+      const persisted = await waitFor(
+        () =>
+          page.evaluate<{ client: string; voice: string } | null>(`
           const raw = localStorage.getItem('ttsPreferredVoices');
           if (!raw) return null;
           const values = JSON.parse(raw);
@@ -291,158 +424,236 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
             ? { client: values.preferredClient, voice }
             : null;
         `),
-      { timeoutMs: 30_000, label: 'persisted buffered provider preference' },
-    );
-    expect(persisted.client).toBe(BUFFERED_PROVIDER);
-    expect(persisted.voice.startsWith(BUFFERED_VOICE_PREFIX)).toBe(true);
+        { timeoutMs: 30_000, label: 'persisted buffered provider preference' },
+      );
+      expect(persisted.client).toBe(BUFFERED_PROVIDER);
+      expect(persisted.voice.startsWith(BUFFERED_VOICE_PREFIX)).toBe(true);
 
-    const runtimeEvidence = await waitFor(
-      async () => {
-        const entries = page.getConsoleEntries();
-        const android = parseStructuredEvents(entries, ANDROID_EVENT_PREFIX);
-        const scheduled = parseStructuredEvents(entries, WEB_AUDIO_EVENT_PREFIX).filter(
-          ({ payload }) => payload.event === 'scheduled',
-        );
-        const composite = parseStructuredEvents(entries, COMPOSITE_EVENT_PREFIX).find(
-          ({ payload }) =>
-            payload.event === 'scheduled' && typeof payload.marks === 'number' && payload.marks > 1,
-        );
-        if (!composite) return null;
+      const runtimeEvidence = await waitFor(
+        async () => {
+          const entries = page.getConsoleEntries();
+          const android = parseStructuredEvents(entries, ANDROID_EVENT_PREFIX);
+          const scheduled = parseStructuredEvents(entries, WEB_AUDIO_EVENT_PREFIX).filter(
+            ({ payload }) => payload.event === 'scheduled',
+          );
+          const composite = parseStructuredEvents(entries, COMPOSITE_EVENT_PREFIX).find(
+            ({ payload }) =>
+              payload.event === 'scheduled' &&
+              typeof payload.marks === 'number' &&
+              payload.marks > 1,
+          );
+          if (!composite) return null;
 
-        for (const web of scheduled.filter(({ index }) => index < composite.index).reverse()) {
-          const bridge = android
-            .filter(
-              ({ index, payload }) => index < web.index && payload.event === 'bridge-completed',
-            )
-            .at(-1);
-          if (!bridge) continue;
-          const requestId = bridge.payload.requestId;
-          const sessionId = bridge.payload.sessionId;
-          const synthesisGeneration = bridge.payload.generation;
-          const file = android.find(
-            ({ index, payload }) =>
-              index < bridge.index &&
-              payload.event === 'file-ready' &&
-              payload.requestId === requestId &&
-              payload.sessionId === sessionId &&
-              payload.generation === synthesisGeneration,
+          for (const web of scheduled.filter(({ index }) => index < composite.index).reverse()) {
+            const bridge = android
+              .filter(
+                ({ index, payload }) => index < web.index && payload.event === 'bridge-completed',
+              )
+              .at(-1);
+            if (!bridge) continue;
+            const requestId = bridge.payload.requestId;
+            const sessionId = bridge.payload.sessionId;
+            const synthesisGeneration = bridge.payload.generation;
+            const file = android.find(
+              ({ index, payload }) =>
+                index < bridge.index &&
+                payload.event === 'file-ready' &&
+                payload.requestId === requestId &&
+                payload.sessionId === sessionId &&
+                payload.generation === synthesisGeneration,
+            );
+            const start = android.find(
+              ({ index, payload }) =>
+                index < (file?.index ?? -1) &&
+                payload.event === 'native-start' &&
+                payload.requestId === requestId &&
+                payload.sessionId === sessionId &&
+                payload.generation === synthesisGeneration,
+            );
+            if (!start || !file) continue;
+            // WebAudio has its own playout-generation counter. The bridge does
+            // not currently copy the provider request ID into scheduleChunk, so
+            // correlate the real pipeline by strict event order: the closest
+            // completed bridge before this schedule, with no newer native start
+            // interposed, must be the audio admission that produced it.
+            const interposedStart = android.some(
+              ({ index, payload }) =>
+                index > bridge.index && index < web.index && payload.event === 'native-start',
+            );
+            if (interposedStart) continue;
+            const physicalSchedules = scheduled.filter(
+              ({ index }) => index > bridge.index && index < composite.index,
+            );
+            if (physicalSchedules.length !== 1) continue;
+            return { start, file, bridge, web, composite, physicalSchedules };
+          }
+          return null;
+        },
+        { timeoutMs: 120_000, intervalMs: 250, label: 'correlated buffered synthesis pipeline' },
+      );
+
+      expect(runtimeEvidence.start.index).toBeLessThan(runtimeEvidence.file.index);
+      expect(runtimeEvidence.file.index).toBeLessThan(runtimeEvidence.bridge.index);
+      expect(runtimeEvidence.bridge.index).toBeLessThan(runtimeEvidence.web.index);
+      expect(runtimeEvidence.start.payload.generation).toBe(
+        runtimeEvidence.bridge.payload.generation,
+      );
+      expect(typeof runtimeEvidence.web.payload.generation).toBe('number');
+
+      expect(runtimeEvidence.composite.payload.event).toBe('scheduled');
+      expect(runtimeEvidence.composite.payload.marks).toEqual(expect.any(Number));
+      expect(Number(runtimeEvidence.composite.payload.marks)).toBeGreaterThan(1);
+      expect(runtimeEvidence.physicalSchedules).toHaveLength(1);
+      console.info(
+        `[test:android] buffered synthesis outcome: composite ` +
+          `(${String(runtimeEvidence.composite.payload.marks)} logical marks, 1 WebAudio chunk)`,
+      );
+
+      if (backgroundE2E) {
+        const beforeScreenOffEntryCount = page.getConsoleEntries().length;
+        try {
+          await adbShell('input keyevent KEYCODE_SLEEP');
+          await waitFor(async () => ((await getWakefulness()) !== 'Awake' ? true : null), {
+            timeoutMs: 15_000,
+            label: 'non-awake Android emulator',
+          });
+          const screenOffStartedAt = Date.now();
+          const backgroundEvidence = await waitFor(
+            async () => {
+              const entries = page.getConsoleEntries();
+              const newSchedules = parseStructuredEvents(entries, WEB_AUDIO_EVENT_PREFIX).filter(
+                ({ index, payload }) =>
+                  index >= beforeScreenOffEntryCount && payload.event === 'scheduled',
+              );
+              const newComposites = parseStructuredEvents(entries, COMPOSITE_EVENT_PREFIX).filter(
+                ({ index, payload }) =>
+                  index >= beforeScreenOffEntryCount && payload.event === 'scheduled',
+              );
+              return newSchedules.length >= 4 && newComposites.length > 0
+                ? { newSchedules, newComposites }
+                : null;
+            },
+            {
+              timeoutMs: 180_000,
+              intervalMs: 500,
+              label: 'screen-off WebAudio refill beyond hidden queue headroom',
+            },
           );
-          const start = android.find(
-            ({ index, payload }) =>
-              index < (file?.index ?? -1) &&
-              payload.event === 'native-start' &&
-              payload.requestId === requestId &&
-              payload.sessionId === sessionId &&
-              payload.generation === synthesisGeneration,
+          expect(backgroundEvidence.newSchedules.length).toBeGreaterThanOrEqual(4);
+          expect(backgroundEvidence.newComposites.length).toBeGreaterThan(0);
+          console.info(
+            `[test:android] screen-off outcome: ${String(backgroundEvidence.newSchedules.length)} ` +
+              `new WebAudio chunks, ${String(backgroundEvidence.newComposites.length)} composites`,
           );
-          if (!start || !file) continue;
-          // WebAudio has its own playout-generation counter. The bridge does
-          // not currently copy the provider request ID into scheduleChunk, so
-          // correlate the real pipeline by strict event order: the closest
-          // completed bridge before this schedule, with no newer native start
-          // interposed, must be the audio admission that produced it.
-          const interposedStart = android.some(
-            ({ index, payload }) =>
-              index > bridge.index && index < web.index && payload.event === 'native-start',
-          );
-          if (interposedStart) continue;
-          const physicalSchedules = scheduled.filter(
-            ({ index }) => index > bridge.index && index < composite.index,
-          );
-          if (physicalSchedules.length !== 1) continue;
-          return { start, file, bridge, web, composite, physicalSchedules };
+          if (dialogueE2E) {
+            const dialogueComposite = await waitFor(
+              async () =>
+                parseStructuredEvents(page.getConsoleEntries(), COMPOSITE_EVENT_PREFIX).find(
+                  ({ payload }) =>
+                    payload.event === 'scheduled' && payload.marks === 3 && payload.chars === 167,
+                ) ?? null,
+              {
+                timeoutMs: 240_000,
+                intervalMs: 500,
+                label: 'Chapter 7 short-dialogue composite (3 marks, 167 chars)',
+              },
+            );
+            expect(dialogueComposite.payload.event).toBe('scheduled');
+            console.info(
+              '[test:android] dialogue regression outcome: 3 marks/167 chars composite scheduled',
+            );
+          }
+          if (soakE2E) {
+            const samples = await runBackgroundSoak(screenOffStartedAt);
+            const appPssSamples = samples
+              .map(({ appTotalPssKb }) => appTotalPssKb)
+              .filter((value): value is number => value !== null);
+            const enginePssSamples = samples
+              .map(({ engineTotalPssKb }) => engineTotalPssKb)
+              .filter((value): value is number => value !== null);
+            expect(appPssSamples.length).toBe(samples.length);
+            expect(enginePssSamples.length).toBe(samples.length);
+            console.info(
+              `[test:android] soak outcome: ${String(Math.floor(samples.at(-1)!.elapsedMs / 60_000))} ` +
+                `min, ${String(samples.length)} samples, Readest pid ${samples[0]!.appPid}, ` +
+                `PSS first/min/max/last ${String(appPssSamples[0])}/${String(Math.min(...appPssSamples))}/` +
+                `${String(Math.max(...appPssSamples))}/${String(appPssSamples.at(-1))} KiB; ` +
+                `engine pid ${samples[0]!.enginePid}, PSS first/min/max/last ` +
+                `${String(enginePssSamples[0])}/${String(Math.min(...enginePssSamples))}/` +
+                `${String(Math.max(...enginePssSamples))}/${String(enginePssSamples.at(-1))} KiB`,
+            );
+          }
+        } finally {
+          await wakeAndUnlock();
         }
-        return null;
-      },
-      { timeoutMs: 120_000, intervalMs: 250, label: 'correlated buffered synthesis pipeline' },
-    );
-
-    expect(runtimeEvidence.start.index).toBeLessThan(runtimeEvidence.file.index);
-    expect(runtimeEvidence.file.index).toBeLessThan(runtimeEvidence.bridge.index);
-    expect(runtimeEvidence.bridge.index).toBeLessThan(runtimeEvidence.web.index);
-    expect(runtimeEvidence.start.payload.generation).toBe(
-      runtimeEvidence.bridge.payload.generation,
-    );
-    expect(typeof runtimeEvidence.web.payload.generation).toBe('number');
-
-    expect(runtimeEvidence.composite.payload.event).toBe('scheduled');
-    expect(runtimeEvidence.composite.payload.marks).toEqual(expect.any(Number));
-    expect(Number(runtimeEvidence.composite.payload.marks)).toBeGreaterThan(1);
-    expect(runtimeEvidence.physicalSchedules).toHaveLength(1);
-    console.info(
-      `[test:android] buffered synthesis outcome: composite ` +
-        `(${String(runtimeEvidence.composite.payload.marks)} logical marks, 1 WebAudio chunk)`,
-    );
-
-    if (backgroundE2E) {
-      const beforeScreenOffEntryCount = page.getConsoleEntries().length;
-      try {
-        await adbShell('input keyevent KEYCODE_SLEEP');
-        await waitFor(async () => ((await getWakefulness()) !== 'Awake' ? true : null), {
-          timeoutMs: 15_000,
-          label: 'non-awake Android emulator',
-        });
-        const backgroundEvidence = await waitFor(
-          async () => {
-            const entries = page.getConsoleEntries();
-            const newSchedules = parseStructuredEvents(entries, WEB_AUDIO_EVENT_PREFIX).filter(
-              ({ index, payload }) =>
-                index >= beforeScreenOffEntryCount && payload.event === 'scheduled',
-            );
-            const newComposites = parseStructuredEvents(entries, COMPOSITE_EVENT_PREFIX).filter(
-              ({ index, payload }) =>
-                index >= beforeScreenOffEntryCount && payload.event === 'scheduled',
-            );
-            return newSchedules.length >= 4 && newComposites.length > 0
-              ? { newSchedules, newComposites }
-              : null;
-          },
-          {
-            timeoutMs: 180_000,
-            intervalMs: 500,
-            label: 'screen-off WebAudio refill beyond hidden queue headroom',
-          },
-        );
-        expect(backgroundEvidence.newSchedules.length).toBeGreaterThanOrEqual(4);
-        expect(backgroundEvidence.newComposites.length).toBeGreaterThan(0);
-        console.info(
-          `[test:android] screen-off outcome: ${String(backgroundEvidence.newSchedules.length)} ` +
-            `new WebAudio chunks, ${String(backgroundEvidence.newComposites.length)} composites`,
-        );
-      } finally {
-        await wakeAndUnlock();
       }
-    }
 
-    await tapAria(page, 'Close', '#tts_player_sheet');
-    const stop = await waitFor(() => visibleAriaTarget(page, 'Stop reading aloud'), {
-      label: 'buffered mini-player Stop control',
-    });
-    const beforeStopEntryCount = page.getConsoleEntries().length;
-    await page.tap(stop.x, stop.y);
+      await tapAria(page, 'Close', '#tts_player_sheet');
+      const stop = await waitFor(() => visibleAriaTarget(page, 'Stop reading aloud'), {
+        label: 'buffered mini-player Stop control',
+      });
+      const beforeStopEntryCount = page.getConsoleEntries().length;
+      await page.tap(stop.x, stop.y);
 
-    const finalMetrics = await waitFor(
-      async () => {
-        const entries = page.getConsoleEntries().slice(beforeStopEntryCount);
-        return (
-          parseStructuredEvents(entries, METRICS_EVENT_PREFIX)
-            .map(({ payload }) => payload)
-            .find((payload) => payload.client === BUFFERED_PROVIDER && payload.reason === 'stop') ??
-          null
+      const finalMetrics = await waitFor(
+        async () => {
+          const entries = page.getConsoleEntries().slice(beforeStopEntryCount);
+          return (
+            parseStructuredEvents(entries, METRICS_EVENT_PREFIX)
+              .map(({ payload }) => payload)
+              .find(
+                (payload) => payload.client === BUFFERED_PROVIDER && payload.reason === 'stop',
+              ) ?? null
+          );
+        },
+        { timeoutMs: 30_000, label: 'buffered Stop metrics' },
+      );
+      const playback = finalMetrics.playback as StructuredPayload | undefined;
+      const composite = finalMetrics.composite as StructuredPayload | undefined;
+      expect(Number(composite?.compositesScheduled)).toBeGreaterThan(0);
+      expect(composite?.fallbackSessions).toBe(0);
+      // Chunk start accounts for the first mark. A second started mark proves
+      // that the WebAudio clock crossed a real internal composite boundary;
+      // requiring a third made the short lane depend on exactly when Stop won
+      // the race after the refill assertion.
+      if (backgroundE2E) expect(Number(composite?.logicalMarksStarted)).toBeGreaterThan(1);
+      if (soakE2E) {
+        expect(Number(composite?.logicalMarksStarted)).toBeGreaterThanOrEqual(500);
+        expect(finalMetrics.retries).toBe(0);
+        expect(finalMetrics.attempts).toBe(finalMetrics.misses);
+        const regenerationsPer100Marks =
+          (100 * Number(finalMetrics.regenerations)) / Number(composite?.logicalMarksStarted);
+        console.info(
+          `[test:android] repeated acoustic requests: ${String(finalMetrics.regenerations)} ` +
+            `(${regenerationsPer100Marks.toFixed(2)} per 100 logical marks); ` +
+            `streamed playback has one sequential scheduler, so this content-key metric ` +
+            `also counts legitimate repeated phrases after ephemeral eviction`,
         );
-      },
-      { timeoutMs: 30_000, label: 'buffered Stop metrics' },
-    );
-    const playback = finalMetrics.playback as StructuredPayload | undefined;
-    const composite = finalMetrics.composite as StructuredPayload | undefined;
-    expect(Number(composite?.compositesScheduled)).toBeGreaterThan(0);
-    expect(composite?.fallbackSessions).toBe(0);
-    if (backgroundE2E) expect(Number(composite?.logicalMarksStarted)).toBeGreaterThan(2);
-    expect(playback?.currentBufferAheadMs).toBe(0);
-    expect(playback?.retainedChunks).toBe(0);
-    const unexpectedExceptions = page
-      .getExceptions()
-      .filter(({ description }) => !description.includes('ResizeObserver loop completed'));
-    expect(unexpectedExceptions).toEqual([]);
-  }, 240_000);
+        // Sentence and paragraph are steady-state transitions. Chapter
+        // changes require a new document cursor/session and are reported
+        // separately as cold transitions instead of being judged by the
+        // steady-state underrun target.
+        for (const gaps of [playback?.sentenceGaps, playback?.paragraphGaps] as unknown[]) {
+          const diagnostics = gaps as StructuredPayload | undefined;
+          if (!diagnostics || Number(diagnostics.transitions) === 0) continue;
+          expect(Number(diagnostics.unplannedGapMsP50)).toBeLessThanOrEqual(50);
+          expect(Number(diagnostics.unplannedGapMsP95)).toBeLessThanOrEqual(150);
+          expect(Number(diagnostics.gapsOver500Ms)).toBe(0);
+        }
+        console.info(
+          `[test:android] cold transition diagnostics: ${JSON.stringify({
+            chapter: playback?.chapterGaps,
+            refill: playback?.coldStartGaps,
+          })}`,
+        );
+      }
+      expect(playback?.currentBufferAheadMs).toBe(0);
+      expect(playback?.retainedChunks).toBe(0);
+      const unexpectedExceptions = page
+        .getExceptions()
+        .filter(({ description }) => !description.includes('ResizeObserver loop completed'));
+      expect(unexpectedExceptions).toEqual([]);
+    },
+    BUFFERED_TEST_TIMEOUT_MS,
+  );
 });

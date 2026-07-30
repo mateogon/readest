@@ -279,6 +279,57 @@ describe('WebAudioPlayer scheduling', () => {
     expect(chapterSchedule).toMatchObject({ configuredGapMs: 200, unplannedGapMs: 800 });
   });
 
+  test('keeps chapter refill gaps out of steady-state paragraph diagnostics', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const first = player.startSession(onEvent);
+    player.scheduleChunk(first, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+    });
+    player.endSession(first);
+    await ctx.advanceTo(SAFETY + 1);
+
+    ctx.currentTime = 2;
+    const chapter = player.startSession(onEvent, {
+      transitionFromPrevious: 'chapter',
+      leadingGapSec: 0.2,
+    });
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+    });
+    ctx.currentTime = 4;
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+      transitionFromPrevious: 'paragraph',
+    });
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+      transitionFromPrevious: 'sentence',
+    });
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+      transitionFromPrevious: 'paragraph',
+    });
+    await ctx.advanceTo(8);
+
+    expect(player.getDiagnostics()).toMatchObject({
+      chapterGaps: { transitions: 1, unplannedGapMsP95: 800 },
+      coldStartGaps: { transitions: 2, gapsOver500Ms: 1, unplannedGapMsP95: 800 },
+      sentenceGaps: { transitions: 0 },
+      paragraphGaps: { transitions: 1, gapsOver500Ms: 0, unplannedGapMsP95: 0 },
+    });
+  });
+
   test('does not classify a manual restart after natural completion as a paragraph gap', async () => {
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
