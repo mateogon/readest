@@ -727,7 +727,7 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
       expect(Number(composite?.compositesScheduled)).toBeGreaterThan(0);
       expect(composite?.fallbackSessions).toBe(0);
       if (lifecycleE2E) {
-        expect(Number(playback?.sessionsStarted)).toBeGreaterThanOrEqual(3);
+        expect(Number(playback?.['sessionsStarted'])).toBeGreaterThanOrEqual(3);
         expect(finalMetrics.regenerations).toBe(0);
         expect(finalMetrics.retries).toBe(0);
       }
