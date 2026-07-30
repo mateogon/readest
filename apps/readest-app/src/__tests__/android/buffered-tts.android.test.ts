@@ -152,6 +152,7 @@ const bufferedE2E = process.env['READEST_ANDROID_BUFFERED_E2E'] === '1';
 const backgroundE2E = process.env['READEST_ANDROID_BUFFERED_BACKGROUND_E2E'] === '1';
 const soakE2E = process.env['READEST_ANDROID_BUFFERED_SOAK_E2E'] === '1';
 const dialogueE2E = process.env['READEST_ANDROID_BUFFERED_DIALOGUE_E2E'] === '1';
+const lifecycleE2E = process.env['READEST_ANDROID_BUFFERED_LIFECYCLE_E2E'] === '1';
 const androidEnv = bufferedE2E ? await detectAndroidEnv() : null;
 const SOAK_DURATION_MS = 30 * 60 * 1000;
 const SOAK_POLL_MS = 60 * 1000;
@@ -228,6 +229,76 @@ const gotoDialogueRegression = async (page: CdpPage): Promise<boolean> => {
   `);
   if (found) await new Promise((resolve) => setTimeout(resolve, 1000));
   return found;
+};
+
+const scheduledWebAudioEvents = (page: CdpPage): StructuredEvent[] =>
+  parseStructuredEvents(page.getConsoleEntries(), WEB_AUDIO_EVENT_PREFIX).filter(
+    ({ payload }) => payload.event === 'scheduled' && typeof payload.generation === 'number',
+  );
+
+const latestWebAudioGeneration = (page: CdpPage): number =>
+  Math.max(...scheduledWebAudioEvents(page).map(({ payload }) => Number(payload.generation)));
+
+const waitForNewWebAudioGeneration = (page: CdpPage, previousGeneration: number, label: string) =>
+  waitFor(
+    async () =>
+      scheduledWebAudioEvents(page).find(
+        ({ payload }) => Number(payload.generation) > previousGeneration,
+      ) ?? null,
+    { timeoutMs: 60_000, intervalMs: 250, label },
+  );
+
+const assertNoOlderSchedulingAfter = async (
+  page: CdpPage,
+  event: StructuredEvent,
+): Promise<void> => {
+  const generation = Number(event.payload.generation);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const stale = scheduledWebAudioEvents(page).filter(
+    ({ index, payload }) => index > event.index && Number(payload.generation) < generation,
+  );
+  expect(stale).toEqual([]);
+};
+
+const runLifecycleProbe = async (page: CdpPage): Promise<[number, number, number]> => {
+  const initialGeneration = latestWebAudioGeneration(page);
+
+  await tapAria(page, 'Pause', '#tts_player_sheet');
+  await waitFor(() => visibleAriaTarget(page, 'Play', '#tts_player_sheet'), {
+    label: 'buffered player paused',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  expect(await visibleAriaTarget(page, 'Play', '#tts_player_sheet')).not.toBeNull();
+
+  await tapAria(page, 'Play', '#tts_player_sheet');
+  await waitFor(() => visibleAriaTarget(page, 'Pause', '#tts_player_sheet'), {
+    label: 'buffered player resumed',
+  });
+
+  await tapAria(page, 'Next Sentence', '#tts_player_sheet');
+  const forward = await waitForNewWebAudioGeneration(
+    page,
+    initialGeneration,
+    'new WebAudio generation after Next Sentence',
+  );
+  await assertNoOlderSchedulingAfter(page, forward);
+  await waitFor(() => visibleAriaTarget(page, 'Pause', '#tts_player_sheet'), {
+    label: 'buffered playback after Next Sentence',
+  });
+
+  const forwardGeneration = Number(forward.payload.generation);
+  await tapAria(page, 'Previous Sentence', '#tts_player_sheet');
+  const backward = await waitForNewWebAudioGeneration(
+    page,
+    forwardGeneration,
+    'new WebAudio generation after Previous Sentence',
+  );
+  await assertNoOlderSchedulingAfter(page, backward);
+  await waitFor(() => visibleAriaTarget(page, 'Pause', '#tts_player_sheet'), {
+    label: 'buffered playback after Previous Sentence',
+  });
+
+  return [initialGeneration, forwardGeneration, Number(backward.payload.generation)];
 };
 
 interface AndroidProcessSample {
@@ -307,8 +378,11 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
     if (!androidEnv) {
       throw new Error(`Android buffered E2E prerequisites missing for ${APP_PKG}`);
     }
-    if ((backgroundE2E || soakE2E || dialogueE2E) && !androidEnv.serial.startsWith('emulator-')) {
-      throw new Error('Buffered background E2E is restricted to an Android emulator');
+    if (
+      (backgroundE2E || soakE2E || dialogueE2E || lifecycleE2E) &&
+      !androidEnv.serial.startsWith('emulator-')
+    ) {
+      throw new Error('Buffered extended E2E is restricted to an Android emulator');
     }
     if (soakE2E && !backgroundE2E) {
       throw new Error('Buffered soak E2E requires READEST_ANDROID_BUFFERED_BACKGROUND_E2E=1');
@@ -427,7 +501,8 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
         },
         { timeoutMs: 60_000, intervalMs: 500, label: 'initialized Read Aloud player sheet' },
       );
-      if (soakE2E || dialogueE2E) await selectSpeed(page, 1.5);
+      if (lifecycleE2E) await selectSpeed(page, 1);
+      else if (soakE2E || dialogueE2E) await selectSpeed(page, 1.5);
       await tapAria(page, 'Voice', '#tts_player_sheet');
       const bufferedVoice = await waitFor(() => findBufferedVoiceTarget(page), {
         timeoutMs: 30_000,
@@ -538,6 +613,16 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
           `(${String(runtimeEvidence.composite.payload.marks)} logical marks, 1 WebAudio chunk)`,
       );
 
+      if (lifecycleE2E) {
+        const generations = await runLifecycleProbe(page);
+        expect(generations[1]).toBeGreaterThan(generations[0]);
+        expect(generations[2]).toBeGreaterThan(generations[1]);
+        console.info(
+          `[test:android] lifecycle outcome: pause/resume, next/previous generations ` +
+            generations.join(' -> '),
+        );
+      }
+
       if (backgroundE2E) {
         const beforeScreenOffEntryCount = page.getConsoleEntries().length;
         try {
@@ -641,6 +726,11 @@ describe.runIf(bufferedE2E)('Android buffered System TTS over the existing CDP l
       const composite = finalMetrics.composite as StructuredPayload | undefined;
       expect(Number(composite?.compositesScheduled)).toBeGreaterThan(0);
       expect(composite?.fallbackSessions).toBe(0);
+      if (lifecycleE2E) {
+        expect(Number(playback?.sessionsStarted)).toBeGreaterThanOrEqual(3);
+        expect(finalMetrics.regenerations).toBe(0);
+        expect(finalMetrics.retries).toBe(0);
+      }
       // Chunk start accounts for the first mark. A second started mark proves
       // that the WebAudio clock crossed a real internal composite boundary;
       // requiring a third made the short lane depend on exactly when Stop won
