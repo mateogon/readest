@@ -5,6 +5,10 @@ use std::collections::HashMap;
 #[serde(rename_all = "camelCase")]
 pub struct AuthRequest {
     pub auth_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_scheme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -54,9 +58,13 @@ pub struct UseBackgroundAudioRequest {
     pub enabled: bool,
 }
 
+/// Which piece of the OS selection UI to gate: "gesture" suppresses the
+/// long-press text-selection gesture (iOS, instant highlight), "menu"
+/// suppresses the floating selection toolbar (Android, #5427).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetTextSelectionSuppressedRequest {
+pub struct SetSelectionSuppressedRequest {
+    pub target: String,
     pub suppressed: bool,
 }
 
@@ -219,6 +227,20 @@ pub struct SetScreenBrightnessRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetScreenBrightnessResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HasAmbientLightSensorResponse {
+    pub available: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmbientLightUpdatesResponse {
     pub success: bool,
     pub error: Option<String>,
 }

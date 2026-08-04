@@ -40,6 +40,8 @@ export const LibraryGroupByType = {
   Group: 'group',
   Series: 'series',
   Author: 'author',
+  Tag: 'tag',
+  Subject: 'subject',
 } as const;
 
 export type LibraryGroupByType = (typeof LibraryGroupByType)[keyof typeof LibraryGroupByType];
@@ -53,7 +55,6 @@ export interface ReadSettings {
   notebookWidth: string;
   isNotebookPinned: boolean;
   notebookActiveTab: NotebookTab;
-  autohideCursor: boolean;
   translationProvider: string;
   translateTargetLang: string;
   /**
@@ -84,10 +85,32 @@ export interface KOSyncSettings {
   strategy: KOSyncStrategy;
 }
 
+export interface BookOrbitSettings {
+  enabled: boolean;
+  /** Base server origin, e.g. https://books.example.com (no /api/v1/koreader suffix). */
+  serverUrl: string;
+  username: string;
+  userkey: string;
+  password?: string;
+  deviceId: string;
+  deviceName: string;
+  strategy: KOSyncStrategy;
+  syncProgress: boolean;
+  /** Annotations and bookmarks. */
+  syncNotes: boolean;
+  syncStats: boolean;
+  syncBookStates: boolean;
+}
+
 export interface ReadwiseSettings {
   enabled: boolean;
   accessToken: string;
   lastSyncedAt: number;
+  /**
+   * Send the book cover with pushed highlights (image_url). Optional so
+   * settings persisted before this option existed default to enabled.
+   */
+  includeCoverImage?: boolean;
   /**
    * Advanced: override the Readwise API base URL (e.g. for a self-hosted,
    * Readwise-compatible receiver). When unset or blank, the official
@@ -331,6 +354,16 @@ export interface SystemSettings {
    * `BACKUP_SETTINGS_BLACKLIST`.
    */
   autoImportFolders?: string[];
+  /**
+   * The subset of {@link autoImportFolders} the user imported with "Import all
+   * into library" (flatten). Auto-imported books from those folders go straight
+   * to the library root; every other watched folder mirrors its subfolders as
+   * groups, matching the dialog's default "Create groups from subfolders" —
+   * which is also what a folder watched before this list existed falls back to.
+   * Device-local, and excluded from cloud settings backups alongside
+   * {@link autoImportFolders}.
+   */
+  autoImportFlattenFolders?: string[];
 
   keepLogin: boolean;
   alwaysOnTop: boolean;
@@ -338,6 +371,7 @@ export interface SystemSettings {
   autoCheckUpdates: boolean;
   updateChannel: 'stable' | 'nightly';
   screenWakeLock: boolean;
+  autohideCursor: boolean;
   screenBrightness: number;
   autoScreenBrightness: boolean;
   swipeBrightnessGesture: boolean;
@@ -361,7 +395,9 @@ export interface SystemSettings {
    * `false` the moment the user picks any primary sort in the menu.
    */
   librarySortByAuto: boolean;
-  librarySortBy2: LibrarySecondarySortByType;
+  libraryThenSortBy: LibrarySecondarySortByType;
+  /** Sort order of the secondary ("Then by") key, independent of `librarySortAscending` (#5119). */
+  libraryThenSortAscending: boolean;
   libraryGroupBy: LibraryGroupByType;
   libraryCoverFit: LibraryCoverFitType;
   libraryAutoColumns: boolean;
@@ -413,6 +449,7 @@ export interface SystemSettings {
   biometricUnlockEnabled?: boolean;
 
   kosync: KOSyncSettings;
+  bookorbit: BookOrbitSettings;
   readwise: ReadwiseSettings;
   hardcover: HardcoverSettings;
   /** Optional by design — see {@link ReadestCloudSettings}. Never defaulted. */

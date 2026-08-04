@@ -6,7 +6,8 @@ export type BaseColor = {
   primary: string;
 };
 
-export type ThemeMode = 'auto' | 'light' | 'dark';
+/** `ambient` follows the ambient light sensor (lux → light/dark), Android-first. */
+export type ThemeMode = 'auto' | 'light' | 'dark' | 'ambient';
 
 export type Palette = {
   'base-100': string;

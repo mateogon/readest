@@ -1,4 +1,4 @@
-import { act, cleanup, render } from '@testing-library/react';
+import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // --- Dependency mocks (must be set up before importing the hook) ---
@@ -29,6 +29,7 @@ const mockView = {
     start: 0,
     end: 0,
     sideProp: 'height',
+    next: vi.fn(),
     goTo: vi.fn(),
   },
   resolveCFI: vi.fn().mockReturnValue({ index: 0, anchor: () => new Range() }),
@@ -45,7 +46,7 @@ const mockView = {
   },
 };
 
-const mockProgress = {
+let mockProgress = {
   location: { start: { cfi: '' }, end: { cfi: '' } },
   index: 0,
   range: null as Range | null,
@@ -158,8 +159,13 @@ vi.mock('@/services/tts', () => ({
       detachView: vi.fn(),
       attachView: vi.fn().mockResolvedValue(undefined),
       getSpeakingLang: vi.fn().mockReturnValue('en'),
+      getSentenceProgress: vi.fn().mockReturnValue(null),
+      isSoundingSentenceOnScreen: vi.fn().mockReturnValue(false),
+      getCurrentHighlightCfi: vi.fn().mockReturnValue(null),
+      reapplyCurrentHighlight: vi.fn(),
       terminated: false,
       isViewAttached: true,
+      narrationActive: narrationState.active,
       state: 'idle',
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
@@ -170,10 +176,24 @@ vi.mock('@/services/tts', () => ({
   ensureSharedAudioContext: vi.fn().mockResolvedValue(undefined),
 }));
 
+// jsdom reports every rect as zero, so the layout probe cannot answer here.
+// What this suite covers is the follow loop; where the page break falls is
+// covered by src/__tests__/utils/ttsPageFollow.test.ts.
+vi.mock('@/utils/ttsPageFollow', () => ({
+  pageBreakFraction: vi.fn(() => null),
+}));
+
+vi.mock('@/services/tts/wordHighlight', () => ({
+  rangeTextExcludingInert: vi.fn(() => 'a sentence long enough to straddle a page break'),
+  getTextSubRange: vi.fn(() => null),
+}));
+
 vi.mock('@/libs/mediaSession', () => ({
   TauriMediaSession: class {},
   getMediaSession: vi.fn(() => null),
 }));
+
+const { narrationState } = vi.hoisted(() => ({ narrationState: { active: false } }));
 
 const { mockSessionManager } = vi.hoisted(() => ({
   mockSessionManager: {
@@ -243,6 +263,7 @@ vi.mock('@/utils/ttsTime', () => ({
 import { useTTSControl } from '@/app/reader/hooks/useTTSControl';
 import { ttsMediaBridge } from '@/services/tts/ttsMediaBridge';
 import { eventDispatcher } from '@/utils/event';
+import { pageBreakFraction } from '@/utils/ttsPageFollow';
 import { useReaderStore } from '@/store/readerStore';
 
 const getSetTTSEnabledMock = () =>
@@ -291,6 +312,120 @@ describe('useTTSControl concurrent tts-speak events', () => {
       while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
       await Promise.all([p1, p2]);
     });
+  });
+});
+
+// Reading a selection aloud has to mean different things for the two kinds of
+// engine: a synthesizer can render the selected words, a recording only has the
+// clips the publisher timed. Handing raw text to the narration client ended the
+// utterance at once, which fired the one-shot callback and killed the session —
+// the button appeared to play for a moment and stop.
+describe('useTTSControl reading a selection aloud', () => {
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+    narrationState.active = false;
+    mockView.tts.from.mockClear();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  const speakSelection = async () => {
+    render(<Harness />);
+    const range = new Range();
+    await act(async () => {
+      const p = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1', range, oneTime: true });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await p;
+    });
+    const controller = ttsControllerInstances[0] as unknown as {
+      speak: ReturnType<typeof vi.fn>;
+    };
+    return { range, controller };
+  };
+
+  it('starts the recording at the selection when the book is narrated', async () => {
+    narrationState.active = true;
+
+    const { range, controller } = await speakSelection();
+
+    expect(mockView.tts.from).toHaveBeenCalledWith(range);
+    // Not a one-shot: the session goes on from that passage rather than being
+    // stopped by the one-time callback as soon as the first clip ends.
+    expect(controller.speak).toHaveBeenCalledWith(expect.anything(), false, expect.any(Function));
+  });
+
+  it('synthesizes the selected text when the book is not narrated', async () => {
+    const { controller } = await speakSelection();
+
+    expect(mockView.tts.from).not.toHaveBeenCalled();
+    expect(controller.speak).toHaveBeenCalledWith(expect.anything(), true, expect.any(Function));
+  });
+});
+
+// Following the voice onto the next page moves the view past the *start* of the
+// sentence being read, which is what ttsLocation records. Judged on that alone
+// the reader looks like they navigated away, so the back-to-position prompt
+// appeared on every page turn — while they were in fact looking at the words
+// being spoken. isCfiInLocation is mocked false throughout this suite, so these
+// two tests turn entirely on whether the sentence is still on screen.
+describe('useTTSControl back-to-position prompt', () => {
+  const BannerHarness = () => {
+    const tts = useTTSControl({ bookKey: 'book-1' });
+    return <div data-testid='banner'>{String(tts.showBackToCurrentTTSLocation)}</div>;
+  };
+
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+    mockViewSettings.ttsLocation = 'epubcfi(/6/4!/4/2)';
+  });
+
+  afterEach(() => {
+    cleanup();
+    mockViewSettings.ttsLocation = null;
+  });
+
+  const startSessionThenRelocate = async (sentenceOnScreen: boolean) => {
+    const view = render(<BannerHarness />);
+    await act(async () => {
+      const p = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await p;
+    });
+    const controller = ttsControllerInstances[0] as unknown as {
+      isSoundingSentenceOnScreen: ReturnType<typeof vi.fn>;
+    };
+    controller.isSoundingSentenceOnScreen.mockReturnValue(sentenceOnScreen);
+
+    // Past the suppression window that hides the prompt right after a section
+    // change, so this asserts the on-screen test rather than that grace period.
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 5000);
+    try {
+      // A page turn republishes the location as a new object; the re-render is
+      // what a store update would do, and is what re-runs the location effect.
+      await act(async () => {
+        mockProgress = { ...mockProgress, location: { start: { cfi: 'a' }, end: { cfi: 'b' } } };
+        view.rerender(<BannerHarness />);
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+    return screen.getByTestId('banner').textContent;
+  };
+
+  it('stays hidden when the sentence being read is still on the page', async () => {
+    expect(await startSessionThenRelocate(true)).toBe('false');
+  });
+
+  it('appears when the reader has paged away from the sentence entirely', async () => {
+    expect(await startSessionThenRelocate(false)).toBe('true');
   });
 });
 
@@ -456,6 +591,7 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
     mockView.renderer.scrolled = false;
     mockProgress.range = null;
     mockViewSettings.ttsLocation = null;
+    vi.mocked(pageBreakFraction).mockReturnValue(null);
   });
 
   afterEach(() => {
@@ -513,6 +649,110 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
 
     expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledTimes(1);
     expect(mockView.goTo).not.toHaveBeenCalled();
+  });
+
+  // A sentence laid out across a page break: its mark fires once, on the page it
+  // starts on, and a phrase-timed recording reports no words in between. Without
+  // following the audio clock the reader is left on the first page while the
+  // voice reads the tail rendered on the next one.
+  it('turns the page when the voice reads past the visible part of a sentence', async () => {
+    vi.useFakeTimers();
+    try {
+      const handler = await setupAndCaptureHighlightHandler();
+      const controller = ttsControllerInstances[0] as unknown as {
+        getSentenceProgress: ReturnType<typeof vi.fn>;
+        state: string;
+      };
+      controller.state = 'playing';
+
+      // Three quarters of the sentence is readable on this page; the tail is
+      // laid out past its edge.
+      vi.mocked(pageBreakFraction).mockReturnValue(0.75);
+      mockView.renderer.end = 528;
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+      controller.getSentenceProgress.mockReturnValue(0);
+
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+      });
+
+      // Still reading the visible part.
+      controller.getSentenceProgress.mockReturnValue(0.5);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(400);
+      });
+      expect(mockView.renderer.next).not.toHaveBeenCalled();
+
+      // Past it: the page must follow.
+      controller.getSentenceProgress.mockReturnValue(0.8);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(400);
+      });
+      expect(mockView.renderer.next).toHaveBeenCalled();
+    } finally {
+      mockView.renderer.end = 0;
+      mockView.renderer.next = vi.fn();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not follow a sentence that fits on the page', async () => {
+    vi.useFakeTimers();
+    try {
+      const handler = await setupAndCaptureHighlightHandler();
+      const controller = ttsControllerInstances[0] as unknown as {
+        getSentenceProgress: ReturnType<typeof vi.fn>;
+        state: string;
+      };
+      controller.state = 'playing';
+      controller.getSentenceProgress.mockReturnValue(0.99);
+      // The whole sentence fits: no break to follow.
+      vi.mocked(pageBreakFraction).mockReturnValue(null);
+      mockView.renderer.end = 528;
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+
+      expect(mockView.renderer.next).not.toHaveBeenCalled();
+    } finally {
+      mockView.renderer.end = 0;
+      mockView.renderer.next = vi.fn();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not follow when the engine reports no clock', async () => {
+    vi.useFakeTimers();
+    try {
+      const handler = await setupAndCaptureHighlightHandler();
+      const controller = ttsControllerInstances[0] as unknown as {
+        getSentenceProgress: ReturnType<typeof vi.fn>;
+        state: string;
+      };
+      controller.state = 'playing';
+      controller.getSentenceProgress.mockReturnValue(null);
+      vi.mocked(pageBreakFraction).mockReturnValue(0.1);
+      mockView.renderer.end = 528;
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+
+      expect(mockView.renderer.next).not.toHaveBeenCalled();
+    } finally {
+      mockView.renderer.end = 0;
+      mockView.renderer.next = vi.fn();
+      vi.useRealTimers();
+    }
   });
 
   it('does not throw when the renderer has no loaded contents (READEST-19)', async () => {
@@ -703,6 +943,7 @@ describe('useTTSControl background session lifecycle', () => {
       attachView: vi.fn().mockResolvedValue(undefined),
       getSpeakingLang: vi.fn().mockReturnValue('en'),
       getCurrentHighlightCfi: vi.fn().mockReturnValue(null),
+      isSoundingSentenceOnScreen: vi.fn().mockReturnValue(false),
       getSpokenSentence: vi.fn().mockReturnValue(null),
       updateHighlightOptions: vi.fn(),
       setHighlightGranularity: vi.fn(),

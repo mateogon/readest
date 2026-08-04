@@ -75,6 +75,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::get_safe_area_insets,
             commands::get_screen_brightness,
             commands::set_screen_brightness,
+            commands::has_ambient_light_sensor,
+            commands::start_ambient_light_updates,
+            commands::stop_ambient_light_updates,
             commands::get_external_sdcard_path,
             commands::open_external_url,
             commands::show_lookup_popover,
@@ -91,7 +94,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::refresh_eink_screen,
             commands::update_reading_widget,
             commands::capture_webview_region,
-            commands::set_text_selection_suppressed,
+            commands::set_selection_suppressed,
             commands::read_share_clip_html,
         ])
         .setup(|app, api| {

@@ -635,6 +635,69 @@ describe('OPDS feed checker', () => {
       expect(items[0]!.entryId).toBe('https://example.com/dl/book.epub');
     });
 
+    it('carries the entry cover href so the import can use it (issue #5270)', () => {
+      const feed: OPDSFeed = {
+        metadata: { title: 'Test' },
+        links: [],
+        publications: [
+          {
+            metadata: { id: 'urn:cover', title: 'Custom Cover' },
+            links: [
+              {
+                href: '/dl/cover.epub',
+                type: 'application/epub+zip',
+                rel: 'http://opds-spec.org/acquisition',
+                properties: {},
+              },
+            ],
+            images: [
+              { href: '/cwa/opds/cover/572/thumb', rel: 'http://opds-spec.org/image/thumbnail' },
+              { href: '/cwa/opds/cover/572', rel: 'http://opds-spec.org/image' },
+            ],
+          },
+        ],
+      };
+      const items = collectNewEntries(feed, new Set(), 'https://example.com');
+      expect(items[0]!.coverHref).toBe('/cwa/opds/cover/572');
+    });
+
+    it('carries the entry metadata so the import can apply it (issue #5270)', () => {
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <id>urn:test:feed</id>
+  <title>Test Feed</title>
+  <entry>
+    <id>urn:meta</id>
+    <title>Feed Title</title>
+    <author><name>Jane Doe</name></author>
+    <dc:language>fr</dc:language>
+    <category term="FIC009000" label="Fantasy"/>
+    <summary type="text">A summary.</summary>
+    <link href="/dl/a.epub" type="application/epub+zip"
+          rel="http://opds-spec.org/acquisition"/>
+  </entry>
+</feed>`;
+      const doc = parseXML(xml);
+      const feed = getFeed(doc) as OPDSFeed;
+      const items = collectNewEntries(feed, new Set(), 'https://example.com');
+      expect(items[0]!.metadata).toMatchObject({
+        title: 'Feed Title',
+        author: 'Jane Doe',
+        language: 'fr',
+        subject: ['Fantasy'],
+        description: 'A summary.',
+      });
+    });
+
+    it('leaves coverHref unset when the entry advertises no artwork', () => {
+      const xml = makeAcquisitionFeed([{ id: 'urn:a', title: 'Issue 1', href: '/dl/a' }]);
+      const doc = parseXML(xml);
+      const feed = getFeed(doc) as OPDSFeed;
+      const items = collectNewEntries(feed, new Set(), 'https://example.com');
+      expect(items[0]!.coverHref).toBeUndefined();
+    });
+
     it('returns empty when all entries are already known', () => {
       const xml = makeAcquisitionFeed([{ id: 'urn:a', title: 'Issue 1', href: '/dl/a' }]);
       const doc = parseXML(xml);

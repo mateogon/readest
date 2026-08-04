@@ -16,6 +16,7 @@ import {
 import { RiVoiceAiFill } from 'react-icons/ri';
 import { useRouter } from 'next/navigation';
 import { TTSVoicesGroup } from '@/services/tts';
+import { MEDIA_OVERLAY_VOICE_ID } from '@/services/tts/mediaOverlay';
 import { DEFAULT_SENTENCE_GAP_SEC } from '@/services/tts/EdgeTTSClient';
 import { DEFAULT_PARAGRAPH_GAP_SEC } from '@/services/tts/TTSController';
 import { useEnv } from '@/context/EnvContext';
@@ -155,6 +156,13 @@ const TTSPlayerSheet = ({
   const sectionLabel = progress?.sectionLabel;
   const isEink = viewSettings?.isEink ?? false;
 
+  // Books with recorded narration expose it as a voice; while it is playing
+  // there is nothing to pre-download, since the audio ships with the book.
+  const hasNarrationVoice = voiceGroups.some((group) =>
+    group.voices.some((voice) => voice.id === MEDIA_OVERLAY_VOICE_ID),
+  );
+  const isNarrating = selectedVoice === MEDIA_OVERLAY_VOICE_ID;
+
   // Fresh open: land on the main view with current rate/voice.
   useEffect(() => {
     if (!isOpen) return;
@@ -185,10 +193,13 @@ const TTSPlayerSheet = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, ttsLang]);
 
-  /* Scale a given `baseGap` based on a given `rate`. */
+  /* Scale a given `baseGap` based on a given `rate`. Gaps are sub-second
+   * (0.15s / 0.3s), so they have to keep two decimals — rounding to a whole
+   * number floors every one of them to 0 and silently removes the pauses
+   * along with any way to get them back (#5414). */
   const scaleGap = (baseGap: number, rate: number) => {
     const k = 0.6;
-    return Math.round((baseGap / Math.pow(rate, k)) * 1000) / 1000;
+    return Math.round((baseGap / Math.pow(rate, k)) * 100) / 100;
   };
 
   const handleSelectRate = (value: number) => {
@@ -220,6 +231,12 @@ const TTSPlayerSheet = ({
     setSelectedVoice(voice);
     const vs = getViewSettings(bookKey)!;
     vs.ttsVoice = voice;
+    // Remember per book whether the reader wants its own narrator or a
+    // synthetic voice; ttsVoice alone can't say, since it inherits the global
+    // default. Only written for books that offer narration at all.
+    if (hasNarrationVoice) {
+      vs.ttsUseNarration = voice === MEDIA_OVERLAY_VOICE_ID;
+    }
     setViewSettings(bookKey, vs);
     setView('main');
   };
@@ -428,7 +445,7 @@ const TTSPlayerSheet = ({
               </span>
             </button>
           </div>
-          {downloads.supported && downloads.chapters.length > 0 && (
+          {!isNarrating && downloads.supported && downloads.chapters.length > 0 && (
             <button
               type='button'
               aria-label={_('Offline Audio')}
@@ -473,10 +490,14 @@ const TTSPlayerSheet = ({
           {voiceGroups.map((voiceGroup) => (
             <div key={voiceGroup.id}>
               <div className='text-base-content/60 px-2 py-1 text-sm sm:text-xs'>
-                {_('{{engine}}: {{count}} voices', {
-                  engine: _(voiceGroup.name),
-                  count: voiceGroup.voices.length,
-                })}
+                {/* A single-voice group (a book's own narrator) would otherwise
+                    read "Narration: 1 voices". */}
+                {voiceGroup.voices.length === 1
+                  ? _(voiceGroup.name)
+                  : _('{{engine}}: {{count}} voices', {
+                      engine: _(voiceGroup.name),
+                      count: voiceGroup.voices.length,
+                    })}
               </div>
               {voiceGroup.voices.map((voice) => (
                 <button

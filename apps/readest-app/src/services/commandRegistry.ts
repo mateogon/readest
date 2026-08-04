@@ -363,7 +363,7 @@ const colorPanelItems = [
   {
     id: 'settings.color.backgroundTexture',
     labelKey: _('Background Image'),
-    keywords: ['background', 'texture', 'image', 'paper', 'pattern'],
+    keywords: ['background', 'texture', 'image', 'paper', 'pattern', 'library', 'reader'],
     section: 'Theme',
   },
   {
@@ -494,6 +494,12 @@ const controlPanelItems = [
     id: 'settings.control.screenWakeLock',
     labelKey: _('Keep Screen Awake'),
     keywords: ['screen', 'wake', 'lock', 'awake', 'sleep', 'display'],
+    section: 'Device',
+  },
+  {
+    id: 'settings.control.autohideCursor',
+    labelKey: _('Auto-hide Cursor'),
+    keywords: ['cursor', 'mouse', 'pointer', 'hide', 'autohide', 'idle'],
     section: 'Device',
   },
   {

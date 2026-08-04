@@ -47,9 +47,12 @@ import {
 // the screen off), not when it is fetched — schedule-ahead would otherwise
 // run foliate's mark cursor ahead of the voice and break prev/next/resume.
 
-// Natural pause between sentences, replacing Edge's baked-in ~300ms trailing
-// silence. Divided by the playback rate so pauses shrink with speed (#2033's
-// "gaps don't scale" complaint).
+// Natural pause between sentences, replacing the silence Edge bakes into every
+// utterance: measured at ~0.18s leading and ~0.8s trailing, so ~1s of dead air
+// per sentence if it is played as-is (see #5414). Divided by the playback rate
+// so pauses shrink with speed (#2033's "gaps don't scale" complaint). Note the
+// native path only cuts the trailing silence, so its audible gap also carries
+// the next utterance's ~0.18s of leading silence.
 export const DEFAULT_SENTENCE_GAP_SEC = 0.15;
 const TICKS_PER_SECOND = 10_000_000;
 

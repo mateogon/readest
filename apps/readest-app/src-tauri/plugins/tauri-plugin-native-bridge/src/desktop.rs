@@ -71,9 +71,9 @@ impl<R: Runtime> NativeBridge<R> {
         Err(crate::Error::UnsupportedPlatformError)
     }
 
-    pub fn set_text_selection_suppressed(
+    pub fn set_selection_suppressed(
         &self,
-        _payload: SetTextSelectionSuppressedRequest,
+        _payload: SetSelectionSuppressedRequest,
     ) -> crate::Result<()> {
         Err(crate::Error::UnsupportedPlatformError)
     }
@@ -167,6 +167,27 @@ impl<R: Runtime> NativeBridge<R> {
         _payload: SetScreenBrightnessRequest,
     ) -> crate::Result<SetScreenBrightnessResponse> {
         Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn has_ambient_light_sensor(&self) -> crate::Result<HasAmbientLightSensorResponse> {
+        Ok(HasAmbientLightSensorResponse {
+            available: false,
+            error: None,
+        })
+    }
+
+    pub fn start_ambient_light_updates(&self) -> crate::Result<AmbientLightUpdatesResponse> {
+        Ok(AmbientLightUpdatesResponse {
+            success: false,
+            error: Some("unsupported".to_string()),
+        })
+    }
+
+    pub fn stop_ambient_light_updates(&self) -> crate::Result<AmbientLightUpdatesResponse> {
+        Ok(AmbientLightUpdatesResponse {
+            success: true,
+            error: None,
+        })
     }
 
     pub fn get_external_sdcard_path(&self) -> crate::Result<GetExternalSDCardPathResponse> {

@@ -200,3 +200,24 @@ describe('BookDetailView file path row', () => {
     expect(queryByText('File Path')).toBeNull();
   });
 });
+
+describe('BookDetailView tags and subjects', () => {
+  it('normalizes clicked tag and subject values before shelf navigation', () => {
+    const onMetadataValueClick = vi.fn();
+    const { getByText } = renderView({
+      book: makeBook({ tags: [' Favorite '] }),
+      metadata: {
+        title: 'Test Book',
+        author: 'Test Author',
+        language: 'en',
+        subject: ['History'],
+      },
+      onMetadataValueClick,
+    });
+
+    fireEvent.click(getByText('History'));
+    expect(onMetadataValueClick).toHaveBeenCalledWith('subject', 'History');
+    fireEvent.click(getByText('Favorite'));
+    expect(onMetadataValueClick).toHaveBeenCalledWith('tag', 'Favorite');
+  });
+});

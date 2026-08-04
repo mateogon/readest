@@ -1609,6 +1609,17 @@ describe('TTSController', () => {
     test('preserves prepared synthesis during a sequential transition', async () => {
       await controller.stop(true);
       expect(controller.ttsClient.invalidateSynthesis).not.toHaveBeenCalled();
+      expect(controller.ttsClient.stop).toHaveBeenCalledWith(false);
+    });
+
+    test('hands over a continuous recording independently of synthesis retention', async () => {
+      const capabilities = controller.ttsClient.getCapabilities();
+      vi.mocked(controller.ttsClient.getCapabilities).mockReturnValue({
+        ...capabilities,
+        continuousTimeline: true,
+      });
+      await controller.stop(true, false);
+      expect(controller.ttsClient.invalidateSynthesis).toHaveBeenCalledTimes(1);
       expect(controller.ttsClient.stop).toHaveBeenCalledWith(true);
     });
 

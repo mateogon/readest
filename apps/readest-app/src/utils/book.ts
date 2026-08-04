@@ -113,6 +113,14 @@ export const flattenContributors = (
       : formatLanguageMap(contributors?.name);
 };
 
+export const getContributorNames = (
+  contributors: string | string[] | Contributor | Contributor[] | undefined,
+): string[] => {
+  if (!contributors) return [];
+  const values = Array.isArray(contributors) ? contributors : [contributors];
+  return [...new Set(values.map((value) => flattenContributors(value).trim()).filter(Boolean))];
+};
+
 // biome-ignore format: keep the language codes compact on a single line
 const LASTNAME_AUTHOR_SORT_LANGS = [ 'ar', 'bo', 'de', 'en', 'es', 'fr', 'hi', 'it', 'nl', 'pl', 'pt', 'ru', 'th', 'tr', 'uk' ];
 
@@ -194,14 +202,23 @@ export const getPrimaryLanguage = (lang: string | string[] | undefined) => {
 // Callers must not mutate the existing book in place: <BookCover> is memoized
 // and compares fields off the book, so an in-place mutation makes the memo's
 // previous snapshot point to the same object and skips re-rendering the cover.
-export const getBookWithUpdatedMetadata = (book: Book, metadata: BookMetadata): Book => {
+export const getBookWithUpdatedMetadata = (
+  book: Book,
+  metadata: BookMetadata,
+  tags?: string[],
+): Book => {
+  const now = Date.now();
   const updatedBook: Book = {
     ...book,
     metadata,
+    ...(tags ? { tags: [...tags] } : {}),
     title: formatTitle(metadata.title),
     author: formatAuthors(metadata.author),
     primaryLanguage: getPrimaryLanguage(metadata.language),
-    updatedAt: Date.now(),
+    updatedAt: now,
+    // The metadata group merges on its own clock so a page turn elsewhere
+    // (which dominates updatedAt) cannot clobber this edit (issue #5438).
+    metadataUpdatedAt: now,
   };
   const newCoverImageUrl = metadata.coverImageBlobUrl || metadata.coverImageUrl;
   if (newCoverImageUrl) {
@@ -394,13 +411,17 @@ export interface MetadataHashInfo {
   metaHash: string;
 }
 
-export const getMetadataHashInfo = (metadata: BookMetadata): MetadataHashInfo | undefined => {
+export const getMetadataHashInfo = (
+  metadata: BookMetadata,
+  filename?: string,
+): MetadataHashInfo | undefined => {
   if (!metadata) return;
   try {
     const title = getTitleForHash(metadata.title);
     const authors = getAuthorsList(metadata.author);
     const identifiers = getIdentifiersList(metadata.altIdentifier || metadata.identifier);
-    const hashSource = `${title}|${authors.join(',')}|${identifiers.join(',')}`;
+    let hashSource = `${title}|${authors.join(',')}|${identifiers.join(',')}`;
+    if (filename) hashSource += `|${filename}`;
     const metaHash = md5(hashSource.normalize('NFC'));
     return { title, authors, identifiers, hashSource, metaHash };
   } catch (error) {
@@ -409,6 +430,6 @@ export const getMetadataHashInfo = (metadata: BookMetadata): MetadataHashInfo | 
   return;
 };
 
-export const getMetadataHash = (metadata: BookMetadata) => {
-  return getMetadataHashInfo(metadata)?.metaHash;
+export const getMetadataHash = (metadata: BookMetadata, filename?: string) => {
+  return getMetadataHashInfo(metadata, filename)?.metaHash;
 };

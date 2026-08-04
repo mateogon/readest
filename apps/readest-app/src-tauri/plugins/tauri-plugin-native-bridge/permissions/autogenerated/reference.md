@@ -24,6 +24,9 @@ Default permissions for the plugin
 - `allow-get-safe-area-insets`
 - `allow-get-screen-brightness`
 - `allow-set-screen-brightness`
+- `allow-has-ambient-light-sensor`
+- `allow-start-ambient-light-updates`
+- `allow-stop-ambient-light-updates`
 - `allow-get-external-sdcard-path`
 - `allow-open-external-url`
 - `allow-show-lookup-popover`
@@ -48,7 +51,7 @@ Default permissions for the plugin
 - `allow-refresh-eink-screen`
 - `allow-update-reading-widget`
 - `allow-capture-webview-region`
-- `allow-set-text-selection-suppressed`
+- `allow-set-selection-suppressed`
 - `allow-read-share-clip-html`
 
 ## Permission Table
@@ -602,6 +605,32 @@ Enables the get_system_color_scheme command without any pre-configured scope.
 <td>
 
 Denies the get_system_color_scheme command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:allow-has-ambient-light-sensor`
+
+</td>
+<td>
+
+Enables the has_ambient_light_sensor command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-has-ambient-light-sensor`
+
+</td>
+<td>
+
+Denies the has_ambient_light_sensor command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1181,6 +1210,32 @@ Denies the set_secure_item command without any pre-configured scope.
 <tr>
 <td>
 
+`native-bridge:allow-set-selection-suppressed`
+
+</td>
+<td>
+
+Enables the set_selection_suppressed command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-set-selection-suppressed`
+
+</td>
+<td>
+
+Denies the set_selection_suppressed command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `native-bridge:allow-set-sync-passphrase`
 
 </td>
@@ -1233,32 +1288,6 @@ Denies the set_system_ui_visibility command without any pre-configured scope.
 <tr>
 <td>
 
-`native-bridge:allow-set-text-selection-suppressed`
-
-</td>
-<td>
-
-Enables the set_text_selection_suppressed command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`native-bridge:deny-set-text-selection-suppressed`
-
-</td>
-<td>
-
-Denies the set_text_selection_suppressed command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
 `native-bridge:allow-show-lookup-popover`
 
 </td>
@@ -1278,6 +1307,58 @@ Enables the show_lookup_popover command without any pre-configured scope.
 <td>
 
 Denies the show_lookup_popover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:allow-start-ambient-light-updates`
+
+</td>
+<td>
+
+Enables the start_ambient_light_updates command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-start-ambient-light-updates`
+
+</td>
+<td>
+
+Denies the start_ambient_light_updates command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:allow-stop-ambient-light-updates`
+
+</td>
+<td>
+
+Enables the stop_ambient_light_updates command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-stop-ambient-light-updates`
+
+</td>
+<td>
+
+Denies the stop_ambient_light_updates command without any pre-configured scope.
 
 </td>
 </tr>

@@ -245,6 +245,27 @@ describe('getThemeCode', () => {
     expect(code.isDarkMode).toBe(false);
   });
 
+  it('uses ambientIsDarkMode when themeMode is ambient', () => {
+    localStorage.setItem('themeMode', 'ambient');
+    localStorage.setItem('ambientIsDarkMode', 'true');
+    localStorage.setItem('systemIsDarkMode', 'false');
+    expect(getThemeCode().isDarkMode).toBe(true);
+
+    localStorage.setItem('ambientIsDarkMode', 'false');
+    expect(getThemeCode().isDarkMode).toBe(false);
+  });
+
+  // themeStore seeds ambientIsDarkMode from the system appearance until the
+  // first lux reading persists a value. getThemeCode has to agree, or the app
+  // chrome and the book content disagree on the very first launch in ambient
+  // mode.
+  it('falls back to systemIsDarkMode when no ambient reading was persisted', () => {
+    localStorage.setItem('themeMode', 'ambient');
+    localStorage.setItem('systemIsDarkMode', 'true');
+    localStorage.removeItem('ambientIsDarkMode');
+    expect(getThemeCode().isDarkMode).toBe(true);
+  });
+
   it('falls back to default theme when custom themeColor not found', () => {
     localStorage.setItem('themeColor', 'nonexistent-theme-xyz');
     localStorage.setItem('themeMode', 'light');

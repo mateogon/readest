@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import {
+  SETTINGS_DICTIONARY_FIELDS,
   SETTINGS_KIND,
   SETTINGS_REPLICA_ID,
   SETTINGS_SCHEMA_VERSION,
@@ -34,6 +35,23 @@ describe('settingsAdapter', () => {
     expect(SETTINGS_KIND).toBe('settings');
     expect(SETTINGS_SCHEMA_VERSION).toBe(1);
     expect(SETTINGS_REPLICA_ID).toBe('singleton');
+  });
+
+  test('every dictionary-category path is a real whitelist entry', () => {
+    // The 'dictionary' sync gate in replicaSettingsSync matches these
+    // paths against SETTINGS_WHITELIST by exact string. A typo or a
+    // renamed whitelist entry would silently reopen the leak in #5465,
+    // so pin the membership here.
+    for (const path of SETTINGS_DICTIONARY_FIELDS) {
+      expect(SETTINGS_WHITELIST).toContain(path);
+    }
+    // Conversely, every whitelisted dictionarySettings.* path must be
+    // gated — a new one added without updating the list would sync
+    // regardless of the Dictionaries toggle.
+    const whitelistedDictPaths = SETTINGS_WHITELIST.filter((p) =>
+      p.startsWith('dictionarySettings.'),
+    );
+    expect([...SETTINGS_DICTIONARY_FIELDS].sort()).toEqual(whitelistedDictPaths.slice().sort());
   });
 
   test('declares no `binary` capability — bundled metadata only', () => {
@@ -161,11 +179,14 @@ describe('settingsAdapter', () => {
     expect(out.patch.s3?.enabled).toBeUndefined();
   });
 
-  test('declares encryptedFields covering kosync / readwise / hardcover / webdav / s3 credentials only (not serverUrl / endpoint)', () => {
+  test('declares encryptedFields covering kosync / bookorbit / readwise / hardcover / webdav / s3 credentials only (not serverUrl / endpoint)', () => {
     expect(settingsAdapter.encryptedFields).toEqual([
       'kosync.username',
       'kosync.userkey',
       'kosync.password',
+      'bookorbit.username',
+      'bookorbit.userkey',
+      'bookorbit.password',
       'readwise.accessToken',
       'hardcover.accessToken',
       'webdav.username',

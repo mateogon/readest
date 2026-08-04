@@ -19,6 +19,9 @@ const COMMANDS: &[&str] = &[
     "get_safe_area_insets",
     "get_screen_brightness",
     "set_screen_brightness",
+    "has_ambient_light_sensor",
+    "start_ambient_light_updates",
+    "stop_ambient_light_updates",
     "get_external_sdcard_path",
     "open_external_url",
     "show_lookup_popover",
@@ -40,7 +43,7 @@ const COMMANDS: &[&str] = &[
     "refresh_eink_screen",
     "update_reading_widget",
     "capture_webview_region",
-    "set_text_selection_suppressed",
+    "set_selection_suppressed",
     "read_share_clip_html",
 ];
 

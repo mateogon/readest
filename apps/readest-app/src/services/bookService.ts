@@ -26,6 +26,7 @@ import type { BookNav } from '@/services/nav';
 import { partialMD5, md5 } from '@/utils/md5';
 import { getBaseFilename, getFilename } from '@/utils/path';
 import { BookDoc, DocumentLoader } from '@/libs/document';
+import { hasMediaOverlays } from '@/services/tts/mediaOverlay';
 import { tryNativeParseEpub } from '@/utils/tauriEpubBridge';
 import { tryNativeParseMobi } from '@/utils/tauriMobiBridge';
 import { isPseStreamFileName, openPseStreamBook, parsePseStreamFileName } from './opds/pseStream';
@@ -122,6 +123,27 @@ export function selectNewImportableFiles(
     const key = normalizeFilePathForIndex(entry.fullPath, opts.osPlatform);
     return !!key && !opts.existingPaths.has(key);
   });
+}
+
+/**
+ * Turn the newly-found entries of one watched folder into importer inputs.
+ *
+ * `flatten` mirrors the Import-from-Folder dialog's "Folder Structure" choice
+ * for that folder. In the default "Create groups from subfolders" mode every
+ * file carries the watched folder as `basePath` — that hint is what makes
+ * `importBooks` derive a group from the subfolder the file lives in. Without it
+ * auto-imported books piled up in the library root while the same folder's
+ * initial import stayed grouped (issue #5423). Flattened folders ("Import all
+ * into library") omit the hint so their books keep landing in the root.
+ */
+export function toWatchedFolderImports(
+  folder: string,
+  entries: ScannedFileEntry[],
+  flatten: boolean,
+): Array<{ path: string; basePath?: string }> {
+  return entries.map(({ fullPath }) =>
+    flatten ? { path: fullPath } : { path: fullPath, basePath: folder },
+  );
 }
 
 /**
@@ -388,11 +410,11 @@ export async function importBook(
   } = options;
   const isPseStream = typeof file === 'string' && isPseStreamFileName(file);
 
+  let loadedBook: BookDoc | undefined;
+  let fileobj: File | undefined;
   try {
-    let loadedBook: BookDoc;
     let format: BookFormat;
     let filename: string;
-    let fileobj: File | undefined;
     // When the Rust EPUB parser succeeds it gives us the partialMD5 for free,
     // so we can short-circuit the JS hashing pass below.
     let nativeHash: string | undefined;
@@ -482,7 +504,14 @@ export async function importBook(
         ? nativeHash!
         : await partialMD5(fileobj!);
 
-    const metaHash = getMetadataHash(loadedBook.metadata);
+    // PDF metadata is often generic boilerplate (e.g. every PowerPoint export
+    // is titled "PowerPoint Presentation" by the same author), so metadata
+    // alone wrongly collapses distinct files into one book (issue #5411).
+    // Salt the hash with the original filename so only same-named PDFs dedupe.
+    const metaHash = getMetadataHash(
+      loadedBook.metadata,
+      format === 'PDF' ? getBaseFilename(filename) : undefined,
+    );
     let existingBook = lookupIndex
       ? lookupIndex.byHash.get(hash)
       : books.find((b) => b.hash === hash);
@@ -526,6 +555,10 @@ export async function importBook(
       sourceTitle: formatTitle(loadedBook.metadata.title),
       primaryLanguage,
       author: formatAuthors(loadedBook.metadata.author, primaryLanguage),
+      // Cached here because the library list never opens the book: it is a
+      // property of the file, so it is re-derived on every (re)import rather
+      // than synced as user data.
+      hasNarration: hasMediaOverlays(loadedBook) || undefined,
       metadata: loadedBook.metadata,
       createdAt: existingBook ? existingBook.createdAt : Date.now(),
       uploadedAt: existingBook ? existingBook.uploadedAt : null,
@@ -701,15 +734,25 @@ export async function importBook(
       }
     }
     book.coverImageUrl = await generateCoverImageUrlFn(book);
-    const f = file as ClosableFile;
-    if (f && f.close) {
-      await f.close();
-    }
 
     return existingBook || book;
   } catch (error) {
     console.error('Error importing book:', error);
     throw error;
+  } finally {
+    // Release the parsed document (a PDF leaks its pdf.js worker otherwise,
+    // ~60 MB per imported file — #5387) and the opened file handle.
+    try {
+      await loadedBook?.destroy?.();
+    } catch (error) {
+      console.warn('Error destroying book document:', error);
+    }
+    const f = fileobj as ClosableFile | undefined;
+    if (f?.close) {
+      try {
+        await f.close();
+      } catch {}
+    }
   }
 }
 
@@ -842,12 +885,19 @@ export async function fetchBookDetails(
     await downloadBookFn(book);
   }
   const { file } = await loadBookContent(fs, book);
-  const bookDoc = (await new DocumentLoader(file).open()).book;
-  const f = file as ClosableFile;
-  if (f && f.close) {
-    await f.close();
+  let bookDoc: BookDoc | undefined;
+  try {
+    bookDoc = (await new DocumentLoader(file).open()).book;
+    return bookDoc.metadata;
+  } finally {
+    try {
+      await bookDoc?.destroy?.();
+    } catch {}
+    const f = file as ClosableFile;
+    if (f && f.close) {
+      await f.close();
+    }
   }
-  return bookDoc.metadata;
 }
 
 /**
@@ -858,28 +908,43 @@ export async function fetchBookDetails(
  */
 export async function refreshBookMetadata(fs: FileSystem, book: Book): Promise<boolean> {
   const { file } = await loadBookContent(fs, book);
-  const { book: bookDoc } = await new DocumentLoader(file).open();
-  if (!bookDoc) return false;
+  let bookDoc: BookDoc | undefined;
+  try {
+    ({ book: bookDoc } = await new DocumentLoader(file).open());
+    if (!bookDoc) return false;
 
-  book.metadata = bookDoc.metadata;
-  book.metaHash = getMetadataHash(bookDoc.metadata);
-  const primaryLanguage = getPrimaryLanguage(bookDoc.metadata.language);
-  if (primaryLanguage) {
-    book.primaryLanguage = primaryLanguage;
-  }
+    book.metadata = bookDoc.metadata;
+    // PDF metaHash is salted with the original import filename (issue #5411),
+    // which is lost after import — keep the value stamped at import time.
+    if (book.format !== 'PDF' || !book.metaHash) {
+      book.metaHash = getMetadataHash(bookDoc.metadata);
+    }
+    const primaryLanguage = getPrimaryLanguage(bookDoc.metadata.language);
+    if (primaryLanguage) {
+      book.primaryLanguage = primaryLanguage;
+    }
 
-  // Update series info from metadata
-  if (book.metadata?.belongsTo?.series) {
-    const belongsTo = book.metadata.belongsTo.series;
-    const series = Array.isArray(belongsTo) ? belongsTo[0] : belongsTo;
-    if (series) {
-      book.metadata.series = formatTitle(series.name);
-      book.metadata.seriesIndex = parseFloat(series.position || '0');
-      if (series.total) book.metadata.seriesTotal = parseInt(series.total, 10);
+    // Update series info from metadata
+    if (book.metadata?.belongsTo?.series) {
+      const belongsTo = book.metadata.belongsTo.series;
+      const series = Array.isArray(belongsTo) ? belongsTo[0] : belongsTo;
+      if (series) {
+        book.metadata.series = formatTitle(series.name);
+        book.metadata.seriesIndex = parseFloat(series.position || '0');
+        if (series.total) book.metadata.seriesTotal = parseInt(series.total, 10);
+      }
+    }
+
+    return true;
+  } finally {
+    try {
+      await bookDoc?.destroy?.();
+    } catch {}
+    const f = file as ClosableFile;
+    if (f && f.close) {
+      await f.close();
     }
   }
-
-  return true;
 }
 
 export async function exportBook(

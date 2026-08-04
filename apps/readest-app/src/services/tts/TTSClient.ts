@@ -59,6 +59,10 @@ export interface TTSCapabilities {
   downloadable: boolean;
   // Sentence durations can be measured/refined for a section timeline.
   measurableDurations: boolean;
+  // Consecutive blocks are one continuous recording rather than separate
+  // utterances, so the controller must not insert its own pauses between them —
+  // the recording already contains the pauses its narrator made.
+  continuousTimeline?: boolean;
 }
 
 export interface TTSClient {
@@ -85,7 +89,10 @@ export interface TTSClient {
   ): AsyncIterable<TTSMessageEvent>;
   pause(): Promise<boolean>;
   resume(): Promise<boolean>;
-  stop(preserveSynthesis?: boolean): Promise<void>;
+  // `handover` marks the stop the controller performs between two consecutive
+  // utterances of the same session, as opposed to a real stop. A continuous
+  // recording may stay rolling; synthesized clients can ignore the hint.
+  stop(handover?: boolean): Promise<void>;
   // Drop queued/prepared synthesis after a logical navigation or acoustic
   // configuration change. Pause/resume and sequential auto-advance preserve it.
   invalidateSynthesis?(): void;
@@ -120,4 +127,8 @@ export interface TTSClient {
   // when capabilities.mediaClock is true; the section timeline treats absence
   // as sentence-granularity positions.
   getChunkPosition?(): number | null;
+  // How far through the chunk now sounding, 0..1. Reported as a single value
+  // rather than position/duration so it cannot skew between two calls, and so a
+  // playback rate change cannot be applied to one but not the other.
+  getChunkProgress?(): number | null;
 }

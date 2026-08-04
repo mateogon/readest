@@ -150,9 +150,12 @@ export const viewPagination = (
       default: {
         const forward = !(side === 'left' || side === 'up');
         // Snap so the view's bottom edge lands between lines (not for vertical flow).
-        const snapped = viewSettings.vertical
-          ? distance
-          : snapScrolledDistanceToLines(view, distance, forward);
+        const snapped =
+          viewSettings.vertical ||
+          (viewSettings.scrolledDirection === 'horizontal' &&
+            view.book.rendition?.layout === 'pre-paginated')
+            ? distance
+            : snapScrolledDistanceToLines(view, distance, forward);
         return forward ? view.next(snapped) : view.prev(snapped);
       }
     }
