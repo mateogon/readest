@@ -51,3 +51,22 @@ describe('NativeTTSClient.stop', () => {
     expect(settled).toBe(true);
   });
 });
+
+describe('NativeTTSClient.setRate', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  test.each([
+    1, 1.25, 1.5,
+  ])('passes the user-selected rate %s to the native engine', async (rate) => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    const client = new NativeTTSClient();
+
+    await client.setRate(rate);
+
+    expect(invoke).toHaveBeenCalledWith('plugin:native-tts|set_rate', {
+      payload: { rate },
+    });
+  });
+});

@@ -967,7 +967,9 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       const ttsController = ttsControllerRef.current;
       if (ttsController) {
         if (ttsController.state === 'playing') {
-          await ttsController.stop();
+          // Rate is a playout concern, not part of the synthesized-audio key.
+          // Preserve prepared audio while restarting the player at the new rate.
+          await ttsController.stop(true);
           await ttsController.setRate(rate);
           await ttsController.start();
         } else {

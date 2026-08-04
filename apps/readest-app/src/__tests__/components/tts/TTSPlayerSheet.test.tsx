@@ -50,7 +50,9 @@ vi.mock('@/store/readerStore', () => ({
   }),
 }));
 
-const settings = { globalViewSettings: { ttsRate: 1.0, ttsSentenceGap: 0.15 } };
+const settings = {
+  globalViewSettings: { ttsRate: 1.0, ttsSentenceGap: 0.15, ttsParagraphGap: 0.3 },
+};
 const saveSettings = vi.fn();
 const settingsState = { settings, setSettings: vi.fn(), saveSettings };
 vi.mock('@/store/settingsStore', () => ({
@@ -149,7 +151,11 @@ describe('TTSPlayerSheet', () => {
   beforeEach(() => {
     viewSettings['ttsRate'] = 1.0;
     viewSettings['ttsSentenceGap'] = 0.15;
+    viewSettings['ttsParagraphGap'] = 0.3;
     viewSettings['isEink'] = false;
+    settings.globalViewSettings.ttsRate = 1.0;
+    settings.globalViewSettings.ttsSentenceGap = 0.15;
+    settings.globalViewSettings.ttsParagraphGap = 0.3;
     getBookData.mockReturnValue({
       book: { title: 'Alice in Wonderland', coverImageUrl: null },
     });
@@ -244,8 +250,33 @@ describe('TTSPlayerSheet', () => {
     expect(props.onSetRate).not.toHaveBeenCalled();
     fireEvent.pointerUp(slider);
     expect(props.onSetRate).toHaveBeenCalledWith(1.5);
+    expect(props.onSetSentenceGap).toHaveBeenCalledWith(0.118);
+    expect(props.onSetParagraphGap).toHaveBeenCalledWith(0.235);
     expect(viewSettings['ttsRate']).toBe(1.5);
+    expect(viewSettings['ttsSentenceGap']).toBe(0.118);
+    expect(viewSettings['ttsParagraphGap']).toBe(0.235);
     expect(settings.globalViewSettings.ttsRate).toBe(1.5);
+    expect(settings.globalViewSettings.ttsSentenceGap).toBe(0.118);
+    expect(settings.globalViewSettings.ttsParagraphGap).toBe(0.235);
+    expect(saveSettings).toHaveBeenCalled();
+  });
+
+  test('selecting 1.0 persists the non-zero default gaps in seconds', () => {
+    viewSettings['ttsRate'] = 1.5;
+    const props = makeProps();
+    render(<TTSPlayerSheet {...props} />);
+    fireEvent.click(screen.getByLabelText('Speed'));
+    const slider = screen.getByRole('slider', { name: 'Speed' });
+    fireEvent.change(slider, { target: { value: '1.0' } });
+    fireEvent.pointerUp(slider);
+
+    expect(props.onSetRate).toHaveBeenCalledWith(1.0);
+    expect(props.onSetSentenceGap).toHaveBeenCalledWith(0.15);
+    expect(props.onSetParagraphGap).toHaveBeenCalledWith(0.3);
+    expect(viewSettings['ttsSentenceGap']).toBe(0.15);
+    expect(viewSettings['ttsParagraphGap']).toBe(0.3);
+    expect(settings.globalViewSettings.ttsSentenceGap).toBe(0.15);
+    expect(settings.globalViewSettings.ttsParagraphGap).toBe(0.3);
     expect(saveSettings).toHaveBeenCalled();
   });
 

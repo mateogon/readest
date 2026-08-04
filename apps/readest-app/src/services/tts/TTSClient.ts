@@ -1,4 +1,12 @@
-import { TTSGranularity, TTSVoice, TTSVoicesGroup } from './types';
+import { TTSGranularity, TTSMark, TTSPlaybackTransition, TTSVoice, TTSVoicesGroup } from './types';
+import type { SynthesisCoordinatorMetrics } from './SynthesisCoordinator';
+import type { WebAudioPlayerDiagnostics } from './WebAudioPlayer';
+
+// A semantic sentence may be arbitrarily long (or become long after a broken
+// abbreviation heuristic). Keep every engine request acoustically bounded at
+// real DOM ranges so navigation, highlighting, and timelines share the same
+// segments instead of inventing invisible transport-only continuations.
+export const DEFAULT_TTS_MAX_SEGMENT_CHARS = 200;
 
 type TTSMessageCode = 'boundary' | 'error' | 'end';
 
@@ -6,6 +14,30 @@ export interface TTSMessageEvent {
   code: TTSMessageCode;
   message?: string;
   mark?: string;
+  // Valid only on `code: 'boundary'`; emitted when playback reaches a logical
+  // mark transition in a streamed block. It may precede audio samples by an
+  // intentional configured gap.
+  // Block labels are local to each SSML fragment, so blockOffset is part of
+  // the identity even when adjacent blocks both contain a mark named "0".
+  logicalBoundary?: {
+    blockOffset: number;
+    mark: TTSMark;
+  };
+  // On a successful terminal `end`, the last block fully consumed by the
+  // client. This lets the controller commit trailing empty/skipped blocks
+  // without moving the live document cursor for merely planned audio.
+  consumedBlockOffset?: number;
+}
+
+export interface TTSBlockInput {
+  // Current block is zero; future blocks increase monotonically within the
+  // same document section.
+  blockOffset: number;
+  ssml: string;
+}
+
+export interface TTSRuntimeMetrics extends SynthesisCoordinatorMetrics {
+  playback?: WebAudioPlayerDiagnostics;
 }
 
 // What the active engine can actually do, so the controller and UI degrade
@@ -21,6 +53,12 @@ export interface TTSCapabilities {
   gapControl: boolean;
   // Rate changes apply to in-flight audio without restarting the session.
   liveRateChange: boolean;
+  // Provider permits prepared audio to be persisted under a safe identity.
+  cacheable: boolean;
+  // Active client exposes a real headless download/cache workflow.
+  downloadable: boolean;
+  // Sentence durations can be measured/refined for a section timeline.
+  measurableDurations: boolean;
 }
 
 export interface TTSClient {
@@ -28,14 +66,43 @@ export interface TTSClient {
   initialized: boolean;
   init(): Promise<boolean>;
   shutdown(): Promise<void>;
-  speak(ssml: string, signal: AbortSignal, preload?: boolean): AsyncIterable<TTSMessageEvent>;
+  speak(
+    ssml: string,
+    signal: AbortSignal,
+    preload?: boolean,
+    preloadPriority?: 'next' | 'prefetch',
+    transitionFromPrevious?: TTSPlaybackTransition,
+  ): AsyncIterable<TTSMessageEvent>;
+  // Paired optional methods: a client opts into streamed logical blocks only
+  // when it explicitly advertises support and implements speakBlocks. The
+  // returned stream must finish with one terminal `end` or `error` event.
+  // Established clients retain the single-SSML path.
+  supportsBlockStreaming?(): boolean;
+  speakBlocks?(
+    blocks: AsyncIterable<TTSBlockInput>,
+    signal: AbortSignal,
+    transitionFromPrevious?: TTSPlaybackTransition,
+  ): AsyncIterable<TTSMessageEvent>;
   pause(): Promise<boolean>;
   resume(): Promise<boolean>;
-  stop(): Promise<void>;
+  stop(preserveSynthesis?: boolean): Promise<void>;
+  // Drop queued/prepared synthesis after a logical navigation or acoustic
+  // configuration change. Pause/resume and sequential auto-advance preserve it.
+  invalidateSynthesis?(): void;
+  // Resolve only after provider-side cancellation has completed and no native
+  // synthesis lease remains active. Client switches sharing one OS engine must
+  // await this before applying the next client's mutable configuration.
+  waitForSynthesisIdle?(): Promise<void>;
+  // Structured, text-free counters for live buffer diagnostics.
+  getSynthesisMetrics?(): TTSRuntimeMetrics;
   setPrimaryLang(lang: string): void;
   setRate(rate: number): Promise<void>;
   setPitch(pitch: number): Promise<void>;
   setVoice(voice: string): Promise<void>;
+  setSentenceGap?(sec: number): void;
+  // Diagnostic copy of the controller-owned inter-paragraph delay. Buffered
+  // players use it only to separate intentional silence from underrun.
+  setParagraphGap?(sec: number): void;
   getAllVoices(): Promise<TTSVoice[]>;
   getVoices(lang: string): Promise<TTSVoicesGroup[]>;
   getGranularities(): TTSGranularity[];

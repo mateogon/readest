@@ -137,6 +137,7 @@ vi.mock('@/services/tts', () => ({
       setLang: vi.fn(),
       setRate: vi.fn(),
       setSentenceGap: vi.fn(),
+      setParagraphGap: vi.fn(),
       supportsGapControl: vi.fn().mockReturnValue(false),
       setVoice: vi.fn(),
       setTargetLang: vi.fn(),
@@ -772,6 +773,7 @@ describe('useTTSControl gap control (handleSetSentenceGap / handleSupportsGapCon
     return ttsControllerInstances[0] as {
       setSentenceGap: ReturnType<typeof vi.fn>;
       supportsGapControl: ReturnType<typeof vi.fn>;
+      setRate: ReturnType<typeof vi.fn>;
       stop: ReturnType<typeof vi.fn>;
       start: ReturnType<typeof vi.fn>;
       state: string;
@@ -789,5 +791,18 @@ describe('useTTSControl gap control (handleSetSentenceGap / handleSupportsGapCon
     expect(controller.setSentenceGap).toHaveBeenCalledWith(0.5);
     expect(controller.stop).not.toHaveBeenCalled();
     expect(controller.start).not.toHaveBeenCalled();
+  });
+
+  it('restarts a playing session at a new rate without invalidating prepared audio', async () => {
+    const controller = await startSession();
+    controller.state = 'playing';
+
+    await act(async () => {
+      await hookResult!.handleSetRate(1.5);
+    });
+
+    expect(controller.stop).toHaveBeenCalledWith(true);
+    expect(controller.setRate).toHaveBeenCalledWith(1.5);
+    expect(controller.start).toHaveBeenCalledTimes(1);
   });
 });

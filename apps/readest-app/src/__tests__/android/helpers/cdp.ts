@@ -56,9 +56,53 @@ interface CdpResponse {
   };
 }
 
+interface CdpRemoteObject {
+  type?: string;
+  value?: unknown;
+  description?: string;
+}
+
+interface CdpMessage extends CdpResponse {
+  method?: string;
+  params?: {
+    type?: string;
+    args?: CdpRemoteObject[];
+    timestamp?: number;
+    exceptionDetails?: {
+      text?: string;
+      exception?: { description?: string };
+    };
+  };
+}
+
+export interface CdpConsoleEntry {
+  type: string;
+  text: string;
+  timestamp: number;
+}
+
+export interface CdpExceptionEntry {
+  description: string;
+  timestamp: number;
+}
+
+const stringifyRemoteObject = (arg: CdpRemoteObject): string => {
+  if (typeof arg.value === 'string') return arg.value;
+  if (arg.value !== undefined) {
+    try {
+      return JSON.stringify(arg.value) ?? String(arg.value);
+    } catch {
+      return String(arg.value);
+    }
+  }
+  return arg.description ?? arg.type ?? '';
+};
+
 export class CdpPage {
   private ws: WebSocket;
   private nextId = 1;
+  private consoleEntries: CdpConsoleEntry[] = [];
+  private exceptions: CdpExceptionEntry[] = [];
   private pending = new Map<
     number,
     { resolve: (v: CdpResponse) => void; reject: (e: Error) => void }
@@ -67,7 +111,22 @@ export class CdpPage {
   private constructor(ws: WebSocket) {
     this.ws = ws;
     this.ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(String(ev.data)) as CdpResponse;
+      const msg = JSON.parse(String(ev.data)) as CdpMessage;
+      if (msg.method === 'Runtime.consoleAPICalled') {
+        this.consoleEntries.push({
+          type: msg.params?.type ?? 'unknown',
+          text: (msg.params?.args ?? []).map(stringifyRemoteObject).join(' '),
+          timestamp: msg.params?.timestamp ?? Date.now(),
+        });
+      } else if (msg.method === 'Runtime.exceptionThrown') {
+        this.exceptions.push({
+          description:
+            msg.params?.exceptionDetails?.exception?.description ??
+            msg.params?.exceptionDetails?.text ??
+            'unknown runtime exception',
+          timestamp: msg.params?.timestamp ?? Date.now(),
+        });
+      }
       if (msg.id && this.pending.has(msg.id)) {
         const { resolve, reject } = this.pending.get(msg.id)!;
         this.pending.delete(msg.id);
@@ -134,6 +193,30 @@ export class CdpPage {
       duration: 20,
       gestureSourceType: 'touch',
     });
+  }
+
+  /** A browser-recognized touch tap that carries transient user activation. */
+  async tap(cssX: number, cssY: number): Promise<void> {
+    await this.send('Input.synthesizeTapGesture', {
+      x: cssX,
+      y: cssY,
+      tapCount: 1,
+      duration: 20,
+      gestureSourceType: 'touch',
+    });
+  }
+
+  clearRuntimeEvents(): void {
+    this.consoleEntries = [];
+    this.exceptions = [];
+  }
+
+  getConsoleEntries(): CdpConsoleEntry[] {
+    return [...this.consoleEntries];
+  }
+
+  getExceptions(): CdpExceptionEntry[] {
+    return [...this.exceptions];
   }
 
   close(): void {

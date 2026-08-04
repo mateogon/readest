@@ -41,6 +41,21 @@ impl<R: Runtime> NativeTts<R> {
     pub fn get_all_voices(&self) -> crate::Result<GetVoicesResponse> {
         Err(crate::Error::UnsupportedPlatformError)
     }
+    pub async fn synthesize_to_file(
+        &self,
+        _payload: SynthesizeToFileArgs,
+    ) -> crate::Result<SynthesizeToFileResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+    pub async fn read_synthesis_audio(
+        &self,
+        _payload: ReadSynthesisAudioArgs,
+    ) -> crate::Result<Vec<u8>> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+    pub async fn cancel_synthesis(&self, _payload: CancelSynthesisArgs) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
     pub fn set_media_session_active(
         &self,
         _payload: SetMediaSessionActiveRequest,

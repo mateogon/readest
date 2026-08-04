@@ -1,7 +1,8 @@
 // Persistent-cache decorator for any SpeechProvider. Content-addressed:
-// key = hash(version, provider id, lang, voice, pitch, text) — the playback
-// RATE is excluded by construction because providers never see it, which is
-// what makes cached audio replayable at any speed.
+// key = hash(version, provider/runtime identity, canonical locale, voice,
+// pitch, text) — the playback RATE is excluded by construction because
+// providers never see it, which is what makes cached audio replayable at any
+// speed.
 //
 // The store is pluggable (see the design doc: per-book SQLite database with
 // section packs). Every store failure degrades to plain synthesis — the
@@ -10,7 +11,14 @@
 import { md5 } from 'js-md5';
 import type { TTSWordBoundary } from '@/libs/edgeTTS';
 import type { TTSVoice } from '../types';
-import type { SpeechProvider, SpeechSynthesisRequest, SpeechSynthesisResult } from './types';
+import type {
+  SpeechProvider,
+  SpeechRetryPolicy,
+  SpeechSynthesisContext,
+  SpeechSynthesisRequest,
+  SpeechSynthesisResult,
+} from './types';
+import { normalizeSynthesisLocale } from './types';
 
 export interface TTSCacheEntry {
   audio: ArrayBuffer;
@@ -44,19 +52,42 @@ export interface TTSCacheStore {
   close?(): Promise<void>;
 }
 
-export const computeTTSCacheKey = (providerId: string, req: SpeechSynthesisRequest): string =>
+export const computeTTSCacheKey = (
+  providerId: string,
+  req: SpeechSynthesisRequest,
+  synthesisIdentity = '',
+): string =>
+  md5(
+    JSON.stringify([
+      'tts-v2',
+      providerId,
+      synthesisIdentity,
+      normalizeSynthesisLocale(req.lang),
+      req.voice,
+      req.pitch,
+      req.text,
+    ]),
+  );
+
+const computeLegacyV1TTSCacheKey = (providerId: string, req: SpeechSynthesisRequest): string =>
   md5(JSON.stringify(['tts-v1', providerId, req.lang, req.voice, req.pitch, req.text]));
+
+export interface CachingProviderOptions {
+  // Opt in only when the provider knows its current synthesis semantics are
+  // compatible with entries written before runtime identity and locale
+  // canonicalization became part of the key.
+  readLegacyV1?: boolean;
+}
 
 export class CachingProvider implements SpeechProvider {
   readonly #inner: SpeechProvider;
   readonly #store: TTSCacheStore;
-  // Dedups whole get-or-synthesize flows: the playback scheduler and the
-  // preloader routinely race the same sentence.
-  readonly #inflight = new Map<string, Promise<SpeechSynthesisResult>>();
+  readonly #readLegacyV1: boolean;
 
-  constructor(inner: SpeechProvider, store: TTSCacheStore) {
+  constructor(inner: SpeechProvider, store: TTSCacheStore, options: CachingProviderOptions = {}) {
     this.#inner = inner;
     this.#store = store;
+    this.#readLegacyV1 = options.readLegacyV1 === true;
   }
 
   get id(): string {
@@ -69,6 +100,22 @@ export class CachingProvider implements SpeechProvider {
 
   get fallbackVoiceId(): string | undefined {
     return this.#inner.fallbackVoiceId;
+  }
+
+  get synthesisIdentity(): string | undefined {
+    return this.#inner.synthesisIdentity;
+  }
+
+  get retryPolicy(): SpeechRetryPolicy | undefined {
+    return this.#inner.retryPolicy;
+  }
+
+  get synthesisConcurrency(): number | undefined {
+    return this.#inner.synthesisConcurrency;
+  }
+
+  get cacheable(): boolean | undefined {
+    return this.#inner.cacheable;
   }
 
   init(): Promise<boolean> {
@@ -86,50 +133,68 @@ export class CachingProvider implements SpeechProvider {
   async synthesize(
     req: SpeechSynthesisRequest,
     signal: AbortSignal,
+    context?: SpeechSynthesisContext,
   ): Promise<SpeechSynthesisResult> {
     if (this.#inner.cacheable === false) {
-      return this.#inner.synthesize(req, signal);
+      return this.#inner.synthesize(req, signal, context);
     }
-    const key = computeTTSCacheKey(this.#inner.id, req);
-    const pending = this.#inflight.get(key);
-    if (pending) {
-      // Joiners get their own buffer: decodeAudioData detaches its input.
-      return pending.then((result) => ({ ...result, audio: result.audio.slice(0) }));
-    }
-    const promise = this.#getOrSynthesize(key, req, signal);
-    this.#inflight.set(key, promise);
-    try {
-      return await promise;
-    } finally {
-      // Always cleared — a failed slot must not poison the retry path.
-      this.#inflight.delete(key);
-    }
+    const key = computeTTSCacheKey(this.#inner.id, req, this.#inner.synthesisIdentity);
+    return this.#getOrSynthesize(key, req, signal, context);
   }
 
   async #getOrSynthesize(
     key: string,
     req: SpeechSynthesisRequest,
     signal: AbortSignal,
+    context?: SpeechSynthesisContext,
   ): Promise<SpeechSynthesisResult> {
     try {
       const cached = await this.#store.get(key);
       if (cached) {
-        return { audio: cached.audio.slice(0), boundaries: cached.boundaries };
+        return this.#toSynthesisResult(cached);
+      }
+      if (this.#readLegacyV1) {
+        const legacy = await this.#store.get(computeLegacyV1TTSCacheKey(this.#inner.id, req));
+        if (legacy) {
+          try {
+            await this.#store.put(key, legacy, { provider: this.#inner.id, voice: req.voice });
+          } catch (err) {
+            console.warn('TTS legacy cache migration failed; continuing with cached audio', err);
+          }
+          return this.#toSynthesisResult(legacy);
+        }
       }
     } catch (err) {
       console.warn('TTS cache read failed; synthesizing instead', err);
     }
-    const result = await this.#inner.synthesize(req, signal);
+    const result = await this.#inner.synthesize(req, signal, context);
     try {
       await this.#store.put(
         key,
-        { audio: result.audio, boundaries: result.boundaries },
+        {
+          audio: result.audio,
+          boundaries: result.boundaries,
+          durationMs:
+            result.durationSec !== undefined &&
+            Number.isFinite(result.durationSec) &&
+            result.durationSec > 0
+              ? result.durationSec * 1000
+              : undefined,
+        },
         { provider: this.#inner.id, voice: req.voice },
       );
     } catch (err) {
       console.warn('TTS cache write failed; continuing uncached', err);
     }
     return result;
+  }
+
+  #toSynthesisResult(cached: TTSCacheEntry): SpeechSynthesisResult {
+    const durationSec =
+      cached.durationMs !== undefined && Number.isFinite(cached.durationMs) && cached.durationMs > 0
+        ? cached.durationMs / 1000
+        : undefined;
+    return { audio: cached.audio.slice(0), boundaries: cached.boundaries, durationSec };
   }
 
   // Ordered sentence labels for a section, from the timeline enumeration.
@@ -143,7 +208,7 @@ export class CachingProvider implements SpeechProvider {
   // record its cache key so the section can compact once fully covered.
   recordMark(section: number, ordinal: number, req: SpeechSynthesisRequest): void {
     if (this.#inner.cacheable === false) return;
-    const key = computeTTSCacheKey(this.#inner.id, req);
+    const key = computeTTSCacheKey(this.#inner.id, req, this.#inner.synthesisIdentity);
     void this.#store.recordMarkKey?.(section, ordinal, key).catch((err) => {
       console.warn('TTS cache mark recording failed', err);
     });

@@ -13,6 +13,9 @@ Default permissions for the plugin
 - `allow-set-pitch`
 - `allow-set-voice`
 - `allow-get-all-voices`
+- `allow-synthesize-to-file`
+- `allow-read-synthesis-audio`
+- `allow-cancel-synthesis`
 - `allow-set-media-session-active`
 - `allow-update-media-session-state`
 - `allow-update-media-session-metadata`
@@ -35,6 +38,32 @@ Default permissions for the plugin
 <th>Description</th>
 </tr>
 
+
+<tr>
+<td>
+
+`native-tts:allow-cancel-synthesis`
+
+</td>
+<td>
+
+Enables the cancel_synthesis command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-tts:deny-cancel-synthesis`
+
+</td>
+<td>
+
+Denies the cancel_synthesis command without any pre-configured scope.
+
+</td>
+</tr>
 
 <tr>
 <td>
@@ -240,6 +269,32 @@ Enables the playout_position command without any pre-configured scope.
 <td>
 
 Denies the playout_position command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-tts:allow-read-synthesis-audio`
+
+</td>
+<td>
+
+Enables the read_synthesis_audio command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-tts:deny-read-synthesis-audio`
+
+</td>
+<td>
+
+Denies the read_synthesis_audio command without any pre-configured scope.
 
 </td>
 </tr>
@@ -526,6 +581,32 @@ Enables the stop command without any pre-configured scope.
 <td>
 
 Denies the stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-tts:allow-synthesize-to-file`
+
+</td>
+<td>
+
+Enables the synthesize_to_file command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-tts:deny-synthesize-to-file`
+
+</td>
+<td>
+
+Denies the synthesize_to_file command without any pre-configured scope.
 
 </td>
 </tr>

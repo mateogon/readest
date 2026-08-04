@@ -12,7 +12,12 @@ import {
 } from './adb';
 import { CdpPage, forwardWebViewDevtools, listPages } from './cdp';
 
-export const APP_PKG = 'com.bilingify.readest';
+export const STOCK_APP_PKG = 'com.bilingify.readest';
+const configuredAppPackage = process.env['READEST_ANDROID_PACKAGE']?.trim() || STOCK_APP_PKG;
+if (!/^[A-Za-z][A-Za-z0-9._]*$/.test(configuredAppPackage)) {
+  throw new Error(`invalid READEST_ANDROID_PACKAGE: ${configuredAppPackage}`);
+}
+export const APP_PKG = configuredAppPackage;
 const CDP_PORT = Number(process.env['READEST_CDP_PORT'] ?? 9333);
 const REMOTE_FIXTURE_DIR = '/sdcard/Download';
 

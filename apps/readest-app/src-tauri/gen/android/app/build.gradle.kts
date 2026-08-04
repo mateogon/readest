@@ -58,6 +58,7 @@ android {
     }
     buildTypes {
         getByName("debug") {
+            applicationIdSuffix = ".buffered"
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
             isJniDebuggable = true

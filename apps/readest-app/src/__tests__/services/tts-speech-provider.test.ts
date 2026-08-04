@@ -28,6 +28,7 @@ vi.mock('@/libs/edgeTTS', async (importOriginal) => {
 
 import { EdgeSpeechProvider } from '@/services/tts/providers/edge';
 import { SpeechSynthesisPermanentError } from '@/services/tts/providers/types';
+import { SynthesisCoordinator } from '@/services/tts/SynthesisCoordinator';
 
 describe('EdgeSpeechProvider', () => {
   beforeEach(() => {
@@ -49,6 +50,7 @@ describe('EdgeSpeechProvider', () => {
     const provider = new EdgeSpeechProvider();
     expect(provider.id).toBe('edge-tts');
     expect(provider.label).toBe('Edge TTS');
+    expect(provider.synthesisConcurrency).toBe(4);
   });
 
   test('init probes the transport and reports availability', async () => {
@@ -112,6 +114,44 @@ describe('EdgeSpeechProvider', () => {
         new AbortController().signal,
       ),
     ).rejects.toThrow('network error');
+  });
+
+  test('an aborted Edge transport does not hold the synthesis slot for a new generation', async () => {
+    let resolveStale!: (value: {
+      data: ArrayBuffer;
+      boundaries: Array<{ offset: number; duration: number; text: string }>;
+    }) => void;
+    const staleTransport = new Promise<{
+      data: ArrayBuffer;
+      boundaries: Array<{ offset: number; duration: number; text: string }>;
+    }>((resolve) => {
+      resolveStale = resolve;
+    });
+    h.createAudioData
+      .mockImplementationOnce(() => staleTransport)
+      .mockResolvedValueOnce({ data: new ArrayBuffer(8), boundaries: [] });
+    const provider = await initializedProvider();
+    const coordinator = new SynthesisCoordinator(provider);
+    const request = {
+      lang: 'en',
+      text: 'stale sentence',
+      voice: 'en-US-AriaNeural',
+      pitch: 1,
+    };
+
+    const stale = coordinator.acquire(request, { priority: 'playback' });
+    await vi.waitFor(() => expect(h.createAudioData).toHaveBeenCalledTimes(1));
+    coordinator.advanceGeneration();
+    await expect(stale.result).resolves.toBeUndefined();
+
+    const fresh = coordinator.acquire(
+      { ...request, text: 'fresh sentence' },
+      { priority: 'playback' },
+    );
+    await vi.waitFor(() => expect(h.createAudioData).toHaveBeenCalledTimes(2));
+    await expect(fresh.result).resolves.toMatchObject({ audio: expect.any(ArrayBuffer) });
+
+    resolveStale({ data: new ArrayBuffer(4), boundaries: [] });
   });
 
   test('exposes the static Edge voice list', async () => {

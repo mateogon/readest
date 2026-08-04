@@ -4,6 +4,8 @@ export type TTSHighlightGranularity = 'word' | 'sentence';
 
 export type TTSMediaMetadataMode = 'sentence' | 'paragraph' | 'chapter';
 
+export type TTSPlaybackTransition = 'paragraph' | 'chapter' | null;
+
 // Mini player card style: 'full' is the pre-#5162 (0.11.18) card with book
 // cover, book title, chapter + timestamps; 'minimal' is the chrome-free card.
 export type TTSPlayerStyle = 'full' | 'minimal';

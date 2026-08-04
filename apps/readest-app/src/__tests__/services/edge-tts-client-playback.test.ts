@@ -132,6 +132,83 @@ describe('EdgeTTSClient Web Audio playback', () => {
 
   const ctx = () => FakeAudioContext.instances[0]!;
 
+  test('reuses preloaded audio when playback requests the same marks', async () => {
+    createAudioDataBehavior = vi.fn(async () => audioOf(1));
+    const client = await startClient();
+    for await (const _event of client.speak('<ssml/>', new AbortController().signal, true)) {
+      // Consume the preload iterator exactly as TTSController does.
+    }
+
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+
+    expect(createAudioDataBehavior).toHaveBeenCalledTimes(2);
+    expect(ctx().sources).toHaveLength(2);
+    expect(client.getSynthesisMetrics()).toMatchObject({
+      misses: 2,
+      hits: 2,
+      attempts: 2,
+      retries: 0,
+    });
+    await ctx().advanceTo(3);
+    await done;
+  });
+
+  test('reuses prepared audio after a playback-rate restart', async () => {
+    createAudioDataBehavior = vi.fn(async () => audioOf(1));
+    const client = await startClient();
+    for await (const _event of client.speak('<ssml/>', new AbortController().signal, true)) {
+      // Prepare both marks before the rate restart.
+    }
+
+    await client.stop();
+    await client.setRate(1.5);
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+
+    expect(createAudioDataBehavior).toHaveBeenCalledTimes(2);
+    await ctx().advanceTo(3);
+    await done;
+  });
+
+  test('uses bounded Edge concurrency to prepare multiple queued marks', async () => {
+    parsedMarks = [
+      { name: '0', text: 'First sentence.', language: 'en' },
+      { name: '1', text: 'Second sentence.', language: 'en' },
+      { name: '2', text: 'Third sentence.', language: 'en' },
+    ];
+    const releases = new Map<string, () => void>();
+    let active = 0;
+    let maxActive = 0;
+    createAudioDataBehavior = vi.fn(
+      (text: string) =>
+        new Promise<MockAudioData>((resolve) => {
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          releases.set(text, () => {
+            active -= 1;
+            resolve(audioOf(1));
+          });
+        }),
+    );
+    const client = await startClient();
+    const preload = (async () => {
+      for await (const _event of client.speak('<ssml/>', new AbortController().signal, true)) {
+        // Consume preload.
+      }
+    })();
+
+    await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(1));
+    releases.get('First sentence.')!();
+    await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(3));
+    expect(maxActive).toBe(2);
+    releases.get('Second sentence.')!();
+    releases.get('Third sentence.')!();
+    await preload;
+  });
+
   test('plays marks gaplessly: boundary per audible chunk, one final end', async () => {
     const client = await startClient();
     const { events, done } = collectSpeak(client, new AbortController().signal);
@@ -273,6 +350,34 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await done;
     expect(events.at(-1)).toMatchObject({ code: 'error', message: 'Aborted' });
     expect(ctx().sources.every((s) => s.stopped)).toBe(true);
+  });
+
+  test('emits a final post-stop metrics snapshot after aborting playback', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const client = await startClient();
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+
+    client.invalidateSynthesis();
+    await client.stop();
+    await done;
+
+    const metricCalls = info.mock.calls.filter(
+      ([message]) => typeof message === 'string' && message.startsWith('[TTS][BufferedMetrics] '),
+    );
+    const payloads = metricCalls.map(([message]) =>
+      JSON.parse((message as string).slice('[TTS][BufferedMetrics] '.length)),
+    );
+    expect(metricCalls.every((call) => call.length === 1)).toBe(true);
+    expect(payloads.at(-1)).toMatchObject({
+      reason: 'stop',
+      playback: {
+        sessionsAborted: 1,
+        currentBufferAheadMs: 0,
+      },
+    });
+    info.mockRestore();
   });
 
   test('a no-audio mark is skipped and the session continues', async () => {

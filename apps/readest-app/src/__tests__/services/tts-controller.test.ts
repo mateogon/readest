@@ -5,6 +5,7 @@ import { TTSGranularity, TTSVoicesGroup } from '@/services/tts/types';
 import { TTSUtils } from '@/services/tts/TTSUtils';
 import { FoliateView } from '@/types/view';
 import { AppService } from '@/types/system';
+import { TTS } from 'foliate-js/tts.js';
 
 // --- Mock all heavy dependencies so we never import real TTS clients ---
 
@@ -16,7 +17,10 @@ vi.mock('@/services/tts/WebSpeechClient', () => ({
 
 vi.mock('@/services/tts/EdgeTTSClient', () => ({
   EdgeTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
-    Object.assign(this, createMockTTSClient('edge'), { setSentenceGap: vi.fn() });
+    Object.assign(this, createMockTTSClient('edge'), {
+      setSentenceGap: vi.fn(),
+      setParagraphGap: vi.fn(),
+    });
   }),
 }));
 
@@ -24,6 +28,18 @@ vi.mock('@/services/tts/NativeTTSClient', () => ({
   NativeTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
     Object.assign(this, createMockTTSClient('native'));
   }),
+}));
+
+vi.mock('@/services/tts/BufferedTTSClient', () => ({
+  BufferedTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
+    Object.assign(this, createMockTTSClient('android-system-buffered'), {
+      setParagraphGap: vi.fn(),
+    });
+  }),
+}));
+
+vi.mock('@/services/tts/providers/android', () => ({
+  AndroidSystemSpeechProvider: vi.fn(),
 }));
 
 // Track the inaudible background keep-alive (WebAudio) toggled for direct-speak
@@ -101,6 +117,8 @@ function createMockTTSClient(name: string): TTSClient {
     pause: vi.fn().mockResolvedValue(true),
     resume: vi.fn().mockResolvedValue(true),
     stop: vi.fn().mockResolvedValue(undefined),
+    invalidateSynthesis: vi.fn(),
+    waitForSynthesisIdle: vi.fn().mockResolvedValue(undefined),
     setPrimaryLang: vi.fn(),
     setRate: vi.fn().mockResolvedValue(undefined),
     setPitch: vi.fn().mockResolvedValue(undefined),
@@ -109,10 +127,13 @@ function createMockTTSClient(name: string): TTSClient {
     getVoices: vi.fn().mockResolvedValue([]),
     getGranularities: vi.fn().mockReturnValue(['word', 'sentence'] as TTSGranularity[]),
     getCapabilities: vi.fn().mockImplementation(() => ({
-      wordBoundaries: name === 'edge',
-      mediaClock: name === 'edge',
-      gapControl: name === 'edge',
+      wordBoundaries: name === 'edge' || name === 'android-system-buffered',
+      mediaClock: name === 'edge' || name === 'android-system-buffered',
+      gapControl: name === 'edge' || name === 'android-system-buffered',
       liveRateChange: false,
+      cacheable: name === 'edge',
+      downloadable: name === 'edge',
+      measurableDurations: name === 'edge' || name === 'android-system-buffered',
     })),
     getVoiceId: vi.fn().mockReturnValue('voice-1'),
     getSpeakingLang: vi.fn().mockReturnValue('en'),
@@ -254,6 +275,15 @@ describe('TTSController', () => {
       expect(c.ttsNativeClient).not.toBeNull();
     });
 
+    test('creates a separate buffered system client only on Android', () => {
+      const android = new TTSController(createMockAppService(true), mockView);
+      const ios = new TTSController(createMockAppService(false, true), mockView);
+
+      expect(android.ttsAndroidBufferedClient?.name).toBe('android-system-buffered');
+      expect(ios.ttsAndroidBufferedClient).toBeNull();
+      expect(controller.ttsAndroidBufferedClient).toBeNull();
+    });
+
     test('creates native client when isIOSApp', () => {
       const iosService = createMockAppService(false, true);
       const c = new TTSController(iosService, mockView);
@@ -318,6 +348,53 @@ describe('TTSController', () => {
       expect(c.ttsNativeClient!.init).toHaveBeenCalled();
       expect(c.ttsNativeClient!.getAllVoices).toHaveBeenCalled();
     });
+
+    test('initializes and records buffered system voices on Android', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      const bufferedVoice = {
+        id: 'android-buffered:engine_en_voice',
+        name: 'English voice',
+        lang: 'en-US',
+      };
+      vi.mocked(c.ttsAndroidBufferedClient!.getAllVoices).mockResolvedValue([bufferedVoice]);
+
+      await c.init();
+
+      expect(c.ttsAndroidBufferedClient!.init).toHaveBeenCalled();
+      expect(c.ttsAndroidBufferedVoices).toEqual([bufferedVoice]);
+    });
+
+    test('restores an explicitly preferred buffered Android client', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValue('android-system-buffered');
+      const c = new TTSController(createMockAppService(true), mockView);
+
+      await c.init();
+
+      expect(c.ttsClient.name).toBe('android-system-buffered');
+    });
+
+    test('does not make the experimental buffered client the implicit Android default', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValue(null);
+      const c = new TTSController(createMockAppService(true), mockView);
+      vi.mocked(c.ttsEdgeClient.init).mockResolvedValue(false);
+
+      await c.init();
+
+      expect(c.ttsClient.name).toBe('native');
+    });
+
+    test('keeps established TTS available when experimental Android init rejects', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValue(null);
+      const c = new TTSController(createMockAppService(true), mockView);
+      vi.mocked(c.ttsAndroidBufferedClient!.init).mockRejectedValue(
+        new Error('experimental bridge unavailable'),
+      );
+
+      await expect(c.init()).resolves.toBeUndefined();
+
+      expect(c.ttsClient.name).toBe('edge');
+      expect(c.ttsAndroidBufferedVoices).toEqual([]);
+    });
   });
 
   describe('setRate', () => {
@@ -345,14 +422,98 @@ describe('TTSController', () => {
     });
   });
 
+  describe('download capability', () => {
+    test('is hidden when the active client is not downloadable', () => {
+      controller.ttsClient = controller.ttsWebClient;
+      expect(controller.canDownload()).toBe(false);
+    });
+
+    test('follows the active client capability', () => {
+      controller.ttsClient = controller.ttsEdgeClient;
+      expect(controller.canDownload()).toBe(true);
+    });
+
+    test('does not claim a downloader for a non-Edge client', () => {
+      controller.ttsClient = controller.ttsWebClient;
+      vi.mocked(controller.ttsWebClient.getCapabilities).mockReturnValue({
+        wordBoundaries: true,
+        mediaClock: true,
+        gapControl: true,
+        liveRateChange: false,
+        cacheable: true,
+        downloadable: true,
+        measurableDurations: true,
+      });
+
+      expect(controller.canDownload()).toBe(false);
+      expect(controller.getTTSDownloader()).toBeNull();
+    });
+  });
+
+  describe('getSynthesisMetrics', () => {
+    test('returns a text-free snapshot from the active buffered client', () => {
+      const metrics = {
+        hits: 2,
+        misses: 3,
+        joins: 1,
+        evictions: 0,
+        regenerations: 0,
+        attempts: 4,
+        retries: 1,
+        cancellations: 0,
+      };
+      controller.ttsClient = Object.assign(controller.ttsEdgeClient, {
+        getSynthesisMetrics: vi.fn(() => metrics),
+      });
+
+      expect(controller.getSynthesisMetrics()).toEqual(metrics);
+    });
+
+    test('returns null for a direct-speech client', () => {
+      controller.ttsClient = controller.ttsWebClient;
+      expect(controller.getSynthesisMetrics()).toBeNull();
+    });
+  });
+
   describe('setSentenceGap', () => {
-    test('delegates to ttsEdgeClient.setSentenceGap with the given value', () => {
+    test('delegates to the active buffered client', () => {
+      controller.ttsClient = controller.ttsEdgeClient;
       controller.setSentenceGap(0.5);
       expect(controller.ttsEdgeClient.setSentenceGap).toHaveBeenCalledWith(0.5);
+    });
+
+    test('does not mutate the Edge client while another client is active', () => {
+      const setSentenceGap = vi.fn();
+      controller.ttsClient = Object.assign(controller.ttsWebClient, { setSentenceGap });
+      controller.setSentenceGap(0.4);
+
+      expect(setSentenceGap).toHaveBeenCalledWith(0.4);
+      expect(controller.ttsEdgeClient.setSentenceGap).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('setParagraphGap', () => {
+    test('delegates to the active buffered client', () => {
+      controller.ttsClient = controller.ttsEdgeClient;
+      controller.setParagraphGap(0.75);
+
+      expect(controller.ttsEdgeClient.setParagraphGap).toHaveBeenCalledWith(0.75);
     });
   });
 
   describe('setVoice', () => {
+    test('applies the stored sentence gap when switching buffered clients', async () => {
+      controller.ttsClient = controller.ttsEdgeClient;
+      controller.setSentenceGap(0.4);
+      const setSentenceGap = vi.fn();
+      controller.ttsWebClient = Object.assign(controller.ttsWebClient, { setSentenceGap });
+
+      await controller.setVoice('unknown-voice', 'en');
+
+      expect(controller.ttsClient).toBe(controller.ttsWebClient);
+      expect(setSentenceGap).toHaveBeenCalledWith(0.4);
+    });
+
     test('switches to edge client when voice found in edge voices', async () => {
       controller.ttsEdgeVoices = [{ id: 'edge-voice-1', name: 'Edge Voice', lang: 'en-US' }];
       await controller.setVoice('edge-voice-1', 'en');
@@ -378,6 +539,48 @@ describe('TTSController', () => {
       await c.setVoice('native-v', 'en');
 
       expect(c.ttsClient.name).toBe('native');
+    });
+
+    test('switches to the buffered Android client for its namespaced voice', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      c.setParagraphGap(0.6);
+      c.ttsAndroidBufferedVoices = [
+        {
+          id: 'android-buffered:engine_en_voice',
+          name: 'Buffered voice',
+          lang: 'en-US',
+        },
+      ];
+
+      await c.setVoice('android-buffered:engine_en_voice', 'en');
+
+      expect(c.ttsClient.name).toBe('android-system-buffered');
+      expect(c.ttsClient.setRate).toHaveBeenCalledWith(1);
+      expect(c.ttsClient.setParagraphGap).toHaveBeenCalledWith(0.6);
+      expect(TTSUtils.setPreferredClient).toHaveBeenCalledWith('android-system-buffered');
+    });
+
+    test('waits for buffered native cancellation to drain before selecting direct speech', async () => {
+      let finishDrain!: () => void;
+      const drain = new Promise<void>((resolve) => {
+        finishDrain = resolve;
+      });
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      c.ttsClient = c.ttsAndroidBufferedClient!;
+      c.ttsNativeVoices = [{ id: 'native-v', name: 'Native', lang: 'en-US' }];
+      vi.mocked(c.ttsAndroidBufferedClient!.waitForSynthesisIdle!).mockReturnValue(drain);
+
+      const switching = c.setVoice('native-v', 'en');
+      await vi.waitFor(() =>
+        expect(c.ttsAndroidBufferedClient!.waitForSynthesisIdle).toHaveBeenCalled(),
+      );
+      expect(c.ttsNativeClient!.setRate).not.toHaveBeenCalled();
+
+      finishDrain();
+      await switching;
+      expect(c.ttsNativeClient!.setRate).toHaveBeenCalledWith(1);
     });
 
     test('throws when native voice found but native client unavailable', async () => {
@@ -443,6 +646,30 @@ describe('TTSController', () => {
       const result = await c.getVoices('en');
       expect(result).toEqual(nativeVoices);
     });
+
+    test('lists buffered Android voices in their own experimental group', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      const bufferedVoices: TTSVoicesGroup[] = [
+        {
+          id: 'android-system-buffered',
+          name: 'System TTS — Buffered (Experimental)',
+          voices: [
+            {
+              id: 'android-buffered:engine_en_voice',
+              name: 'Buffered voice',
+              lang: 'en-US',
+            },
+          ],
+        },
+      ];
+      vi.mocked(c.ttsAndroidBufferedClient!.getVoices).mockResolvedValue(bufferedVoices);
+      vi.mocked(c.ttsNativeClient!.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsEdgeClient.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsWebClient.getVoices).mockResolvedValue([]);
+
+      await expect(c.getVoices('en')).resolves.toEqual(bufferedVoices);
+    });
   });
 
   describe('getVoiceId', () => {
@@ -485,6 +712,15 @@ describe('TTSController', () => {
 
       expect(controller.ttsEdgeClient.setPrimaryLang).toHaveBeenCalledWith('fr');
       expect(controller.ttsWebClient.setPrimaryLang).toHaveBeenCalledWith('fr');
+    });
+
+    test('updates the initialized buffered Android client language', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      c.ttsAndroidBufferedClient!.initialized = true;
+
+      await c.setPrimaryLang('es');
+
+      expect(c.ttsAndroidBufferedClient!.setPrimaryLang).toHaveBeenCalledWith('es');
     });
 
     test('skips uninitialised clients', async () => {
@@ -1110,6 +1346,9 @@ describe('TTSController', () => {
       // here since nothing was ever spoken for the new section.
       expect(controller.state).toBe('forward-paused');
       expect(stopKeepAlive).toHaveBeenCalled();
+      expect(
+        vi.mocked(controller.ttsClient.speak).mock.calls.some((call) => call[2] === false),
+      ).toBe(false);
     });
 
     test('auto-advance crosses the boundary normally when the mode is off', async () => {
@@ -1120,6 +1359,14 @@ describe('TTSController', () => {
 
       expect(sectionOpened(1)).toBe(true);
       expect(controller.state).toBe('playing');
+      expect(controller.ttsClient.invalidateSynthesis).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() =>
+        expect(
+          vi
+            .mocked(controller.ttsClient.speak)
+            .mock.calls.some((call) => call[2] === false && call[4] === 'chapter'),
+        ).toBe(true),
+      );
     });
 
     test('a user skip still crosses the boundary while the mode is armed', async () => {
@@ -1133,6 +1380,13 @@ describe('TTSController', () => {
 
       expect(sectionOpened(1)).toBe(true);
       expect(controller.state).toBe('playing');
+      await vi.waitFor(() =>
+        expect(
+          vi
+            .mocked(controller.ttsClient.speak)
+            .mock.calls.some((call) => call[2] === false && call[4] === null),
+        ).toBe(true),
+      );
     });
 
     test('a user next-sentence skip still crosses the boundary', async () => {
@@ -1263,6 +1517,50 @@ describe('TTSController', () => {
   });
 
   describe('forward and backward', () => {
+    test('same-section auto-advance preserves prepared synthesis', async () => {
+      mockView.tts = {
+        next: vi.fn().mockReturnValue('<speak>next</speak>'),
+        nextMark: vi.fn(),
+        start: vi.fn(),
+        doc: null,
+      } as unknown as FoliateView['tts'];
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* () {});
+      controller.state = 'playing';
+
+      await controller.forward(false, true);
+
+      expect(controller.ttsClient.invalidateSynthesis).not.toHaveBeenCalled();
+      await vi.waitFor(() =>
+        expect(
+          vi
+            .mocked(controller.ttsClient.speak)
+            .mock.calls.some((call) => call[2] === false && call[4] === 'paragraph'),
+        ).toBe(true),
+      );
+    });
+
+    test('manual forward invalidates prepared synthesis', async () => {
+      mockView.tts = {
+        next: vi.fn().mockReturnValue('<speak>next</speak>'),
+        nextMark: vi.fn(),
+        start: vi.fn(),
+        doc: null,
+      } as unknown as FoliateView['tts'];
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* () {});
+      controller.state = 'playing';
+
+      await controller.forward(false, false);
+
+      expect(controller.ttsClient.invalidateSynthesis).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() =>
+        expect(
+          vi
+            .mocked(controller.ttsClient.speak)
+            .mock.calls.some((call) => call[2] === false && call[4] === null),
+        ).toBe(true),
+      );
+    });
+
     test('forward sets forward-paused state when not playing', async () => {
       // Set up controller with a mock tts on the view
       mockView.tts = {
@@ -1294,13 +1592,24 @@ describe('TTSController', () => {
   describe('stop', () => {
     test('calls ttsClient.stop', async () => {
       await controller.stop();
-      expect(controller.ttsClient.stop).toHaveBeenCalled();
+      expect(controller.ttsClient.stop).toHaveBeenCalledWith(false);
     });
 
     test('sets state to stopped', async () => {
       controller.state = 'playing';
       await controller.stop();
       expect(controller.state).toBe('stopped');
+    });
+
+    test('invalidates prepared synthesis on a terminal stop', async () => {
+      await controller.stop();
+      expect(controller.ttsClient.invalidateSynthesis).toHaveBeenCalledTimes(1);
+    });
+
+    test('preserves prepared synthesis during a sequential transition', async () => {
+      await controller.stop(true);
+      expect(controller.ttsClient.invalidateSynthesis).not.toHaveBeenCalled();
+      expect(controller.ttsClient.stop).toHaveBeenCalledWith(true);
     });
 
     test('handles client stop errors gracefully', async () => {
@@ -1477,57 +1786,809 @@ describe('TTSController', () => {
         '<speak>hi</speak>',
         expect.anything(),
         true,
+        'prefetch',
       );
     });
   });
 
   describe('preloadNextSSML', () => {
-    test('calls tts.next() and tts.prev() synchronously without async gaps between them', async () => {
-      // This test verifies the fix for a race condition where async gaps between
-      // tts.next() calls in preloadNextSSML allowed #speak() to interleave and
-      // read corrupted #ranges state (replaced by next() for a different block).
-      const callOrder: string[] = [];
-      let asyncOpHappened = false;
-
+    const installLiveCursor = (options: { doc?: Document | null; anchor?: Range | null } = {}) => {
+      const doc = options.doc === undefined ? document : options.doc;
+      const anchor = options.anchor === undefined ? document.createRange() : options.anchor;
+      let currentMark: string | null = '1';
+      const next = vi.fn().mockImplementation(() => {
+        currentMark = null;
+        return '<speak>live-next</speak>';
+      });
+      const prev = vi.fn().mockImplementation(() => {
+        currentMark = null;
+        return '<speak>live-prev</speak>';
+      });
+      const nextMark = vi
+        .fn()
+        .mockImplementation(() =>
+          currentMark === '1' ? '<speak>same-block-next</speak>' : '<speak>next-block</speak>',
+        );
+      const getLastRange = vi.fn().mockImplementation(() => anchor ?? undefined);
       mockView.tts = {
-        next: vi.fn().mockImplementation(() => {
-          if (asyncOpHappened) {
-            callOrder.push('next-after-async');
-          } else {
-            callOrder.push('next');
-          }
-          return '<speak>chunk</speak>';
-        }),
-        prev: vi.fn().mockImplementation(() => {
-          callOrder.push('prev');
-        }),
-        doc: {},
+        next,
+        prev,
+        nextMark,
+        getLastRange,
+        doc,
       } as unknown as FoliateView['tts'];
+      return {
+        anchor,
+        getLastRange,
+        next,
+        prev,
+        nextMark,
+        currentMark: () => currentMark,
+      };
+    };
 
-      // Use preprocessCallback to detect when async processing happens
+    const queueShadowCursor = (
+      chunks: string[],
+      fromResult: string | null = '<speak>current</speak>',
+    ) => {
+      const from = vi.fn().mockReturnValue(fromResult);
+      const next = vi.fn();
+      for (const chunk of chunks) next.mockReturnValueOnce(chunk);
+      next.mockReturnValue(undefined);
+      vi.mocked(TTS).mockImplementationOnce(function () {
+        return {
+          from,
+          next,
+          doc: document,
+        } as unknown as InstanceType<typeof TTS>;
+      });
+      return { from, next };
+    };
+
+    const startPendingPreload = async () => {
+      const live = installLiveCursor();
+      queueShadowCursor(['<speak>chunk</speak>']);
+      let observedSignal: AbortSignal | undefined;
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* (_ssml, signal) {
+        observedSignal = signal;
+        if (!signal.aborted) {
+          await new Promise<void>((resolve) =>
+            signal.addEventListener('abort', () => resolve(), { once: true }),
+          );
+        }
+        yield { code: 'end' } as TTSMessageEvent;
+      });
+      const pending = controller.preloadNextSSML(1);
+      await vi.waitFor(() => expect(observedSignal).toBeDefined());
+      return { live, pending, signal: observedSignal! };
+    };
+
+    test('terminal stop aborts the active speculative preload run', async () => {
+      const { pending, signal } = await startPendingPreload();
+
+      await controller.stop();
+
+      expect(signal.aborted).toBe(true);
+      await pending;
+    });
+
+    test('sequential stop preserves the active speculative preload run', async () => {
+      const { pending, signal } = await startPendingPreload();
+
+      await controller.stop(true);
+
+      expect(signal.aborted).toBe(false);
+      await controller.stop();
+      await pending;
+    });
+
+    test('coalesces refill requests and reruns from the current live anchor', async () => {
+      const firstAnchor = document.createRange();
+      const secondAnchor = document.createRange();
+      const live = installLiveCursor({ anchor: firstAnchor });
+      const firstShadow = queueShadowCursor(['<speak>chunk-0</speak>']);
+      const secondShadow = queueShadowCursor([
+        '<speak>chunk-10</speak>',
+        '<speak>chunk-11</speak>',
+        '<speak>chunk-12</speak>',
+      ]);
+      let releaseFirst!: () => void;
+      const firstPending = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* (ssml) {
+        if (ssml === '<speak>chunk-0</speak>') await firstPending;
+        yield { code: 'end' } as TTSMessageEvent;
+      });
+
+      const firstRun = controller.preloadNextSSML(1);
+      await vi.waitFor(() => expect(controller.ttsClient.speak).toHaveBeenCalledTimes(1));
+
+      // Playback advances while the first speculative synthesis is still in
+      // flight. Multiple refill requests collapse to one run using the larger
+      // requested window, anchored at the live range when the refill starts.
+      live.getLastRange.mockReturnValue(secondAnchor);
+      void controller.preloadNextSSML(2);
+      void controller.preloadNextSSML(3);
+      releaseFirst();
+      await firstRun;
+
+      expect(firstShadow.from).toHaveBeenCalledWith(firstAnchor);
+      expect(secondShadow.from).toHaveBeenCalledWith(secondAnchor);
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
+      expect(vi.mocked(controller.ttsClient.speak).mock.calls.map(([ssml]) => ssml)).toEqual([
+        '<speak>chunk-0</speak>',
+        '<speak>chunk-10</speak>',
+        '<speak>chunk-11</speak>',
+        '<speak>chunk-12</speak>',
+      ]);
+    });
+
+    test('terminal cancellation clears a queued refill and stale completion cannot restart it', async () => {
+      const live = installLiveCursor();
+      queueShadowCursor(['<speak>chunk-0</speak>']);
+      queueShadowCursor(['<speak>chunk-1</speak>']);
+      let firstSignal: AbortSignal | undefined;
+      let invocation = 0;
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* (_ssml, signal) {
+        invocation += 1;
+        if (invocation === 1) {
+          firstSignal = signal;
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) =>
+              signal.addEventListener('abort', () => resolve(), { once: true }),
+            );
+          }
+        }
+        yield { code: 'end' } as TTSMessageEvent;
+      });
+
+      const firstRun = controller.preloadNextSSML(1);
+      await vi.waitFor(() => expect(firstSignal).toBeDefined());
+      void controller.preloadNextSSML(3);
+
+      await controller.stop();
+      await firstRun;
+
+      expect(firstSignal!.aborted).toBe(true);
+      expect(controller.ttsClient.speak).toHaveBeenCalledTimes(1);
+
+      // A later explicit request starts cleanly; it must not inherit the
+      // cancelled refill count after the stale run's finally block executes.
+      await controller.preloadNextSSML(1);
+      expect(controller.ttsClient.speak).toHaveBeenCalledTimes(2);
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
+    });
+
+    test('starts speculative SSML preloads concurrently after shadow enumeration', async () => {
+      const live = installLiveCursor();
+      queueShadowCursor(['<speak>chunk-0</speak>', '<speak>chunk-1</speak>']);
+      let releaseFirst!: () => void;
+      const firstPending = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let invocation = 0;
+      vi.mocked(controller.ttsClient.speak).mockImplementation(async function* () {
+        invocation += 1;
+        if (invocation === 1) await firstPending;
+        yield { code: 'end' } as TTSMessageEvent;
+      });
+
+      const preload = controller.preloadNextSSML(2);
+      await vi.waitFor(() => expect(controller.ttsClient.speak).toHaveBeenCalledTimes(2));
+      releaseFirst();
+      await preload;
+
+      expect(controller.ttsClient.speak).toHaveBeenCalledTimes(2);
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
+    });
+
+    test('never mutates the live cursor or erases its current local mark', async () => {
+      const live = installLiveCursor();
+      const shadow = queueShadowCursor(['<speak>chunk-0</speak>', '<speak>chunk-1</speak>']);
       controller.preprocessCallback = async (ssml: string) => {
-        asyncOpHappened = true;
-        callOrder.push('preprocess');
+        await Promise.resolve();
         return ssml;
       };
 
       await controller.preloadNextSSML(2);
 
-      // All next() calls should happen before any preprocess (async operation)
-      const firstPreprocessIdx = callOrder.indexOf('preprocess');
-      const nextIndices = callOrder.map((op, i) => (op === 'next' ? i : -1)).filter((i) => i >= 0);
-      const prevIndices = callOrder.map((op, i) => (op === 'prev' ? i : -1)).filter((i) => i >= 0);
+      expect(shadow.from).toHaveBeenCalledWith(live.anchor);
+      expect(shadow.next).toHaveBeenCalledTimes(2);
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
+      expect(live.currentMark()).toBe('1');
+      expect(live.nextMark()).toBe('<speak>same-block-next</speak>');
+    });
 
-      // All next() calls must come before any async preprocessing
-      for (const idx of nextIndices) {
-        expect(idx).toBeLessThan(firstPreprocessIdx);
-      }
-      // All prev() calls must come before any async preprocessing
-      for (const idx of prevIndices) {
-        expect(idx).toBeLessThan(firstPreprocessIdx);
-      }
-      // No next() should happen after an async operation
-      expect(callOrder).not.toContain('next-after-async');
+    test.each([
+      'document',
+      'range',
+    ] as const)('fails safely without a live %s anchor and never falls back to live enumeration', async (missing) => {
+      const live = installLiveCursor({
+        doc: missing === 'document' ? null : document,
+        anchor: missing === 'range' ? null : document.createRange(),
+      });
+
+      await expect(controller.preloadNextSSML(2)).resolves.toBeUndefined();
+
+      expect(TTS).not.toHaveBeenCalled();
+      expect(controller.ttsClient.speak).not.toHaveBeenCalled();
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
+      expect(live.currentMark()).toBe('1');
+    });
+
+    test('fails safely when the shadow cannot position at the live range', async () => {
+      const live = installLiveCursor();
+      const shadow = queueShadowCursor([], null);
+
+      await expect(controller.preloadNextSSML(2)).resolves.toBeUndefined();
+
+      expect(shadow.from).toHaveBeenCalledWith(live.anchor);
+      expect(shadow.next).not.toHaveBeenCalled();
+      expect(controller.ttsClient.speak).not.toHaveBeenCalled();
+      expect(live.next).not.toHaveBeenCalled();
+      expect(live.prev).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('streamed logical blocks', () => {
+    const installLiveCursor = async (blockCount = 4) => {
+      await controller.initViewTTS(0);
+      const doc = mockView.renderer.getContents()[0]!.doc;
+      const ranges = Array.from({ length: blockCount }, () => document.createRange());
+      const highlighter = vi.mocked(TTS).mock.calls.at(-1)?.[3] as
+        | ((range: Range) => void)
+        | undefined;
+      let blockIndex = 0;
+      let currentMark: string | null = null;
+      const setMark = vi.fn().mockImplementation((mark: string) => {
+        currentMark = mark;
+        highlighter?.(ranges[blockIndex]!);
+        return ranges[blockIndex];
+      });
+      const getLastRange = vi.fn().mockImplementation(() => {
+        return currentMark ? ranges[blockIndex] : undefined;
+      });
+      const next = vi.fn().mockImplementation(() => {
+        if (blockIndex + 1 >= blockCount) return undefined;
+        blockIndex += 1;
+        currentMark = null;
+        return `<speak>live-${blockIndex}</speak>`;
+      });
+      const nextMark = vi.fn().mockImplementation(() => {
+        return `<speak>block-${blockIndex}-next-mark</speak>`;
+      });
+      mockView.tts = {
+        doc,
+        setMark,
+        getLastRange,
+        next,
+        nextMark,
+      } as unknown as FoliateView['tts'];
+      return {
+        ranges,
+        setMark,
+        getLastRange,
+        next,
+        nextMark,
+        blockIndex: () => blockIndex,
+      };
+    };
+
+    const queueShadowCursor = (chunks: string[]) => {
+      const from = vi.fn().mockReturnValue('<speak>shadow-current</speak>');
+      const next = vi.fn();
+      for (const chunk of chunks) next.mockReturnValueOnce(chunk);
+      next.mockReturnValue(undefined);
+      vi.mocked(TTS).mockImplementationOnce(function () {
+        return { from, next } as unknown as InstanceType<typeof TTS>;
+      });
+      return { from, next };
+    };
+
+    const installBatchClient = (
+      speakBlocks: (...args: unknown[]) => AsyncIterable<TTSMessageEvent>,
+    ) => {
+      const batchSpeak = vi.fn(speakBlocks);
+      Object.assign(controller.ttsClient, {
+        supportsBlockStreaming: vi.fn(() => true),
+        speakBlocks: batchSpeak,
+      });
+      return batchSpeak;
+    };
+
+    const suppressLegacyPreload = () => {
+      const preloadCurrent = vi.spyOn(controller, 'preloadSSML').mockResolvedValue();
+      const preloadFuture = vi.spyOn(controller, 'preloadNextSSML').mockResolvedValue();
+      return { preloadCurrent, preloadFuture };
+    };
+
+    test('keeps the legacy speak and preload path when the client does not opt in', async () => {
+      const live = await installLiveCursor();
+      const speakBlocks = vi.fn(async function* () {
+        yield { code: 'end' } as TTSMessageEvent;
+      });
+      Object.assign(controller.ttsClient, { speakBlocks });
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+      expect(controller.ttsClient.speak).toHaveBeenCalled();
+      expect(speakBlocks).not.toHaveBeenCalled();
+      expect(live.next).not.toHaveBeenCalled();
+    });
+
+    test('streams future blocks lazily and continuously without touching the live cursor', async () => {
+      const live = await installLiveCursor();
+      const shadow = queueShadowCursor([
+        '<speak>future-1</speak>',
+        '<speak>future-2</speak>',
+        '<speak>future-3</speak>',
+        '<speak>not-pulled</speak>',
+      ]);
+      const { preloadCurrent, preloadFuture } = suppressLegacyPreload();
+      let releaseBoundary!: () => void;
+      const boundaryGate = new Promise<void>((resolve) => {
+        releaseBoundary = resolve;
+      });
+      let plannedBlocks: { blockOffset: number; ssml: string }[] | undefined;
+      let shadowPullCounts: number[] | undefined;
+      const planned = new Promise<void>((resolve) => {
+        installBatchClient(async function* (blocksArg: unknown) {
+          plannedBlocks = [];
+          shadowPullCounts = [];
+          const iterator = (
+            blocksArg as AsyncIterable<{
+              blockOffset: number;
+              ssml: string;
+            }>
+          )[Symbol.asyncIterator]();
+          for (let pull = 0; pull < 4; pull++) {
+            const { value, done } = await iterator.next();
+            if (done) break;
+            plannedBlocks.push(value);
+            shadowPullCounts.push(shadow.next.mock.calls.length);
+          }
+          await iterator.return?.();
+          resolve();
+          await boundaryGate;
+          yield {
+            code: 'boundary',
+            logicalBoundary: {
+              blockOffset: 1,
+              mark: { offset: 0, name: '0', text: 'future', language: 'en' },
+            },
+          } as TTSMessageEvent;
+          yield { code: 'end', consumedBlockOffset: 1 } as TTSMessageEvent;
+        });
+      });
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await planned;
+
+      expect(plannedBlocks).toEqual([
+        { blockOffset: 0, ssml: '<speak>current</speak>' },
+        { blockOffset: 1, ssml: '<speak>future-1</speak>' },
+        { blockOffset: 2, ssml: '<speak>future-2</speak>' },
+        { blockOffset: 3, ssml: '<speak>future-3</speak>' },
+      ]);
+      // Current yields without shadow work; each later pull advances exactly
+      // one shadow block. The fourth queued future block remains untouched.
+      expect(shadowPullCounts).toEqual([0, 1, 2, 3]);
+      expect(shadow.from).toHaveBeenCalledWith(live.ranges[0]);
+      expect(shadow.next).toHaveBeenCalledTimes(3);
+      expect(live.next).not.toHaveBeenCalled();
+      expect(preloadCurrent).not.toHaveBeenCalled();
+      expect(preloadFuture).not.toHaveBeenCalled();
+      expect(controller.ttsClient.speak).not.toHaveBeenCalled();
+
+      releaseBoundary();
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+      expect(live.next).toHaveBeenCalledTimes(1);
+    });
+
+    test('rejects a logical boundary for a block the client never pulled', async () => {
+      const live = await installLiveCursor();
+      const shadow = queueShadowCursor(['<speak>future-1</speak>']);
+      suppressLegacyPreload();
+      installBatchClient(async function* (blocksArg: unknown) {
+        const iterator = (blocksArg as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+        await iterator.next();
+        yield {
+          code: 'boundary',
+          logicalBoundary: {
+            blockOffset: 1,
+            mark: { offset: 0, name: '0', text: 'future', language: 'en' },
+          },
+        } as TTSMessageEvent;
+      });
+
+      controller.speak('<speak>current</speak>');
+      await vi.waitFor(() => expect(controller.terminated).toBe(true));
+
+      expect(shadow.next).not.toHaveBeenCalled();
+      expect(live.next).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      {
+        label: 'end with a logical boundary',
+        event: {
+          code: 'end',
+          logicalBoundary: {
+            blockOffset: 1,
+            mark: { offset: 0, name: '0', text: 'future', language: 'en' },
+          },
+        } as TTSMessageEvent,
+      },
+      {
+        label: 'error with a logical boundary',
+        event: {
+          code: 'error',
+          logicalBoundary: {
+            blockOffset: 1,
+            mark: { offset: 0, name: '0', text: 'future', language: 'en' },
+          },
+        } as TTSMessageEvent,
+      },
+      {
+        label: 'boundary without a logical boundary',
+        event: { code: 'boundary' } as TTSMessageEvent,
+      },
+    ])('rejects malformed streamed protocol event: $label', async ({ event }) => {
+      const live = await installLiveCursor();
+      queueShadowCursor(['<speak>future-1</speak>']);
+      suppressLegacyPreload();
+      let eventReadyResolve!: () => void;
+      const eventReady = new Promise<void>((resolve) => {
+        eventReadyResolve = resolve;
+      });
+      installBatchClient(async function* (blocksArg: unknown) {
+        const iterator = (blocksArg as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+        await iterator.next();
+        await iterator.next();
+        eventReadyResolve();
+        yield event;
+      });
+      vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await eventReady;
+      await vi.waitFor(() => expect(controller.terminated).toBe(true), { timeout: 1000 });
+
+      expect(controller.state).toBe('stopped');
+      expect(live.next).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      { label: 'zero events', emitBoundary: false },
+      { label: 'a final non-terminal boundary', emitBoundary: true },
+    ])('treats streamed iterator EOF after $label as a terminal error', async ({
+      emitBoundary,
+    }) => {
+      const live = await installLiveCursor();
+      suppressLegacyPreload();
+      installBatchClient(async function* (blocksArg: unknown) {
+        const iterator = (blocksArg as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+        await iterator.next();
+        if (emitBoundary) {
+          yield {
+            code: 'boundary',
+            logicalBoundary: {
+              blockOffset: 0,
+              mark: { offset: 0, name: '0', text: 'current', language: 'en' },
+            },
+          } as TTSMessageEvent;
+        }
+      });
+
+      controller.speak('<speak>current</speak>');
+      await vi.waitFor(() => expect(controller.terminated).toBe(true), { timeout: 1000 });
+
+      expect(controller.state).toBe('stopped');
+      expect(live.next).not.toHaveBeenCalled();
+    });
+
+    test('rejects stale block events after the live TTS instance changes', async () => {
+      const live = await installLiveCursor();
+      queueShadowCursor(['<speak>future-1</speak>']);
+      suppressLegacyPreload();
+      const replacementNext = vi.fn().mockReturnValue('<speak>replacement-next</speak>');
+      installBatchClient(async function* (blocksArg: unknown) {
+        const iterator = (blocksArg as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+        await iterator.next();
+        await iterator.next();
+        mockView.tts = {
+          ...(mockView.tts as NonNullable<FoliateView['tts']>),
+          next: replacementNext,
+        } as unknown as FoliateView['tts'];
+        yield {
+          code: 'boundary',
+          logicalBoundary: {
+            blockOffset: 1,
+            mark: { offset: 0, name: '0', text: 'future', language: 'en' },
+          },
+        } as TTSMessageEvent;
+      });
+
+      controller.speak('<speak>current</speak>');
+      await vi.waitFor(() => expect(controller.terminated).toBe(true));
+
+      expect(live.next).not.toHaveBeenCalled();
+      expect(replacementNext).not.toHaveBeenCalled();
+    });
+
+    test('dispatches the same local mark name at each logical playback boundary', async () => {
+      const live = await installLiveCursor();
+      queueShadowCursor(['<speak>future-1</speak>']);
+      suppressLegacyPreload();
+      const marks: string[] = [];
+      controller.addEventListener('tts-speak-mark', (event) => {
+        const mark = (event as CustomEvent<{ name?: string }>).detail;
+        if (mark.name) marks.push(mark.name);
+      });
+      installBatchClient(async function* (blocksArg: unknown) {
+        for await (const _ of blocksArg as AsyncIterable<unknown>);
+        yield {
+          code: 'boundary',
+          logicalBoundary: {
+            blockOffset: 0,
+            mark: { offset: 0, name: '0', text: 'current', language: 'en' },
+          },
+        } as TTSMessageEvent;
+        yield {
+          code: 'boundary',
+          logicalBoundary: {
+            blockOffset: 1,
+            mark: { offset: 0, name: '0', text: 'future', language: 'en' },
+          },
+        } as TTSMessageEvent;
+        yield { code: 'end', consumedBlockOffset: 1 } as TTSMessageEvent;
+      });
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+
+      expect(marks).toEqual(['0', '0']);
+      expect(live.next).toHaveBeenCalledTimes(1);
+      // One silent setMark anchors the shadow, then each playback boundary is
+      // dispatched even when the local mark labels repeat across blocks.
+      expect(live.setMark.mock.calls.map(([mark]) => mark)).toEqual(['0', '0', '0']);
+    });
+
+    test('does not paint the sentence anchor before its playback boundary', async () => {
+      await installLiveCursor();
+      queueShadowCursor([]);
+      suppressLegacyPreload();
+      controller.setHighlightGranularity('sentence');
+      const addHighlight = (
+        mockView.renderer.getContents()[0]!.overlayer as unknown as {
+          add: ReturnType<typeof vi.fn>;
+        }
+      ).add;
+      let anchoredResolve!: () => void;
+      const anchored = new Promise<void>((resolve) => {
+        anchoredResolve = resolve;
+      });
+      let releaseBoundary!: () => void;
+      const boundaryGate = new Promise<void>((resolve) => {
+        releaseBoundary = resolve;
+      });
+      installBatchClient(async function* (blocksArg: unknown) {
+        const iterator = (blocksArg as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+        await iterator.next();
+        anchoredResolve();
+        await boundaryGate;
+        yield {
+          code: 'boundary',
+          logicalBoundary: {
+            blockOffset: 0,
+            mark: { offset: 0, name: '0', text: 'current', language: 'en' },
+          },
+        } as TTSMessageEvent;
+        yield { code: 'end', consumedBlockOffset: 0 } as TTSMessageEvent;
+      });
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await anchored;
+
+      expect(addHighlight).not.toHaveBeenCalled();
+
+      releaseBoundary();
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+      expect(addHighlight).toHaveBeenCalledTimes(1);
+    });
+
+    test.each([
+      'abort',
+      'error',
+    ] as const)('%s after speculative consumption does not advance the live cursor', async (outcome) => {
+      const live = await installLiveCursor();
+      queueShadowCursor(['<speak>future-1</speak>', '<speak>future-2</speak>']);
+      suppressLegacyPreload();
+      let plannedResolve!: () => void;
+      const planned = new Promise<void>((resolve) => {
+        plannedResolve = resolve;
+      });
+      installBatchClient(async function* (blocksArg: unknown, signalArg: unknown) {
+        for await (const _ of blocksArg as AsyncIterable<unknown>);
+        plannedResolve();
+        if (outcome === 'abort') {
+          const signal = signalArg as AbortSignal;
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) =>
+              signal.addEventListener('abort', () => resolve(), { once: true }),
+            );
+          }
+        }
+        yield { code: 'error', consumedBlockOffset: 2 } as TTSMessageEvent;
+      });
+
+      controller.speak('<speak>current</speak>');
+      await planned;
+      if (outcome === 'abort') await controller.stop();
+      else await vi.waitFor(() => expect(controller.terminated).toBe(true));
+
+      expect(live.next).not.toHaveBeenCalled();
+    });
+
+    test('user mark navigation remains relative to the last playback-reached block', async () => {
+      const live = await installLiveCursor();
+      queueShadowCursor(['<speak>future-1</speak>']);
+      suppressLegacyPreload();
+      let boundaryResolve!: () => void;
+      const boundaryCommitted = new Promise<void>((resolve) => {
+        boundaryResolve = resolve;
+      });
+      installBatchClient(async function* (blocksArg: unknown, signalArg: unknown) {
+        for await (const _ of blocksArg as AsyncIterable<unknown>);
+        yield {
+          code: 'boundary',
+          logicalBoundary: {
+            blockOffset: 1,
+            mark: { offset: 0, name: '0', text: 'future', language: 'en' },
+          },
+        } as TTSMessageEvent;
+        boundaryResolve();
+        const signal = signalArg as AbortSignal;
+        if (!signal.aborted) {
+          await new Promise<void>((resolve) =>
+            signal.addEventListener('abort', () => resolve(), { once: true }),
+          );
+        }
+        yield { code: 'error' } as TTSMessageEvent;
+      });
+
+      controller.speak('<speak>current</speak>');
+      await boundaryCommitted;
+      await vi.waitFor(() => expect(live.blockIndex()).toBe(1));
+      controller.state = 'paused';
+      await controller.forward(true);
+
+      expect(live.nextMark).toHaveBeenCalledWith(true);
+      expect(live.nextMark).toHaveReturnedWith('<speak>block-1-next-mark</speak>');
+      expect(live.next).toHaveBeenCalledTimes(1);
+    });
+
+    test('preserves a selected current tail and preprocesses future shadow blocks', async () => {
+      const live = await installLiveCursor();
+      const shadow = queueShadowCursor(['<speak>future raw</speak>']);
+      suppressLegacyPreload();
+      controller.preprocessCallback = vi.fn(async (ssml: string) => ssml.replace('raw', 'clean'));
+      const blocks: { blockOffset: number; ssml: string }[] = [];
+      installBatchClient(async function* (blocksArg: unknown) {
+        for await (const block of blocksArg as AsyncIterable<{
+          blockOffset: number;
+          ssml: string;
+        }>) {
+          blocks.push(block);
+        }
+        yield { code: 'end', consumedBlockOffset: 0 } as TTSMessageEvent;
+      });
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>selected raw tail</speak>');
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+
+      expect(blocks).toEqual([
+        { blockOffset: 0, ssml: '<speak>selected clean tail</speak>' },
+        { blockOffset: 1, ssml: '<speak>future clean</speak>' },
+      ]);
+      expect(shadow.from).toHaveBeenCalledWith(live.ranges[0]);
+    });
+
+    test('stops the shadow iterable cleanly at the end of the chapter', async () => {
+      await installLiveCursor(1);
+      const shadow = queueShadowCursor([]);
+      suppressLegacyPreload();
+      const blocks: { blockOffset: number; ssml: string }[] = [];
+      installBatchClient(async function* (blocksArg: unknown) {
+        for await (const block of blocksArg as AsyncIterable<{
+          blockOffset: number;
+          ssml: string;
+        }>) {
+          blocks.push(block);
+        }
+        yield { code: 'end', consumedBlockOffset: 0 } as TTSMessageEvent;
+      });
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>last block</speak>');
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+
+      expect(blocks).toEqual([{ blockOffset: 0, ssml: '<speak>last block</speak>' }]);
+      expect(shadow.next).toHaveBeenCalledTimes(1);
+    });
+
+    test('commits trailing consumed blocks only after a successful end', async () => {
+      const live = await installLiveCursor();
+      queueShadowCursor(['<speak>audible</speak>', '<speak>trailing skip</speak>']);
+      suppressLegacyPreload();
+      installBatchClient(async function* (blocksArg: unknown) {
+        for await (const _ of blocksArg as AsyncIterable<unknown>);
+        yield {
+          code: 'boundary',
+          logicalBoundary: {
+            blockOffset: 1,
+            mark: { offset: 0, name: '0', text: 'audible', language: 'en' },
+          },
+        } as TTSMessageEvent;
+        yield { code: 'end', consumedBlockOffset: 2 } as TTSMessageEvent;
+      });
+      const forward = vi.spyOn(controller, 'forward').mockImplementation(async () => {
+        expect(live.blockIndex()).toBe(2);
+      });
+
+      controller.speak('<speak>current</speak>');
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+
+      expect(live.next).toHaveBeenCalledTimes(2);
+    });
+
+    test('preserves an empty preprocessed block for trailing consumed-offset commit', async () => {
+      const live = await installLiveCursor();
+      queueShadowCursor(['<speak>audible</speak>', '<speak>empty</speak>']);
+      suppressLegacyPreload();
+      controller.preprocessCallback = vi.fn(async (ssml: string) =>
+        ssml.includes('empty') ? '' : ssml,
+      );
+      const blocks: { blockOffset: number; ssml: string }[] = [];
+      installBatchClient(async function* (blocksArg: unknown) {
+        for await (const block of blocksArg as AsyncIterable<{
+          blockOffset: number;
+          ssml: string;
+        }>) {
+          blocks.push(block);
+        }
+        yield {
+          code: 'boundary',
+          logicalBoundary: {
+            blockOffset: 1,
+            mark: { offset: 0, name: '0', text: 'audible', language: 'en' },
+          },
+        } as TTSMessageEvent;
+        yield { code: 'end', consumedBlockOffset: 2 } as TTSMessageEvent;
+      });
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+
+      expect(blocks).toEqual([
+        { blockOffset: 0, ssml: '<speak>current</speak>' },
+        { blockOffset: 1, ssml: '<speak>audible</speak>' },
+        { blockOffset: 2, ssml: '' },
+      ]);
+      expect(live.next).toHaveBeenCalledTimes(2);
     });
   });
 

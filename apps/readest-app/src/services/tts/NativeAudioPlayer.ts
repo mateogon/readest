@@ -15,7 +15,7 @@
 
 import { addPluginListener, invoke, PluginListener } from '@tauri-apps/api/core';
 import type { TTSAudioPlayer } from './TTSAudioPlayer';
-import type { WebAudioPlayerEvent } from './WebAudioPlayer';
+import type { WebAudioPlayerEvent, WebAudioSessionOptions } from './WebAudioPlayer';
 
 interface PlayoutPosition {
   session: number;
@@ -84,7 +84,10 @@ export class NativeAudioPlayer implements TTSAudioPlayer {
     }
   }
 
-  startSession(onEvent: (event: WebAudioPlayerEvent) => void): number {
+  startSession(
+    onEvent: (event: WebAudioPlayerEvent) => void,
+    _options?: WebAudioSessionOptions,
+  ): number {
     this.abortSession();
     const generation = ++this.#generation;
     const session: NativePlayerSession = {

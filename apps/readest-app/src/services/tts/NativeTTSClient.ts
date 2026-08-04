@@ -229,8 +229,10 @@ export class NativeTTSClient implements TTSClient {
   }
 
   async setRate(rate: number) {
-    // Power the rate to match the EdgeTTS behavior
-    this.#rate = parseFloat(Math.pow(rate, 2.5).toFixed(2));
+    // Native engines already interpret 1.0 as their natural rate. Applying
+    // Edge's historical exponential UI curve here turns 1.25 into 1.75 and
+    // 1.5 into 2.76, which can make local engines compress or truncate speech.
+    this.#rate = rate;
     await invoke('plugin:native-tts|set_rate', { payload: { rate: this.#rate } });
   }
 
@@ -309,7 +311,15 @@ export class NativeTTSClient implements TTSClient {
   getCapabilities(): TTSCapabilities {
     // Direct-speak engine: the OS renders the audio, so there is no media
     // clock, no word boundaries, and no gap or live-rate control.
-    return { wordBoundaries: false, mediaClock: false, gapControl: false, liveRateChange: false };
+    return {
+      wordBoundaries: false,
+      mediaClock: false,
+      gapControl: false,
+      liveRateChange: false,
+      cacheable: false,
+      downloadable: false,
+      measurableDurations: false,
+    };
   }
 
   getGranularities(): TTSGranularity[] {

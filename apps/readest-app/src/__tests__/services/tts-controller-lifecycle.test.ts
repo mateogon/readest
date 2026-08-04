@@ -41,6 +41,7 @@ vi.mock('@/services/tts/WebSpeechClient', () => ({
   }),
 }));
 vi.mock('@/services/tts/EdgeTTSClient', () => ({
+  DEFAULT_SENTENCE_GAP_SEC: 0.15,
   EdgeTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
     Object.assign(this, makeMockClient('edge-tts'));
   }),
@@ -206,5 +207,51 @@ describe('TTSController lifecycle', () => {
     await controller.speak('<speak>again</speak>');
     await flushMicrotasks();
     expect(controller.terminated).toBe(false);
+  });
+
+  test('a stale speak cleanup cannot abort the replacement session', async () => {
+    let resolveStaleSsml!: (value: string) => void;
+    const staleSsml = new Promise<string>((resolve) => {
+      resolveStaleSsml = resolve;
+    });
+    let releaseReplacement!: () => void;
+    const replacementHeld = new Promise<void>((resolve) => {
+      releaseReplacement = resolve;
+    });
+    const signals: AbortSignal[] = [];
+    (controller.ttsClient.speak as ReturnType<typeof vi.fn>).mockImplementation(
+      (_ssml: string, signal: AbortSignal) => {
+        signals.push(signal);
+        return (async function* (): AsyncIterable<TTSMessageEvent> {
+          if (!signal.aborted) await replacementHeld;
+          yield { code: 'boundary', message: 'chunk', mark: '0' };
+        })();
+      },
+    );
+
+    // stop() resolves the public stale speak promise from its abort listener,
+    // while its async executor is still waiting for preprocessing to finish.
+    // That is the exact overlap produced by stop -> setVoice -> start.
+    await controller.speak(staleSsml, true);
+    await vi.waitFor(() => expect(controller.state).toBe('playing'));
+    await controller.stop();
+
+    await controller.speak('<speak>replacement</speak>', true);
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+    const replacementSignal = signals[0]!;
+
+    // Let the stale executor reach its finally block only after the replacement
+    // owns the controller field. It must neither call the active client nor
+    // clean up the replacement AbortController.
+    resolveStaleSsml('<speak>stale</speak>');
+    await flushMicrotasks();
+    await flushMicrotasks();
+    const clientCallsAfterStaleCleanup = signals.length;
+    const abortedByStaleCleanup = replacementSignal.aborted;
+
+    releaseReplacement();
+    await controller.stop();
+    expect(clientCallsAfterStaleCleanup).toBe(1);
+    expect(abortedByStaleCleanup).toBe(false);
   });
 });

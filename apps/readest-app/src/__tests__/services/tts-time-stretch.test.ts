@@ -38,20 +38,19 @@ const zeroCrossingsPerSec = (samples: Float32Array) => {
 };
 
 describe('timeStretch', () => {
-  test('tempo 1.5 shortens output to ~1/1.5 of input length', () => {
-    const input = makeSpeechLike(3);
-    const output = timeStretch(input, SR, 1.5);
+  test.each([
+    0.5, 0.75, 1, 1.25, 1.5, 2, 3,
+  ])('tempo %s preserves finite bounded samples and changes duration without new peaks', (tempo) => {
+    const input = makeSpeechLike(4);
+    const output = timeStretch(input, SR, tempo);
+    const inputPeak = input.reduce((peak, sample) => Math.max(peak, Math.abs(sample)), 0);
+    const outputPeak = output.reduce((peak, sample) => Math.max(peak, Math.abs(sample)), 0);
     const ratio = output.length / input.length;
-    expect(ratio).toBeGreaterThan((1 / 1.5) * 0.95);
-    expect(ratio).toBeLessThan((1 / 1.5) * 1.05);
-  });
 
-  test('tempo 0.75 lengthens output to ~1/0.75 of input length', () => {
-    const input = makeSpeechLike(3);
-    const output = timeStretch(input, SR, 0.75);
-    const ratio = output.length / input.length;
-    expect(ratio).toBeGreaterThan((1 / 0.75) * 0.95);
-    expect(ratio).toBeLessThan((1 / 0.75) * 1.05);
+    expect(output.every((sample) => Number.isFinite(sample))).toBe(true);
+    expect(outputPeak).toBeLessThanOrEqual(inputPeak + 1e-6);
+    expect(ratio).toBeGreaterThan((1 / tempo) * 0.95);
+    expect(ratio).toBeLessThan((1 / tempo) * 1.05);
   });
 
   test('preserves pitch: zero-crossing rate unchanged at tempo 1.5', () => {

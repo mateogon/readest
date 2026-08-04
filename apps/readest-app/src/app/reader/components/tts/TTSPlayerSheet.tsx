@@ -188,7 +188,7 @@ const TTSPlayerSheet = ({
   /* Scale a given `baseGap` based on a given `rate`. */
   const scaleGap = (baseGap: number, rate: number) => {
     const k = 0.6;
-    return Math.round(baseGap / Math.pow(rate, k));
+    return Math.round((baseGap / Math.pow(rate, k)) * 1000) / 1000;
   };
 
   const handleSelectRate = (value: number) => {

@@ -31,6 +31,9 @@ const makeMockClient = (name: string): TTSClient => ({
     mediaClock: true,
     gapControl: true,
     liveRateChange: false,
+    cacheable: true,
+    downloadable: false,
+    measurableDurations: true,
   }),
   getVoiceId: vi.fn().mockReturnValue('timeline-ctrl-voice'),
   getSpeakingLang: vi.fn().mockReturnValue('en'),
@@ -44,6 +47,7 @@ vi.mock('@/services/tts/WebSpeechClient', () => ({
 }));
 
 vi.mock('@/services/tts/EdgeTTSClient', () => ({
+  DEFAULT_SENTENCE_GAP_SEC: 0.15,
   EdgeTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
     Object.assign(this, makeMockClient('edge-tts'));
   }),
@@ -182,9 +186,24 @@ describe('TTSController section timeline', () => {
     expect(controller.getPlaybackInfo()).toBeNull();
   });
 
-  test('getPlaybackInfo is null for non-edge clients', async () => {
+  test('a capable non-Edge client can build and expose playback info', async () => {
     await controller.setVoice('', 'en'); // empty voice id: falls through to web client
     controller.ttsClient = controller.ttsWebClient;
+    expect(await controller.ensureTimeline()).not.toBeNull();
+    expect(controller.getPlaybackInfo()).not.toBeNull();
+  });
+
+  test('getPlaybackInfo is null without a measurable media clock', async () => {
+    controller.ttsClient = controller.ttsWebClient;
+    vi.mocked(controller.ttsWebClient.getCapabilities).mockReturnValue({
+      wordBoundaries: false,
+      mediaClock: false,
+      gapControl: false,
+      liveRateChange: false,
+      cacheable: false,
+      downloadable: false,
+      measurableDurations: false,
+    });
     expect(await controller.ensureTimeline()).toBeNull();
     expect(controller.getPlaybackInfo()).toBeNull();
   });

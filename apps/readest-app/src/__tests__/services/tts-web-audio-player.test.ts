@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import { WebAudioPlayer, type WebAudioPlayerEvent } from '@/services/tts/WebAudioPlayer';
 import { FakeAudioContext, makeBuffer } from './tts-fake-audio';
@@ -13,6 +13,7 @@ const setVisibility = (value: 'visible' | 'hidden') => {
 };
 
 afterEach(() => {
+  vi.restoreAllMocks();
   setVisibility('visible');
 });
 
@@ -25,6 +26,7 @@ const setup = () => {
 
 describe('WebAudioPlayer scheduling', () => {
   test('chunks are scheduled contiguously with the requested gap', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
@@ -32,6 +34,367 @@ describe('WebAudioPlayer scheduling', () => {
     player.scheduleChunk(gen, makeBuffer(3), { trimStartSec: 0, mediaScale: 1, gapSec: 0.5 });
     expect(ctx.sources[0]!.startedAt).toBeCloseTo(SAFETY, 5);
     expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 2 + 0.5, 5);
+    await ctx.advanceTo(SAFETY + 2 + 0.5 + 3);
+    expect(player.getDiagnostics()).toMatchObject({
+      scheduledChunks: 2,
+      sentenceGaps: {
+        transitions: 1,
+        gapsOver50Ms: 0,
+        unplannedGapMsP95: 0,
+      },
+    });
+    const diagnosticCalls = info.mock.calls.filter(
+      ([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '),
+    );
+    expect(diagnosticCalls).toHaveLength(2);
+    expect(diagnosticCalls.every((call) => call.length === 1)).toBe(true);
+    expect(
+      diagnosticCalls.map(([message]) =>
+        JSON.parse((message as string).slice('[TTS][WebAudio] '.length)),
+      ),
+    ).toEqual([
+      expect.objectContaining({ event: 'scheduled', transitionKind: null }),
+      expect.objectContaining({
+        event: 'scheduled',
+        transitionKind: 'sentence',
+        configuredGapMs: 500,
+        unplannedGapMs: 0,
+      }),
+    ]);
+  });
+
+  test('classifies an explicit paragraph transition using the previous chunk gap', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.4,
+    });
+    ctx.currentTime = 3;
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.9,
+      transitionFromPrevious: 'paragraph',
+    });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(3 + SAFETY, 5);
+    await ctx.advanceTo(3 + SAFETY + 1);
+    expect(player.getDiagnostics()).toMatchObject({
+      sentenceGaps: { transitions: 0 },
+      paragraphGaps: { transitions: 1, unplannedGapMsP95: 600 },
+    });
+    const paragraphSchedule = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)))
+      .find((payload) => payload.transitionKind === 'paragraph');
+    expect(paragraphSchedule).toMatchObject({
+      configuredGapMs: 400,
+      unplannedGapMs: 600,
+    });
+  });
+
+  test('classifies an explicit sentence transition using the previous chunk gap', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.15,
+    });
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.8,
+      transitionFromPrevious: 'sentence',
+    });
+
+    await ctx.advanceTo(SAFETY + 1 + 0.15 + 1);
+    expect(player.getDiagnostics()).toMatchObject({
+      sentenceGaps: { transitions: 1, unplannedGapMsP95: 0 },
+      paragraphGaps: { transitions: 0 },
+    });
+    const sentenceSchedule = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)))
+      .find((payload) => payload.transitionKind === 'sentence');
+    expect(sentenceSchedule).toMatchObject({
+      configuredGapMs: 150,
+      unplannedGapMs: 0,
+    });
+  });
+
+  test('explicit null suppresses transition diagnostics without changing contiguous scheduling', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.25,
+    });
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.8,
+      transitionFromPrevious: null,
+    });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 1 + 0.25, 5);
+    await ctx.advanceTo(SAFETY + 1 + 0.25 + 1);
+    expect(player.getDiagnostics()).toMatchObject({
+      sentenceGaps: { transitions: 0 },
+      paragraphGaps: { transitions: 0 },
+      chapterGaps: { transitions: 0 },
+    });
+    const schedules = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)));
+    expect(schedules[1]).toMatchObject({
+      transitionKind: null,
+      configuredGapMs: null,
+      unplannedGapMs: null,
+    });
+  });
+
+  test('undefined transition keeps sentence inference and uses the previous chunk gap', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.35,
+    });
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.8,
+    });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 1 + 0.35, 5);
+    await ctx.advanceTo(SAFETY + 1 + 0.35 + 1);
+    expect(player.getDiagnostics()).toMatchObject({
+      sentenceGaps: { transitions: 1, unplannedGapMsP95: 0 },
+    });
+    const sentenceSchedule = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)))
+      .find((payload) => payload.transitionKind === 'sentence');
+    expect(sentenceSchedule).toMatchObject({
+      configuredGapMs: 350,
+      unplannedGapMs: 0,
+    });
+  });
+
+  test('separates configured silence from a late unplanned transition', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.2 });
+    ctx.currentTime = 2;
+    player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.2 });
+    await ctx.advanceTo(3 + SAFETY);
+
+    expect(player.getDiagnostics()).toMatchObject({
+      sentenceGaps: {
+        transitions: 1,
+        gapsOver50Ms: 1,
+        gapsOver500Ms: 1,
+        unplannedGapMsP50: 800,
+        unplannedGapMsP95: 800,
+        unplannedGapMsP99: 800,
+        unplannedGapMsMax: 800,
+      },
+    });
+  });
+
+  test('measures paragraph startup after subtracting the configured leading gap', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const first = player.startSession(onEvent);
+    player.scheduleChunk(first, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.1 });
+    player.endSession(first);
+    await ctx.advanceTo(SAFETY + 1);
+
+    ctx.currentTime = 2;
+    const second = player.startSession(onEvent, {
+      transitionFromPrevious: 'paragraph',
+      leadingGapSec: 0.2,
+    });
+    player.scheduleChunk(second, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.1 });
+    await ctx.advanceTo(3 + SAFETY);
+
+    expect(player.getDiagnostics()).toMatchObject({
+      sessionsStarted: 2,
+      sessionsCompleted: 1,
+      paragraphGaps: {
+        transitions: 1,
+        gapsOver500Ms: 1,
+        unplannedGapMsP95: 800,
+      },
+    });
+  });
+
+  test('keeps chapter startup separate from ordinary paragraph transitions', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const first = player.startSession(onEvent);
+    player.scheduleChunk(first, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.endSession(first);
+    await ctx.advanceTo(SAFETY + 1);
+
+    ctx.currentTime = 2;
+    const chapter = player.startSession(onEvent, {
+      transitionFromPrevious: 'chapter',
+      leadingGapSec: 0.2,
+    });
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+    });
+    await ctx.advanceTo(3 + SAFETY);
+
+    expect(player.getDiagnostics()).toMatchObject({
+      paragraphGaps: { transitions: 0 },
+      chapterGaps: {
+        transitions: 1,
+        gapsOver500Ms: 1,
+        unplannedGapMsP95: 800,
+      },
+    });
+    const chapterSchedule = info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith('[TTS][WebAudio] '))
+      .map(([message]) => JSON.parse((message as string).slice('[TTS][WebAudio] '.length)))
+      .find((payload) => payload.transitionKind === 'chapter');
+    expect(chapterSchedule).toMatchObject({ configuredGapMs: 200, unplannedGapMs: 800 });
+  });
+
+  test('keeps chapter refill gaps out of steady-state paragraph diagnostics', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const first = player.startSession(onEvent);
+    player.scheduleChunk(first, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+    });
+    player.endSession(first);
+    await ctx.advanceTo(SAFETY + 1);
+
+    ctx.currentTime = 2;
+    const chapter = player.startSession(onEvent, {
+      transitionFromPrevious: 'chapter',
+      leadingGapSec: 0.2,
+    });
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+    });
+    ctx.currentTime = 4;
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+      transitionFromPrevious: 'paragraph',
+    });
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+      transitionFromPrevious: 'sentence',
+    });
+    player.scheduleChunk(chapter, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+      transitionFromPrevious: 'paragraph',
+    });
+    await ctx.advanceTo(8);
+
+    expect(player.getDiagnostics()).toMatchObject({
+      chapterGaps: { transitions: 1, unplannedGapMsP95: 800 },
+      coldStartGaps: { transitions: 2, gapsOver500Ms: 1, unplannedGapMsP95: 800 },
+      sentenceGaps: { transitions: 0 },
+      paragraphGaps: { transitions: 1, gapsOver500Ms: 0, unplannedGapMsP95: 0 },
+    });
+  });
+
+  test('does not classify a manual restart after natural completion as a paragraph gap', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const first = player.startSession(onEvent);
+    player.scheduleChunk(first, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.endSession(first);
+    await ctx.advanceTo(SAFETY + 1);
+
+    ctx.currentTime = 30;
+    const restarted = player.startSession(onEvent);
+    player.scheduleChunk(restarted, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+    });
+    await ctx.advanceTo(31 + SAFETY);
+
+    expect(player.getDiagnostics()).toMatchObject({
+      paragraphGaps: { transitions: 0 },
+      chapterGaps: { transitions: 0 },
+    });
+  });
+
+  test('reports only audible buffer ahead and clears it after abort', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 5 });
+
+    expect(player.getDiagnostics()).toMatchObject({
+      currentBufferAheadMs: 2030,
+      maxBufferAheadMs: 2030,
+    });
+    ctx.currentTime = 1;
+    expect(player.getDiagnostics().currentBufferAheadMs).toBe(1030);
+    player.abortSession();
+    expect(player.getDiagnostics().currentBufferAheadMs).toBe(0);
+  });
+
+  test('counts natural completion separately from an explicit abort', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const completed = player.startSession(onEvent);
+    player.scheduleChunk(completed, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+    });
+    player.endSession(completed);
+    await ctx.advanceTo(SAFETY + 1);
+    player.abortSession();
+
+    const aborted = player.startSession(onEvent);
+    player.scheduleChunk(aborted, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+    });
+    player.abortSession();
+
+    expect(player.getDiagnostics()).toMatchObject({
+      sessionsStarted: 2,
+      sessionsCompleted: 1,
+      sessionsAborted: 1,
+    });
   });
 
   test('chunk-start fires at schedule for index 0 and on prior onended after', async () => {
@@ -47,6 +410,122 @@ describe('WebAudioPlayer scheduling', () => {
       { type: 'chunk-start', chunkIndex: 0 },
       { type: 'chunk-start', chunkIndex: 1 },
     ]);
+  });
+
+  test('emits internal logical boundaries in order from one continuous chunk', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(3), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+      logicalBoundaryOffsetsSec: [1, 2],
+    });
+
+    expect(player.getDiagnostics()).toMatchObject({ scheduledChunks: 1, retainedChunks: 1 });
+    expect(ctx.sources).toHaveLength(3);
+    expect(events).toEqual([{ type: 'chunk-start', chunkIndex: 0 }]);
+
+    // Even if browser task delivery observes the later marker first, public
+    // logical boundaries stay document ordered.
+    ctx.sources[2]!.onended?.();
+    expect(events).toHaveLength(1);
+    ctx.sources[1]!.onended?.();
+    expect(events).toEqual([
+      { type: 'chunk-start', chunkIndex: 0 },
+      { type: 'logical-boundary', chunkIndex: 0, logicalIndex: 1 },
+      { type: 'logical-boundary', chunkIndex: 0, logicalIndex: 2 },
+    ]);
+  });
+
+  test('flushes delayed marker callbacks before next/session end without duplicates', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(3), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+      logicalBoundaryOffsetsSec: [1, 2],
+    });
+    player.endSession(gen);
+    const delayedCallbacks = ctx.sources.slice(1).map((source) => source.onended!);
+
+    // Simulate Chromium grouping background callbacks and delivering the main
+    // source's onended before the queued marker tasks.
+    ctx.sources[0]!.onended?.();
+    expect(events).toEqual([
+      { type: 'chunk-start', chunkIndex: 0 },
+      { type: 'logical-boundary', chunkIndex: 0, logicalIndex: 1 },
+      { type: 'logical-boundary', chunkIndex: 0, logicalIndex: 2 },
+      { type: 'session-end' },
+    ]);
+
+    for (const callback of delayedCallbacks) callback();
+    expect(events).toHaveLength(4);
+  });
+
+  test('validates logical offsets before creating or scheduling any source', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+
+    expect(() =>
+      player.scheduleChunk(gen, makeBuffer(2), {
+        trimStartSec: 0,
+        mediaScale: 1,
+        gapSec: 0,
+        logicalBoundaryOffsetsSec: [1.5, 1],
+      }),
+    ).toThrow('Invalid logical boundary offset');
+    expect(ctx.sources).toHaveLength(0);
+    expect(events).toHaveLength(0);
+    expect(player.getDiagnostics().scheduledChunks).toBe(0);
+  });
+
+  test('a chunk admitted after an underrun announces its own start', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+    });
+    await ctx.advanceTo(SAFETY + 1);
+
+    player.scheduleChunk(gen, makeBuffer(1), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.2,
+    });
+
+    expect(events).toEqual([
+      { type: 'chunk-start', chunkIndex: 0 },
+      { type: 'chunk-start', chunkIndex: 1 },
+    ]);
+  });
+
+  test('releases completed chunk sources while retaining absolute event indexes', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+
+    for (let index = 0; index < 100; index++) {
+      expect(await player.waitUntilReady(gen)).toBe(true);
+      player.scheduleChunk(gen, makeBuffer(0.05), {
+        trimStartSec: 0,
+        mediaScale: 1,
+        gapSec: 0,
+      });
+      await ctx.advanceTo(ctx.sources.at(-1)!.endTime);
+    }
+
+    expect(events.filter((event) => event.type === 'chunk-start')).toEqual(
+      Array.from({ length: 100 }, (_, chunkIndex) => ({ type: 'chunk-start', chunkIndex })),
+    );
+    expect(player.getDiagnostics()).toMatchObject({ scheduledChunks: 100, retainedChunks: 1 });
   });
 
   test('stale-generation scheduleChunk is a no-op', async () => {
@@ -175,6 +654,26 @@ describe('WebAudioPlayer abort', () => {
     const countBefore = events.length;
     await ctx.advanceTo(100);
     expect(events).toHaveLength(countBefore);
+  });
+
+  test('abort cancels silent logical markers and rejects their stale callbacks', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(3), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0,
+      logicalBoundaryOffsetsSec: [1, 2],
+    });
+    const staleCallbacks = ctx.sources.slice(1).map((source) => source.onended!);
+    const countBeforeAbort = events.length;
+
+    player.abortSession();
+    for (const callback of staleCallbacks) callback();
+
+    expect(ctx.sources.every((source) => source.stopped)).toBe(true);
+    expect(events).toHaveLength(countBeforeAbort);
   });
 
   test('double abortSession is idempotent', async () => {
