@@ -282,6 +282,17 @@ impl<R: Runtime> NativeBridge<R> {
 }
 
 impl<R: Runtime> NativeBridge<R> {
+    // Android only. Fire-and-forget: the picked URIs are delivered via the
+    // `file-picker-result` plugin event so they survive activity/process
+    // recreation behind the system picker (#1217).
+    pub fn show_file_picker(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin("show_file_picker", ())
+            .map_err(Into::into)
+    }
+}
+
+impl<R: Runtime> NativeBridge<R> {
     pub fn get_storefront_region_code(&self) -> crate::Result<GetStorefrontRegionCodeResponse> {
         self.0
             .run_mobile_plugin("get_storefront_region_code", ())
@@ -426,5 +437,22 @@ impl<R: Runtime> NativeBridge<R> {
         base64::engine::general_purpose::STANDARD
             .decode(response.data)
             .map_err(|e| crate::Error::NativeBridgeError(format!("invalid base64 PNG: {e}")))
+    }
+}
+
+impl<R: Runtime> NativeBridge<R> {
+    pub fn icloud_container_status(&self) -> crate::Result<ICloudContainerStatusResponse> {
+        self.0
+            .run_mobile_plugin("icloud_container_status", ())
+            .map_err(Into::into)
+    }
+
+    pub fn icloud_ensure_downloaded(
+        &self,
+        payload: ICloudEnsureDownloadedRequest,
+    ) -> crate::Result<ICloudEnsureDownloadedResponse> {
+        self.0
+            .run_mobile_plugin("icloud_ensure_downloaded", payload)
+            .map_err(Into::into)
     }
 }

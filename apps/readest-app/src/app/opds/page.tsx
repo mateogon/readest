@@ -32,6 +32,7 @@ import {
   isSearchLink,
   looksLikeXMLContent,
   MIME,
+  normalizeOpenSearchTemplates,
   parseMediaType,
   parseOPDSXML,
   resolveURL,
@@ -55,7 +56,7 @@ import { FeedView } from './components/FeedView';
 import { PublicationView } from './components/PublicationView';
 import { SearchView } from './components/SearchView';
 import { Navigation } from './components/Navigation';
-import { normalizeOPDSCustomHeaders } from './utils/customHeaders';
+import { normalizeCustomHeaders } from '@/utils/customHeaders';
 import { closeOPDSBrowser, stashOPDSReturnTarget } from './utils/opdsClose';
 import { findExistingBookForPublication } from './utils/findExistingBook';
 import Dialog from '@/components/Dialog';
@@ -289,7 +290,7 @@ export default function BrowserPage() {
               addToHistory(url, newState, 'publication', null);
             }
           } else if (localName === 'OpenSearchDescription') {
-            const search = getOpenSearch(doc) as OPDSSearch;
+            const search = getOpenSearch(normalizeOpenSearchTemplates(doc)) as OPDSSearch;
             const newState = {
               search,
               baseURL: responseURL,
@@ -389,7 +390,7 @@ export default function BrowserPage() {
         usernameRef.current = null;
         passwordRef.current = null;
       }
-      customHeadersRef.current = normalizeOPDSCustomHeaders(catalog?.customHeaders);
+      customHeadersRef.current = normalizeCustomHeaders(catalog?.customHeaders);
       if (libraryLoaded) {
         lastLoadedKeyRef.current = loadKey;
         loadOPDS(url);

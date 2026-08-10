@@ -168,7 +168,7 @@ describe('planTTSCompositeBatches', () => {
 
     expect(batches).toHaveLength(1);
     expect(batches[0]?.request.text).toBe(
-      'Hola, mundo. —Sí.\n\nNuevo párrafo.\n\nCambio de bloque.',
+      'Hola,... mundo.... —Sí.\n\nNuevo párrafo.\n\nCambio de bloque.',
     );
     assertExactSpans(batches[0]!);
   });

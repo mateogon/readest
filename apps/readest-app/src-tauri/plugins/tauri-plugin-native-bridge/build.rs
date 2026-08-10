@@ -28,6 +28,7 @@ const COMMANDS: &[&str] = &[
     "get_lookup_dictionary",
     "clear_lookup_dictionary",
     "select_directory",
+    "show_file_picker",
     "get_storefront_region_code",
     "register_listener",
     "remove_listener",
@@ -45,6 +46,8 @@ const COMMANDS: &[&str] = &[
     "capture_webview_region",
     "set_selection_suppressed",
     "read_share_clip_html",
+    "icloud_container_status",
+    "icloud_ensure_downloaded",
 ];
 
 fn main() {

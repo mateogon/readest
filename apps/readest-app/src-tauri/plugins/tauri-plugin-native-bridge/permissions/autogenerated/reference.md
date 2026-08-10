@@ -33,6 +33,7 @@ Default permissions for the plugin
 - `allow-get-lookup-dictionary`
 - `allow-clear-lookup-dictionary`
 - `allow-select-directory`
+- `allow-show-file-picker`
 - `allow-get-storefront-region-code`
 - `allow-request-manage-storage-permission`
 - `allow-register-listener`
@@ -53,6 +54,8 @@ Default permissions for the plugin
 - `allow-capture-webview-region`
 - `allow-set-selection-suppressed`
 - `allow-read-share-clip-html`
+- `allow-icloud-container-status`
+- `allow-icloud-ensure-downloaded`
 
 ## Permission Table
 
@@ -768,6 +771,58 @@ Denies the iap_restore_purchases command without any pre-configured scope.
 <tr>
 <td>
 
+`native-bridge:allow-icloud-container-status`
+
+</td>
+<td>
+
+Enables the icloud_container_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-icloud-container-status`
+
+</td>
+<td>
+
+Denies the icloud_container_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:allow-icloud-ensure-downloaded`
+
+</td>
+<td>
+
+Enables the icloud_ensure_downloaded command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-icloud-ensure-downloaded`
+
+</td>
+<td>
+
+Denies the icloud_ensure_downloaded command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `native-bridge:allow-install-package`
 
 </td>
@@ -1281,6 +1336,32 @@ Enables the set_system_ui_visibility command without any pre-configured scope.
 <td>
 
 Denies the set_system_ui_visibility command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:allow-show-file-picker`
+
+</td>
+<td>
+
+Enables the show_file_picker command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-show-file-picker`
+
+</td>
+<td>
+
+Denies the show_file_picker command without any pre-configured scope.
 
 </td>
 </tr>

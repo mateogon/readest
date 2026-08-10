@@ -1065,23 +1065,35 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   }, []);
 
   // Rate/voice/timeout/bar controls
-  // rate range: 0.5 - 3, 1.0 is normal speed
+  // rate range: 0.5 - 3, 1.0 is normal speed.
+  // Short throttle: live AVPlayer rate changes are cheap; the old 3s window
+  // dropped trailing slider commits so the UI showed a new speed while audio
+  // kept the previous one.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const handleSetRate = useCallback(
     throttle(async (rate: number) => {
       const ttsController = ttsControllerRef.current;
-      if (ttsController) {
-        if (ttsController.state === 'playing') {
-          // Rate is a playout concern, not part of the synthesized-audio key.
-          // Preserve prepared audio while restarting the player at the new rate.
-          await ttsController.stop(true);
-          await ttsController.setRate(rate);
-          await ttsController.start();
-        } else {
-          await ttsController.setRate(rate);
-        }
+      if (!ttsController) return;
+      // Native MO / Edge AVPlayer can change rate without tearing down the
+      // session. stop→start on continuous narration was racing the rate
+      // invoke and often left playback at the old speed.
+      if (
+        ttsController.state === 'playing' &&
+        ttsController.ttsClient.getCapabilities().liveRateChange
+      ) {
+        await ttsController.setRate(rate);
+        return;
       }
-    }, 3000),
+      if (ttsController.state === 'playing') {
+        // Rate is a playout concern, not part of the synthesized-audio key.
+        // Preserve prepared audio while restarting clients without live rate changes.
+        await ttsController.stop(true);
+        await ttsController.setRate(rate);
+        await ttsController.start();
+      } else {
+        await ttsController.setRate(rate);
+      }
+    }, 200),
     [],
   );
 

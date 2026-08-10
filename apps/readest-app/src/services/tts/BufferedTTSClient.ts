@@ -55,6 +55,14 @@ import {
 // the next utterance's ~0.18s of leading silence.
 export const DEFAULT_SENTENCE_GAP_SEC = 0.15;
 const TICKS_PER_SECOND = 10_000_000;
+// Android file synthesis is atomic and single-concurrency. At the observed
+// BOOX playback rate, one prepared chunk is not enough to absorb request-time
+// variance. Build a real reservoir before the first audible source and after
+// an underrun; this changes latency, never voice quality or generation steps.
+const ANDROID_STARTUP_BUFFER_SEC = 20;
+const ANDROID_REFILL_BUFFER_SEC = 12;
+const ANDROID_MAX_PENDING_VISIBLE = 5;
+const ANDROID_MAX_PENDING_HIDDEN = 8;
 
 // How many consecutive unreachable sentences (offline with nothing cached, or
 // a persistent service failure) to skip before stopping. A cached chapter
@@ -365,6 +373,14 @@ export class BufferedTTSClient implements TTSClient {
       {
         transitionFromPrevious,
         leadingGapSec: this.#paragraphGapSec / this.#rate,
+        ...(streamProgress
+          ? {
+              startupBufferSec: ANDROID_STARTUP_BUFFER_SEC,
+              refillBufferSec: ANDROID_REFILL_BUFFER_SEC,
+              maxPendingVisible: ANDROID_MAX_PENDING_VISIBLE,
+              maxPendingHidden: ANDROID_MAX_PENDING_HIDDEN,
+            }
+          : {}),
       },
     );
     this.#activeGeneration = generation;

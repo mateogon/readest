@@ -288,6 +288,14 @@ export async function selectDirectory(): Promise<SelectDirectoryResponse> {
   return result;
 }
 
+// Android only. Opens the system document picker fire-and-forget; the picked
+// URIs come back as a `file-picker-result` plugin event (see
+// useAndroidPickedBooks) so they survive the activity/process being torn down
+// while the picker is in the foreground (#1217).
+export async function showFilePicker(): Promise<void> {
+  await invoke('plugin:native-bridge|show_file_picker');
+}
+
 export async function getStorefrontRegionCode(): Promise<GetStorefrontRegionCodeResponse> {
   const result = await invoke<GetStorefrontRegionCodeResponse>(
     'plugin:native-bridge|get_storefront_region_code',
@@ -467,4 +475,30 @@ export async function installNightlyUpdate(
   const channel = new Channel<NightlyProgress>();
   if (onProgress) channel.onmessage = onProgress;
   await invoke<void>('install_nightly_update', { endpoint, channel });
+}
+
+export interface ICloudContainerStatusResponse {
+  available: boolean;
+  documentsPath?: string;
+}
+
+export interface ICloudEnsureDownloadedRequest {
+  path: string;
+  timeoutMs?: number;
+}
+
+export interface ICloudEnsureDownloadedResponse {
+  status: 'ready' | 'notFound' | 'timeout';
+}
+
+export async function getICloudContainerStatus(): Promise<ICloudContainerStatusResponse> {
+  return invoke<ICloudContainerStatusResponse>('plugin:native-bridge|icloud_container_status');
+}
+
+export async function icloudEnsureDownloaded(
+  request: ICloudEnsureDownloadedRequest,
+): Promise<ICloudEnsureDownloadedResponse> {
+  return invoke<ICloudEnsureDownloadedResponse>('plugin:native-bridge|icloud_ensure_downloaded', {
+    payload: request,
+  });
 }

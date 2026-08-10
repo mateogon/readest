@@ -163,6 +163,9 @@ vi.mock('@/services/tts', () => ({
       isSoundingSentenceOnScreen: vi.fn().mockReturnValue(false),
       getCurrentHighlightCfi: vi.fn().mockReturnValue(null),
       reapplyCurrentHighlight: vi.fn(),
+      ttsClient: {
+        getCapabilities: vi.fn().mockReturnValue({ liveRateChange: false }),
+      },
       terminated: false,
       isViewAttached: true,
       narrationActive: narrationState.active,
@@ -1017,6 +1020,9 @@ describe('useTTSControl gap control (handleSetSentenceGap / handleSupportsGapCon
       setRate: ReturnType<typeof vi.fn>;
       stop: ReturnType<typeof vi.fn>;
       start: ReturnType<typeof vi.fn>;
+      ttsClient: {
+        getCapabilities: ReturnType<typeof vi.fn>;
+      };
       state: string;
     };
   };
@@ -1045,5 +1051,19 @@ describe('useTTSControl gap control (handleSetSentenceGap / handleSupportsGapCon
     expect(controller.stop).toHaveBeenCalledWith(true);
     expect(controller.setRate).toHaveBeenCalledWith(1.5);
     expect(controller.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies a live rate change without restarting a capable client', async () => {
+    const controller = await startSession();
+    controller.state = 'playing';
+    controller.ttsClient.getCapabilities.mockReturnValue({ liveRateChange: true });
+
+    await act(async () => {
+      await hookResult!.handleSetRate(1.5);
+    });
+
+    expect(controller.setRate).toHaveBeenCalledWith(1.5);
+    expect(controller.stop).not.toHaveBeenCalled();
+    expect(controller.start).not.toHaveBeenCalled();
   });
 });

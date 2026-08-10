@@ -568,6 +568,16 @@ describe('WebAudioPlayer backpressure', () => {
     expect(await player.waitUntilReady(gen)).toBe(true);
   });
 
+  test('a session can deepen its visible pending budget for a local reservoir', async () => {
+    const { player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent, { maxPendingVisible: 5 });
+    for (let i = 0; i < 4; i++) {
+      player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    }
+    expect(await player.waitUntilReady(gen)).toBe(true);
+  });
+
   test('seconds cap blocks scheduling far ahead even under the chunk budget', async () => {
     setVisibility('hidden');
     const { ctx, player, onEvent } = setup();
@@ -592,6 +602,76 @@ describe('WebAudioPlayer backpressure', () => {
     const gen = player.startSession(onEvent);
     player.startSession(() => {});
     expect(await player.waitUntilReady(gen)).toBe(false);
+  });
+});
+
+describe('WebAudioPlayer reservoirs', () => {
+  test('holds startup audio until the requested audible horizon is prepared', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent, { startupBufferSec: 5 });
+
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    expect(ctx.sources).toHaveLength(0);
+    expect(events).toHaveLength(0);
+    expect(player.getDiagnostics().currentBufferAheadMs).toBe(2000);
+
+    player.scheduleChunk(gen, makeBuffer(3), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    expect(ctx.sources).toHaveLength(2);
+    expect(ctx.sources[0]!.startedAt).toBeCloseTo(SAFETY, 5);
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 2, 5);
+    expect(events).toEqual([{ type: 'chunk-start', chunkIndex: 0 }]);
+    expect(player.getDiagnostics()).toMatchObject({
+      currentBufferAheadMs: 5030,
+      maxBufferAheadMs: 5030,
+    });
+  });
+
+  test('source exhaustion releases a short final startup reservoir', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent, { startupBufferSec: 20 });
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+
+    player.endSession(gen);
+    expect(ctx.sources).toHaveLength(1);
+    expect(events).toEqual([{ type: 'chunk-start', chunkIndex: 0 }]);
+    await ctx.advanceTo(SAFETY + 2);
+    expect(events.at(-1)).toEqual({ type: 'session-end' });
+  });
+
+  test('a full pending budget releases short chunks below the time target', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent, {
+      startupBufferSec: 20,
+      maxPendingVisible: 2,
+    });
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    expect(ctx.sources).toHaveLength(0);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+
+    expect(ctx.sources).toHaveLength(2);
+  });
+
+  test('rebuilds a refill reservoir after a real underrun', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent, { refillBufferSec: 3, maxPendingVisible: 5 });
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    await ctx.advanceTo(SAFETY + 2);
+
+    player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    expect(ctx.sources).toHaveLength(1);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+
+    expect(ctx.sources).toHaveLength(3);
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 2 + SAFETY, 5);
+    expect(ctx.sources[2]!.startedAt).toBeCloseTo(SAFETY + 2 + SAFETY + 1, 5);
+    expect(events).toEqual([
+      { type: 'chunk-start', chunkIndex: 0 },
+      { type: 'chunk-start', chunkIndex: 1 },
+    ]);
   });
 });
 
