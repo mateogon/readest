@@ -87,10 +87,12 @@ interface ScheduledChunk {
   index: number;
   source: TTSAudioBufferSourceNode;
   startTime: number;
+  started: boolean;
   duration: number;
   timing: ChunkTiming;
   transitionKind: 'sentence' | TTSPlaybackTransition;
   diagnosticKind: 'sentence' | 'paragraph' | 'chapter' | 'cold-start' | null;
+  configuredGapSec: number | null;
   unplannedGapMs: number | null;
   logicalMarkers: TTSAudioBufferSourceNode[];
   logicalMarkerEnded: boolean[];
@@ -104,6 +106,11 @@ interface PlayerSession {
   leadingGapSec: number;
   transitionFromPrevious: TTSPlaybackTransition;
   coldStartPending: boolean;
+  startupBufferSec: number;
+  refillBufferSec: number;
+  maxPendingVisible: number;
+  maxPendingHidden: number;
+  buffering: 'startup' | 'refill' | null;
   chunks: ScheduledChunk[];
   nextChunkIndex: number;
   nextStartTime: number;
@@ -151,6 +158,18 @@ export interface WebAudioSessionOptions {
   transitionFromPrevious?: TTSPlaybackTransition;
   // Intentional inter-block silence, already scaled for playback rate.
   leadingGapSec?: number;
+  // Atomic local engines can take longer to prepare the next chunk than the
+  // current chunk takes to play. Hold the first prepared chunks until this
+  // audible horizon is available instead of starting with a one-chunk lead.
+  startupBufferSec?: number;
+  // After a real underrun, rebuild this much audible horizon before resuming.
+  // A zero value preserves immediate late-chunk admission.
+  refillBufferSec?: number;
+  // Per-session backpressure budgets. Buffered local engines need enough
+  // pending work to reach their reservoir target; network engines retain the
+  // historical defaults.
+  maxPendingVisible?: number;
+  maxPendingHidden?: number;
 }
 
 // Small offset so start() never lands in the past between the read of
@@ -337,6 +356,11 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       leadingGapSec: Math.max(0, options.leadingGapSec ?? 0),
       transitionFromPrevious,
       coldStartPending: false,
+      startupBufferSec: Math.max(0, options.startupBufferSec ?? 0),
+      refillBufferSec: Math.max(0, options.refillBufferSec ?? 0),
+      maxPendingVisible: Math.max(1, Math.floor(options.maxPendingVisible ?? MAX_PENDING_VISIBLE)),
+      maxPendingHidden: Math.max(1, Math.floor(options.maxPendingHidden ?? MAX_PENDING_HIDDEN)),
+      buffering: (options.startupBufferSec ?? 0) > 0 ? 'startup' : null,
       chunks: [],
       nextChunkIndex: 0,
       nextStartTime: 0,
@@ -384,32 +408,6 @@ export class WebAudioPlayer implements TTSAudioPlayer {
         : previousChunk
           ? Math.max(0, previousChunk.timing.gapSec)
           : session.leadingGapSec;
-    const targetStartTime =
-      transitionKind === null || configuredGapSec === null
-        ? null
-        : previousChunk
-          ? previousChunk.startTime + previousChunk.duration + configuredGapSec
-          : this.#lastAudibleEndSec! + configuredGapSec;
-    const start = Math.max(session.nextStartTime, ctx.currentTime + SCHEDULE_SAFETY_SEC);
-    const unplannedGapMs =
-      targetStartTime === null ? null : Math.max(0, start - targetStartTime) * 1000;
-    const chapterStart = previousChunk === undefined && transitionKind === 'chapter';
-    const diagnosticKind =
-      transitionKind === null
-        ? null
-        : session.coldStartPending && previousChunk !== undefined
-          ? 'cold-start'
-          : transitionKind;
-    if (chapterStart) {
-      session.coldStartPending = true;
-    } else if (
-      diagnosticKind === 'cold-start' &&
-      unplannedGapMs !== null &&
-      unplannedGapMs <= STEADY_STATE_GAP_THRESHOLD_MS
-    ) {
-      session.coldStartPending = false;
-    }
-    if (session.chunks.length === 0) this.#lastAudibleEndSec = null;
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     const logicalMarkerBuffer =
@@ -424,12 +422,14 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const chunk: ScheduledChunk = {
       index: session.nextChunkIndex++,
       source,
-      startTime: start,
+      startTime: 0,
+      started: false,
       duration: buffer.duration,
       timing,
       transitionKind,
-      diagnosticKind,
-      unplannedGapMs,
+      diagnosticKind: null,
+      configuredGapSec,
+      unplannedGapMs: null,
       logicalMarkers,
       logicalMarkerEnded: logicalMarkers.map(() => false),
       nextLogicalIndex: 1,
@@ -451,43 +451,18 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       };
     }
     session.chunks.push(chunk);
-    session.nextStartTime = start + buffer.duration + Math.max(0, timing.gapSec);
     this.#scheduledChunks += 1;
-    const bufferAheadMs = Math.max(0, start + buffer.duration - ctx.currentTime) * 1000;
-    this.#maxBufferAheadMs = Math.max(this.#maxBufferAheadMs, bufferAheadMs);
-    source.start(start);
-    for (let index = 0; index < logicalMarkers.length; index++) {
-      logicalMarkers[index]!.start(start + logicalBoundaryOffsetsSec[index]!);
-    }
-    console.info(
-      `[TTS][WebAudio] ${JSON.stringify({
-        event: 'scheduled',
-        generation,
-        chunkIndex: chunk.index,
-        startSec: Number(start.toFixed(3)),
-        durationSec: Number(buffer.duration.toFixed(3)),
-        transitionKind,
-        diagnosticKind,
-        configuredGapMs:
-          configuredGapSec === null ? null : Math.round(Math.max(0, configuredGapSec) * 1000),
-        unplannedGapMs: unplannedGapMs === null ? null : Math.round(unplannedGapMs),
-        bufferAheadMs: Math.round(bufferAheadMs),
-      })}`,
-    );
-    if (chunk.index === 0 || previousChunk?.ended) {
-      // Normally the previous source announces this chunk from its onended
-      // callback. After a real underrun that callback has already fired, so a
-      // late admission must announce itself here or logical playback events
-      // (cursor/highlight) remain one chunk behind the audio.
-      session.onEvent({ type: 'chunk-start', chunkIndex: chunk.index });
-    }
-    if (previousChunk?.ended) this.#discardEndedBefore(session, chunk.index);
+    this.#updateMaxBufferAhead(session);
+    this.#releaseBufferedChunks(session);
   }
 
   endSession(generation: number): void {
     const session = this.#session;
     if (!session || session.generation !== generation) return;
     session.ended = true;
+    // A short final section may never reach the normal startup/refill target.
+    // Source exhaustion is the safe force-release signal.
+    this.#releaseBufferedChunks(session, true);
     // Fires synchronously when nothing is unfinished: a session whose marks
     // were all skipped (zero chunks) or whose last onended beat endSession
     // must still end, or auto-advance dead-ends with controls stuck playing.
@@ -537,11 +512,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
   }
 
   getDiagnostics(): WebAudioPlayerDiagnostics {
-    const lastChunk = this.#session?.chunks.at(-1);
-    const currentBufferAheadMs =
-      lastChunk && this.#ctx
-        ? Math.max(0, lastChunk.startTime + lastChunk.duration - this.#ctx.currentTime) * 1000
-        : 0;
+    const currentBufferAheadMs = this.#session ? this.#bufferAheadSec(this.#session) * 1000 : 0;
     return {
       sessionsStarted: this.#sessionsStarted,
       sessionsCompleted: this.#sessionsCompleted,
@@ -597,11 +568,12 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const session = this.#session;
     const ctx = this.#ctx;
     if (!session || session.generation !== generation || !ctx) return null;
-    const first = session.chunks[0];
+    const startedChunks = session.chunks.filter((chunk) => chunk.started);
+    const first = startedChunks[0];
     if (!first) return null;
     const t = ctx.currentTime;
     let active = first;
-    for (const chunk of session.chunks) {
+    for (const chunk of startedChunks) {
       if (chunk.startTime <= t) active = chunk;
       else break;
     }
@@ -626,14 +598,124 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const unfinished = session.chunks.reduce((n, c) => n + (c.ended ? 0 : 1), 0);
     const limit =
       typeof document !== 'undefined' && document.visibilityState === 'hidden'
-        ? MAX_PENDING_HIDDEN
-        : MAX_PENDING_VISIBLE;
+        ? session.maxPendingHidden
+        : session.maxPendingVisible;
     if (unfinished >= limit) return false;
-    if (this.#ctx && session.chunks.length > 0) {
-      const aheadSec = session.nextStartTime - this.#ctx.currentTime;
-      if (aheadSec >= MAX_AHEAD_SEC) return false;
-    }
+    if (this.#bufferAheadSec(session) >= MAX_AHEAD_SEC) return false;
     return true;
+  }
+
+  #bufferAheadSec(session: PlayerSession): number {
+    const ctx = this.#ctx;
+    if (!ctx) return 0;
+    const startedEndSec = session.chunks.reduce(
+      (end, chunk) =>
+        chunk.started && !chunk.ended ? Math.max(end, chunk.startTime + chunk.duration) : end,
+      ctx.currentTime,
+    );
+    const pending = session.chunks.filter((chunk) => !chunk.started && !chunk.ended);
+    const pendingSec = pending.reduce(
+      (total, chunk, index) =>
+        total +
+        chunk.duration +
+        (index < pending.length - 1 ? Math.max(0, chunk.timing.gapSec) : 0),
+      0,
+    );
+    return Math.max(0, startedEndSec - ctx.currentTime) + pendingSec;
+  }
+
+  #updateMaxBufferAhead(session: PlayerSession): void {
+    this.#maxBufferAheadMs = Math.max(this.#maxBufferAheadMs, this.#bufferAheadSec(session) * 1000);
+  }
+
+  #releaseBufferedChunks(session: PlayerSession, force = false): void {
+    const ctx = this.#ctx;
+    if (!ctx || this.#session !== session) return;
+    const pending = session.chunks.filter((chunk) => !chunk.started && !chunk.ended);
+    if (pending.length === 0) return;
+
+    if (session.buffering !== null && !force) {
+      const targetSec =
+        session.buffering === 'startup' ? session.startupBufferSec : session.refillBufferSec;
+      const pendingLimit =
+        typeof document !== 'undefined' && document.visibilityState === 'hidden'
+          ? session.maxPendingHidden
+          : session.maxPendingVisible;
+      // Never let the reservoir target deadlock against backpressure when a
+      // run of unusually short chunks fills every pending slot first.
+      if (this.#bufferAheadSec(session) < targetSec && pending.length < pendingLimit) return;
+    }
+    session.buffering = null;
+
+    for (const chunk of pending) {
+      const previousChunk = session.chunks.find((candidate) => candidate.index === chunk.index - 1);
+      const targetStartTime =
+        chunk.transitionKind === null || chunk.configuredGapSec === null
+          ? null
+          : previousChunk?.started
+            ? previousChunk.startTime + previousChunk.duration + chunk.configuredGapSec
+            : this.#lastAudibleEndSec !== null
+              ? this.#lastAudibleEndSec + chunk.configuredGapSec
+              : null;
+      const start = Math.max(session.nextStartTime, ctx.currentTime + SCHEDULE_SAFETY_SEC);
+      const unplannedGapMs =
+        targetStartTime === null ? null : Math.max(0, start - targetStartTime) * 1000;
+      const chapterStart = previousChunk === undefined && chunk.transitionKind === 'chapter';
+      const diagnosticKind =
+        chunk.transitionKind === null
+          ? null
+          : session.coldStartPending && previousChunk !== undefined
+            ? 'cold-start'
+            : chunk.transitionKind;
+      if (chapterStart) {
+        session.coldStartPending = true;
+      } else if (
+        diagnosticKind === 'cold-start' &&
+        unplannedGapMs !== null &&
+        unplannedGapMs <= STEADY_STATE_GAP_THRESHOLD_MS
+      ) {
+        session.coldStartPending = false;
+      }
+      if (chunk.index === 0) this.#lastAudibleEndSec = null;
+
+      chunk.startTime = start;
+      chunk.started = true;
+      chunk.diagnosticKind = diagnosticKind;
+      chunk.unplannedGapMs = unplannedGapMs;
+      session.nextStartTime = start + chunk.duration + Math.max(0, chunk.timing.gapSec);
+      chunk.source.start(start);
+      for (let index = 0; index < chunk.logicalMarkers.length; index++) {
+        chunk.logicalMarkers[index]!.start(
+          start + (chunk.timing.logicalBoundaryOffsetsSec?.[index] ?? 0),
+        );
+      }
+      const bufferAheadMs = this.#bufferAheadSec(session) * 1000;
+      this.#maxBufferAheadMs = Math.max(this.#maxBufferAheadMs, bufferAheadMs);
+      console.info(
+        `[TTS][WebAudio] ${JSON.stringify({
+          event: 'scheduled',
+          generation: session.generation,
+          chunkIndex: chunk.index,
+          startSec: Number(start.toFixed(3)),
+          durationSec: Number(chunk.duration.toFixed(3)),
+          transitionKind: chunk.transitionKind,
+          diagnosticKind,
+          configuredGapMs:
+            chunk.configuredGapSec === null
+              ? null
+              : Math.round(Math.max(0, chunk.configuredGapSec) * 1000),
+          unplannedGapMs: unplannedGapMs === null ? null : Math.round(unplannedGapMs),
+          bufferAheadMs: Math.round(bufferAheadMs),
+        })}`,
+      );
+      if (chunk.index === 0 || previousChunk?.ended) {
+        // Normally the previous source announces this chunk from its onended
+        // callback. Startup and refill reservoirs have no active predecessor,
+        // so their first released chunk must announce itself here.
+        session.onEvent({ type: 'chunk-start', chunkIndex: chunk.index });
+      }
+      if (previousChunk?.ended) this.#discardEndedBefore(session, chunk.index);
+    }
   }
 
   #handleChunkEnded(session: PlayerSession, chunk: ScheduledChunk): void {
@@ -670,9 +752,14 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     session.waiters = [];
     for (const waiter of waiters) waiter(true);
     const next = session.chunks.find((candidate) => candidate.index === chunk.index + 1);
-    if (next) {
+    if (next?.started) {
       session.onEvent({ type: 'chunk-start', chunkIndex: next.index });
       this.#discardEndedBefore(session, next.index);
+    } else if (!session.ended && session.refillBufferSec > 0) {
+      // The synthesis pipeline lost the race with playout. Late chunks now
+      // rebuild a useful reservoir instead of resuming for one short fragment
+      // and immediately stalling again.
+      session.buffering = 'refill';
     }
     this.#maybeEmitSessionEnd(session);
   }
