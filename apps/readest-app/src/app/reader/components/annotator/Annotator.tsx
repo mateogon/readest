@@ -54,13 +54,13 @@ import {
 } from '../../utils/deferredAction';
 import { Insets } from '@/types/misc';
 import { runSimpleCC } from '@/utils/simplecc';
-import { getWordCount } from '@/utils/word';
+import { getWordCount, isSingleLookupTerm } from '@/utils/word';
 import { getIndexFromCfi } from '@/utils/cfi';
 import { writeTextToClipboard } from '@/utils/clipboard';
 import { buildAnnotationUrl } from '@/utils/deeplink';
 import { DEFAULT_NOTE_EXPORT_CONFIG } from '@/services/constants';
 import { canShareText, shareSelectedText } from '@/utils/share';
-import { getToolbarToolTypes } from '@/utils/annotationToolbar';
+import { getToolbarToolTypes, supportsProofread } from '@/utils/annotationToolbar';
 import { AnnotationToolType } from '@/types/annotator';
 import { TransformContext } from '@/services/transformers/types';
 import { transformContent } from '@/services/transformService';
@@ -157,6 +157,7 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
   const containerRef = React.useRef<HTMLDivElement>(null);
 
   const [selection, setSelection] = useState<TextSelection | null>(null);
+  const [translationEpoch, setTranslationEpoch] = useState(0);
   const [showAnnotPopup, setShowAnnotPopup] = useState(false);
   const [showDictionaryPopup, setShowDictionaryPopup] = useState(false);
   const [showDeepLPopup, setShowDeepLPopup] = useState(false);
@@ -939,7 +940,14 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
           handleSearch();
           break;
         case 'dictionary':
-          handleDictionary();
+          // A dictionary lookup only makes sense for a single word (or a short
+          // CJK term); on a longer selection fall back to the annotation
+          // toolbar so highlighting and copying stay reachable (#5213).
+          if (selection && isSingleLookupTerm(selection.text)) {
+            handleDictionary();
+          } else {
+            handleShowAnnotPopup();
+          }
           break;
         case 'translate':
           handleTranslation();
@@ -1077,7 +1085,29 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
       console.warn(e);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [progress, annotationIndex]);
+  }, [progress, annotationIndex, translationEpoch]);
+
+  // Translations are appended long after a section's annotations were drawn, so
+  // a highlight anchored inside translated text has nothing to attach to at
+  // draw time. Bumping this re-runs the draw effect above once the inserts
+  // settle; they arrive in bursts, hence the debounce.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const handleTranslationInserted = (event: CustomEvent) => {
+      const detail = event.detail as { bookKey: string } | undefined;
+      if (!detail || detail.bookKey !== bookKey) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        setTranslationEpoch((epoch) => epoch + 1);
+      }, 150);
+    };
+    eventDispatcher.on('translation-inserted', handleTranslationInserted);
+    return () => {
+      if (timer) clearTimeout(timer);
+      eventDispatcher.off('translation-inserted', handleTranslationInserted);
+    };
+  }, [bookKey]);
 
   useEffect(() => {
     if (!config.booknotes || !selection?.cfi || !showAnnotationNotes) return;
@@ -1096,6 +1126,7 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
     setShowAnnotPopup(true);
     setShowDeepLPopup(false);
     setShowDictionaryPopup(false);
+    setShowProofreadPopup(false);
   };
 
   const handleCopy = (dismissPopup = true) => {
@@ -1892,7 +1923,7 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
           tooltipText: _(label),
           Icon,
           onClick: handleProofread,
-          disabled: bookData.book?.format !== 'EPUB',
+          disabled: !supportsProofread(bookData.book?.format),
         };
       case 'share':
         return { tooltipText: _(label), Icon, onClick: handleShare };
@@ -1904,6 +1935,23 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
   const toolButtons = getToolbarToolTypes(viewSettings.annotationToolbarItems, canShare)
     .map(buildToolButton)
     .filter((button): button is NonNullable<typeof button> => button !== null);
+
+  // The lookup popups never deselect (handleDictionary / handleTranslation /
+  // handleProofread only flip popup flags), so a genuine selection is still
+  // live when one closes — return to its toolbar instead of discarding it
+  // (#5213). Word Lens gloss taps and taps on an existing highlight
+  // synthesize their selection with isTextSelected left false, and an empty
+  // toolbar has nothing to return to: those keep the full dismiss. The
+  // consuming actions are a different class by design — copy, share, search,
+  // and TTS spend the selection (TTS deselects deliberately), and highlight /
+  // annotate replace it with the created annotation — so they are not here.
+  const handleDismissPopupShowToolbar = () => {
+    if (isTextSelected.current && toolButtons.length > 0) {
+      handleShowAnnotPopup();
+    } else {
+      handleDismissPopupAndSelection();
+    }
+  };
 
   return (
     <div ref={containerRef} role='toolbar' tabIndex={-1}>
@@ -1927,7 +1975,7 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
               <DictionarySheet
                 word={selection?.text as string}
                 lang={bookData.bookDoc?.metadata.language as string}
-                onDismiss={handleDismissPopupAndSelection}
+                onDismiss={handleDismissPopupShowToolbar}
                 onManage={onManage}
               />
             );
@@ -1941,7 +1989,7 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
               trianglePosition={trianglePosition}
               popupWidth={dictPopupWidth}
               popupHeight={dictPopupHeight}
-              onDismiss={handleDismissPopupAndSelection}
+              onDismiss={handleDismissPopupShowToolbar}
               onManage={onManage}
             />
           );
@@ -1953,7 +2001,7 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
           trianglePosition={trianglePosition}
           popupWidth={transPopupWidth}
           popupHeight={transPopupHeight}
-          onDismiss={handleDismissPopupAndSelection}
+          onDismiss={handleDismissPopupShowToolbar}
         />
       )}
       {showAnnotPopup &&
@@ -1991,7 +2039,7 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
           trianglePosition={trianglePosition}
           popupWidth={proofreadPopupWidth}
           popupHeight={proofreadPopupHeight}
-          onDismiss={handleDismissPopupAndSelection}
+          onDismiss={handleDismissPopupShowToolbar}
           onManage={() => {
             handleDismissPopupAndSelection();
             setProofreadRulesVisibility(true);

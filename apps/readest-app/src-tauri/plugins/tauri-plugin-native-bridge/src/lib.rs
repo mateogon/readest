@@ -82,6 +82,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::open_external_url,
             commands::show_lookup_popover,
             commands::select_directory,
+            commands::show_file_picker,
             commands::get_storefront_region_code,
             commands::request_manage_storage_permission,
             commands::set_sync_passphrase,
@@ -96,6 +97,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::capture_webview_region,
             commands::set_selection_suppressed,
             commands::read_share_clip_html,
+            commands::icloud_container_status,
+            commands::icloud_ensure_downloaded,
         ])
         .setup(|app, api| {
             #[cfg(mobile)]

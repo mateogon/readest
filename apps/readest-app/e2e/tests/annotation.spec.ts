@@ -20,6 +20,61 @@ test.describe('Annotation', () => {
     await expect(reader.annotationItems).toHaveCount(1);
   });
 
+  test('closing the dictionary popup returns to the selection toolbar (#5213)', async ({
+    openBook,
+  }) => {
+    const reader = await openBook();
+
+    await reader.selectText();
+    await reader.popupTool('Dictionary').click();
+    await expect(reader.dictionaryPopup).toBeVisible();
+    await expect(reader.annotationPopup).toBeHidden();
+
+    await reader.page.keyboard.press('Escape');
+
+    await expect(reader.dictionaryPopup).toBeHidden();
+    // The selection survives the lookup, so its toolbar must come back with
+    // it — before the fix the dismiss discarded both.
+    await expect(reader.annotationPopup).toBeVisible();
+    await expect(reader.popupTool('Highlight')).toBeVisible();
+  });
+
+  // The translator and proofread popups keep the selection alive by the same
+  // mechanism as the dictionary, so their dismiss lands on the same toolbar.
+  test('closing the translator popup returns to the selection toolbar (#5213)', async ({
+    openBook,
+  }) => {
+    const reader = await openBook();
+
+    await reader.selectText();
+    await reader.popupTool('Translate').click();
+    await expect(reader.translatorPopup).toBeVisible();
+    await expect(reader.annotationPopup).toBeHidden();
+
+    await reader.page.keyboard.press('Escape');
+
+    await expect(reader.translatorPopup).toBeHidden();
+    await expect(reader.annotationPopup).toBeVisible();
+    await expect(reader.popupTool('Highlight')).toBeVisible();
+  });
+
+  test('closing the proofread popup returns to the selection toolbar (#5213)', async ({
+    openBook,
+  }) => {
+    const reader = await openBook();
+
+    await reader.selectText();
+    await reader.popupTool('Proofread').click();
+    await expect(reader.proofreadPopup).toBeVisible();
+    await expect(reader.annotationPopup).toBeHidden();
+
+    await reader.page.keyboard.press('Escape');
+
+    await expect(reader.proofreadPopup).toBeHidden();
+    await expect(reader.annotationPopup).toBeVisible();
+    await expect(reader.popupTool('Highlight')).toBeVisible();
+  });
+
   test('changes the highlight color', async ({ openBook }) => {
     const reader = await openBook();
 

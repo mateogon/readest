@@ -83,6 +83,7 @@ export interface KOSyncSettings {
   deviceName: string;
   checksumMethod: KOSyncChecksumMethod;
   strategy: KOSyncStrategy;
+  customHeaders?: Record<string, string>;
 }
 
 export interface BookOrbitSettings {
@@ -100,6 +101,7 @@ export interface BookOrbitSettings {
   syncNotes: boolean;
   syncStats: boolean;
   syncBookStates: boolean;
+  customHeaders?: Record<string, string>;
 }
 
 export interface ReadwiseSettings {
@@ -236,6 +238,25 @@ export interface OneDriveSettings {
   enabled: boolean;
   /** Connected account's userPrincipalName/email, shown in the settings UI. */
   accountLabel?: string;
+  syncProgress?: boolean;
+  syncNotes?: boolean;
+  syncBooks?: boolean;
+  fullSync?: boolean;
+  strategy?: KOSyncStrategy;
+  deviceId?: string;
+  lastSyncedAt?: number;
+  /** See {@link WebDAVSettings.providerSelectedAt}. */
+  providerSelectedAt?: number;
+}
+
+/**
+ * iCloud Drive file-sync settings. Available only in the iOS/macOS Tauri
+ * apps: the backend is the app's ubiquity container, synced by the OS. No
+ * credentials and no OAuth — the device's iCloud session is the account.
+ * `deviceId`/`lastSyncedAt`/`providerSelectedAt` are device-local.
+ */
+export interface ICloudSettings {
+  enabled: boolean;
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
@@ -458,6 +479,7 @@ export interface SystemSettings {
   googleDrive: GoogleDriveSettings;
   s3: S3Settings;
   onedrive: OneDriveSettings;
+  icloud: ICloudSettings;
 
   aiSettings: AISettings;
   /**

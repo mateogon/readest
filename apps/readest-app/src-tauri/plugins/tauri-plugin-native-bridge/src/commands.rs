@@ -245,6 +245,11 @@ pub(crate) async fn select_directory<R: Runtime>(
 }
 
 #[command]
+pub(crate) async fn show_file_picker<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    app.native_bridge().show_file_picker()
+}
+
+#[command]
 pub(crate) async fn get_storefront_region_code<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<GetStorefrontRegionCodeResponse> {
@@ -340,4 +345,19 @@ pub(crate) async fn capture_webview_region<R: Runtime>(
         .native_bridge()
         .capture_webview_region(&window, payload)?;
     Ok(tauri::ipc::Response::new(png))
+}
+
+#[command]
+pub(crate) async fn icloud_container_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<ICloudContainerStatusResponse> {
+    app.native_bridge().icloud_container_status()
+}
+
+#[command]
+pub(crate) async fn icloud_ensure_downloaded<R: Runtime>(
+    app: AppHandle<R>,
+    payload: ICloudEnsureDownloadedRequest,
+) -> Result<ICloudEnsureDownloadedResponse> {
+    app.native_bridge().icloud_ensure_downloaded(payload)
 }
