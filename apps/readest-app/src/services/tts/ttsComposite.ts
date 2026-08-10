@@ -64,6 +64,13 @@ const separatorBefore = (previous: TTSCompositeLogicalUnit, next: TTSCompositeUn
   }
 
   if (!previous.mark.text || !next.mark.text) return '';
+  // Some Android engines can collapse a comma or period when two logical units
+  // become one physical request. Three extra dots prompt a short model-owned
+  // pause; measured Spanish probes kept it near the existing 180 ms target.
+  // This stays inside composites, where a PCM gap cannot be inserted safely.
+  if (/[,\.][\s'"’”»›)\]}]*$/u.test(previous.mark.text)) {
+    return /^\s/u.test(next.mark.text) ? '...' : '... ';
+  }
   return /\s$/u.test(previous.mark.text) || /^\s/u.test(next.mark.text) ? '' : ' ';
 };
 
