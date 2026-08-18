@@ -165,7 +165,7 @@ describe('SynthesisCoordinator', () => {
     await expect(idle).resolves.toBeUndefined();
   });
 
-  test('playback starts before queued prefetch work', async () => {
+  test('playback starts before queued warmup work', async () => {
     const pending = new Map<string, Deferred<SpeechSynthesisResult>>();
     const order: string[] = [];
     const synthesize = vi.fn((req: SpeechSynthesisRequest) => {
@@ -178,7 +178,10 @@ describe('SynthesisCoordinator', () => {
 
     const blocker = coordinator.acquire(request('blocker'), { priority: 'warmup' });
     await waitForCallCount(synthesize, 1);
-    const future = coordinator.acquire(request('future'), { priority: 'prefetch' });
+    // Source exhaustion can enqueue the next section before the planner has
+    // submitted its final current-section batch. Playback must still win the
+    // same coordinator queue when that request arrives afterwards.
+    const future = coordinator.acquire(request('future'), { priority: 'warmup' });
     const current = coordinator.acquire(request('current'), { priority: 'playback' });
 
     pending.get('blocker')!.resolve(result(1));

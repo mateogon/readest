@@ -1624,6 +1624,27 @@ describe('TTSController', () => {
   });
 
   describe('forward and backward', () => {
+    test('cross-section natural auto-advance preserves a compatible streamed warmup', async () => {
+      const speakBlocks = vi.fn();
+      const warmupBlocks = vi.fn().mockResolvedValue(undefined);
+      Object.assign(controller.ttsClient, {
+        speakBlocks,
+        supportsBlockStreaming: vi.fn().mockReturnValue(true),
+        warmupBlocks,
+      });
+      mockView.tts = {
+        next: vi.fn().mockReturnValue(undefined),
+        nextMark: vi.fn().mockReturnValue(undefined),
+        start: vi.fn(),
+        doc: null,
+      } as unknown as FoliateView['tts'];
+      controller.state = 'playing';
+
+      await controller.forward(false, true);
+
+      expect(controller.ttsClient.invalidateSynthesis).not.toHaveBeenCalled();
+    });
+
     test('same-section auto-advance preserves prepared synthesis', async () => {
       mockView.tts = {
         next: vi.fn().mockReturnValue('<speak>next</speak>'),
@@ -2247,13 +2268,19 @@ describe('TTSController', () => {
 
     const installBatchClient = (
       speakBlocks: (...args: unknown[]) => AsyncIterable<TTSMessageEvent>,
+      warmupBlocks?: (...args: unknown[]) => Promise<void>,
     ) => {
       const batchSpeak = vi.fn(speakBlocks);
+      const warmup = warmupBlocks ? vi.fn(warmupBlocks) : undefined;
       Object.assign(controller.ttsClient, {
         supportsBlockStreaming: vi.fn(() => true),
         speakBlocks: batchSpeak,
+        warmupBlocks: warmup,
       });
-      return batchSpeak;
+      return {
+        batchSpeak,
+        warmup,
+      };
     };
 
     const suppressLegacyPreload = () => {
@@ -2681,6 +2708,148 @@ describe('TTSController', () => {
 
       expect(blocks).toEqual([{ blockOffset: 0, ssml: '<speak>last block</speak>' }]);
       expect(shadow.next).toHaveBeenCalledTimes(1);
+    });
+
+    test('warms the next section from the real blocks after natural source exhaustion', async () => {
+      const live = await installLiveCursor(1);
+      const currentShadow = queueShadowCursor([]);
+      const nextAnchor = new Range();
+      vi.mocked(TTS).mockImplementationOnce(function () {
+        return {
+          start: vi.fn().mockReturnValue('<speak>next-first</speak>'),
+          getLastRange: vi.fn().mockReturnValue(nextAnchor),
+        } as unknown as InstanceType<typeof TTS>;
+      });
+      const nextShadow = queueShadowCursor(['<speak>next-second</speak>']);
+      suppressLegacyPreload();
+
+      const currentBlocks: { blockOffset: number; ssml: string }[] = [];
+      const warmedBlocks: { blockOffset: number; ssml: string }[] = [];
+      let warmupDone!: () => void;
+      const warmupFinished = new Promise<void>((resolve) => {
+        warmupDone = resolve;
+      });
+      const { batchSpeak, warmup } = installBatchClient(
+        async function* (blocksArg: unknown) {
+          for await (const block of blocksArg as AsyncIterable<{
+            blockOffset: number;
+            ssml: string;
+          }>) {
+            currentBlocks.push(block);
+          }
+          yield { code: 'end', consumedBlockOffset: 0 } as TTSMessageEvent;
+        },
+        async (blocksArg: unknown) => {
+          for await (const block of blocksArg as AsyncIterable<{
+            blockOffset: number;
+            ssml: string;
+          }>) {
+            warmedBlocks.push(block);
+          }
+          warmupDone();
+        },
+      );
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await warmupFinished;
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+
+      expect(batchSpeak).toHaveBeenCalledTimes(1);
+      expect(warmup).toHaveBeenCalledTimes(1);
+      expect(currentBlocks).toEqual([{ blockOffset: 0, ssml: '<speak>current</speak>' }]);
+      expect(warmedBlocks).toEqual([
+        { blockOffset: 0, ssml: '<speak>next-first</speak>' },
+        { blockOffset: 1, ssml: '<speak>next-second</speak>' },
+      ]);
+      expect(currentShadow.next).toHaveBeenCalledTimes(1);
+      expect(nextShadow.next).toHaveBeenCalledTimes(2);
+      expect(live.next).not.toHaveBeenCalled();
+    });
+
+    test('does not warm the next section when stopAtChapterEnd is enabled', async () => {
+      await installLiveCursor(1);
+      queueShadowCursor([]);
+      suppressLegacyPreload();
+      controller.stopAtChapterEnd = true;
+      const { warmup } = installBatchClient(
+        async function* (blocksArg: unknown) {
+          for await (const _ of blocksArg as AsyncIterable<unknown>);
+          yield { code: 'end', consumedBlockOffset: 0 } as TTSMessageEvent;
+        },
+        async () => undefined,
+      );
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+
+      expect(warmup).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      'epoch',
+      'section',
+      'client',
+    ] as const)('drops next-section blocks when the warmup becomes stale by %s', async (staleReason) => {
+      await installLiveCursor(1);
+      queueShadowCursor([]);
+      suppressLegacyPreload();
+
+      let releaseDocument!: (doc: Document) => void;
+      const documentReady = new Promise<Document>((resolve) => {
+        releaseDocument = resolve;
+      });
+      const nextSection = mockView.book.sections?.[1];
+      if (!nextSection) throw new Error('Missing next test section');
+      nextSection.createDocument = vi.fn(() => documentReady);
+      const warmedBlocks: { blockOffset: number; ssml: string }[] = [];
+      let warmupStarted!: () => void;
+      const warmupBegun = new Promise<void>((resolve) => {
+        warmupStarted = resolve;
+      });
+      let warmupDone!: () => void;
+      const warmupFinished = new Promise<void>((resolve) => {
+        warmupDone = resolve;
+      });
+      const replacementClient = createMockTTSClient('replacement');
+      installBatchClient(
+        async function* (blocksArg: unknown) {
+          for await (const _ of blocksArg as AsyncIterable<unknown>);
+          yield { code: 'end', consumedBlockOffset: 0 } as TTSMessageEvent;
+        },
+        async (blocksArg: unknown) => {
+          warmupStarted();
+          for await (const block of blocksArg as AsyncIterable<{
+            blockOffset: number;
+            ssml: string;
+          }>) {
+            warmedBlocks.push(block);
+          }
+          warmupDone();
+        },
+      );
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await warmupBegun;
+      if (staleReason === 'epoch') {
+        controller.setTargetLang('es');
+      } else if (staleReason === 'section') {
+        // shutdown() clears the controller's section owner and invalidates
+        // the live session. The pending throwaway section must not become a
+        // useful warmup after that section identity disappears.
+        await controller.shutdown();
+      } else {
+        controller.ttsClient = replacementClient;
+      }
+      releaseDocument(mockView.renderer.getContents()[0]!.doc);
+      await warmupFinished;
+      if (staleReason !== 'section') {
+        await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+      }
+
+      expect(warmedBlocks).toEqual([]);
     });
 
     test('commits trailing consumed blocks only after a successful end', async () => {

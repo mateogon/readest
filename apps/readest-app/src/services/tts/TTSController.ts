@@ -124,6 +124,10 @@ export class TTSController extends EventTarget {
   #preloadRunning = false;
   #preloadRunId = 0;
   #pendingPreloadCount: number | null = null;
+  // Invalidates a next-section warmup whose throwaway document is still being
+  // built. Natural auto-advance deliberately does not advance this epoch;
+  // manual navigation and configuration changes do.
+  #warmupEpoch = 0;
 
   #ttsSectionIndex: number = -1;
 
@@ -1111,6 +1115,7 @@ export class TTSController extends EventTarget {
     this.#preloadRunning = false;
     this.#pendingPreloadCount = null;
     this.#preloadRunId += 1;
+    this.#warmupEpoch += 1;
   }
 
   async preloadSSML(
@@ -1201,12 +1206,18 @@ export class TTSController extends EventTarget {
     anchor: Range | undefined,
     signal: AbortSignal,
     streamState: { highestYieldedBlockOffset: number },
+    onSourceExhausted?: () => void,
+    granularity: TTSGranularity = this.#ttsGranularity,
   ): AsyncGenerator<TTSBlockInput> {
     if (signal.aborted) return;
     streamState.highestYieldedBlockOffset = 0;
     yield { blockOffset: 0, ssml: currentSSML };
-    if (!doc || !anchor || signal.aborted) return;
+    if (!doc || !anchor || signal.aborted) {
+      if (!signal.aborted) onSourceExhausted?.();
+      return;
+    }
 
+    let sourceExhausted = false;
     try {
       const { TTS } = await import('foliate-js/tts.js');
       const { textWalker } = await import('foliate-js/text-walker.js');
@@ -1216,7 +1227,7 @@ export class TTSController extends EventTarget {
         textWalker,
         createTTSNodeFilter(),
         () => {},
-        this.#ttsGranularity,
+        granularity,
         DEFAULT_TTS_MAX_SEGMENT_CHARS,
       );
       // Position on the live block without using the returned current SSML:
@@ -1226,7 +1237,10 @@ export class TTSController extends EventTarget {
       for (let blockOffset = 1; ; blockOffset++) {
         if (signal.aborted) return;
         const rawSSML = shadow.next();
-        if (rawSSML === undefined) return;
+        if (rawSSML === undefined) {
+          sourceExhausted = true;
+          return;
+        }
         const ssml = await this.#preprocessSSML(rawSSML);
         if (signal.aborted) return;
         // Preserve empty preprocessed blocks in the logical stream. A client
@@ -1237,7 +1251,71 @@ export class TTSController extends EventTarget {
       }
     } catch (error) {
       console.warn('[TTS] Unable to enumerate streamed SSML blocks', error);
+    } finally {
+      if (sourceExhausted && !signal.aborted) onSourceExhausted?.();
     }
+  }
+
+  async *#warmupNextSectionBlocks(
+    client: TTSClient,
+    sourceSectionIndex: number,
+    epoch: number,
+  ): AsyncGenerator<TTSBlockInput> {
+    const nextSectionIndex = sourceSectionIndex + 1;
+    const section = this.view.book.sections?.[nextSectionIndex];
+    if (!section?.createDocument || this.narrationActive) return;
+
+    // Build a throwaway source exactly like the live section initializer. It
+    // never replaces view.tts, so current-section highlights and cursor state
+    // remain owned by the active session while the chapter is still audible.
+    const doc = await this.#createSectionDoc(section);
+    if (
+      this.#warmupEpoch !== epoch ||
+      (this.#ttsSectionIndex !== sourceSectionIndex &&
+        this.#ttsSectionIndex !== nextSectionIndex) ||
+      this.ttsClient !== client
+    ) {
+      return;
+    }
+
+    const { TTS } = await import('foliate-js/tts.js');
+    const { textWalker } = await import('foliate-js/text-walker.js');
+    let granularity: TTSGranularity = this.view.language.isCJK ? 'sentence' : 'word';
+    const supportedGranularities = client.getGranularities();
+    if (!supportedGranularities.includes(granularity)) {
+      granularity = supportedGranularities[0]!;
+    }
+    const tts = new TTS(
+      doc,
+      textWalker,
+      createTTSNodeFilter(),
+      () => {},
+      granularity,
+      DEFAULT_TTS_MAX_SEGMENT_CHARS,
+    );
+    const firstSSML = await this.#preprocessSSML(tts.start());
+    if (!firstSSML) return;
+    const anchor = tts.getLastRange?.();
+    const sourceState = { highestYieldedBlockOffset: -1 };
+    // This source has no controller speak signal on purpose. The buffered
+    // client owns warmup cancellation through invalidateSynthesis(), which
+    // lets it survive the current session's natural handover abort.
+    yield* this.#streamSSMLBlocks(
+      firstSSML,
+      doc,
+      anchor,
+      new AbortController().signal,
+      sourceState,
+      undefined,
+      granularity,
+    );
+  }
+
+  #startNextSectionWarmup(client: TTSClient, sourceSectionIndex: number, epoch: number): void {
+    if (!client.warmupBlocks || !client.supportsBlockStreaming?.()) return;
+    void client
+      .warmupBlocks(this.#warmupNextSectionBlocks(client, sourceSectionIndex, epoch))
+      .catch((error) => console.warn('[TTS] Next-section warmup failed', error));
   }
 
   #commitStreamedBlockOffset(
@@ -1353,6 +1431,8 @@ export class TTSController extends EventTarget {
         let streamedBlocks: AsyncIterable<TTSBlockInput> | null = null;
         let streamedLiveTts: FoliateView['tts'] = null;
         const blockStreamState = { highestYieldedBlockOffset: -1 };
+        const sourceSectionIndex = this.#ttsSectionIndex;
+        const warmupEpoch = this.#warmupEpoch;
         if (!oneTime) {
           if (!plainText || marks.length === 0) {
             resolve();
@@ -1375,6 +1455,11 @@ export class TTSController extends EventTarget {
               liveTts?.getLastRange?.(),
               signal,
               blockStreamState,
+              () => {
+                if (!this.stopAtChapterEnd) {
+                  this.#startNextSectionWarmup(sessionClient, sourceSectionIndex, warmupEpoch);
+                }
+              },
             );
           } else {
             this.dispatchSpeakMark(marks[0]);
@@ -1622,10 +1707,16 @@ export class TTSController extends EventTarget {
     const ssml = byMark ? this.#getTts()?.nextMark(!isPlaying) : this.#getTts()?.next(!isPlaying);
     if (!ssml) {
       if (isAutoAdvance) {
-        // A new document/section has different mark ownership. Same-section
-        // auto-advance keeps its buffer, but cross-section work must not.
-        this.#cancelPreloads();
-        this.ttsClient.invalidateSynthesis?.();
+        // A streamed client may have warmed the next section with the same
+        // composite requests the new session will acquire. Keep that work for
+        // the natural handover; clients without this contract retain the old
+        // invalidation behavior for cross-section mark ownership.
+        const preserveStreamWarmup =
+          !!this.ttsClient.warmupBlocks && this.#supportsBlockStreaming();
+        if (!preserveStreamWarmup) {
+          this.#cancelPreloads();
+          this.ttsClient.invalidateSynthesis?.();
+        }
       }
       if (isAutoAdvance && isPlaying && this.stopAtChapterEnd) {
         return await this.#stopAtChapterBoundary();
@@ -1778,6 +1869,10 @@ export class TTSController extends EventTarget {
   }
 
   setTargetLang(lang: string) {
+    if (lang !== this.ttsTargetLang) {
+      this.#cancelPreloads();
+      this.ttsClient.invalidateSynthesis?.();
+    }
     this.ttsTargetLang = lang;
   }
 
