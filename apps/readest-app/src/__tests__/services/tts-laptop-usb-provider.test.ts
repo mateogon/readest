@@ -22,14 +22,15 @@ const HEALTH = {
   sampleRate: 44_100,
   maxTextUtf16: 200,
   synthesisConcurrency: 1,
+  settingsIdentity: 'reading-tts-settings-v2:sid8:speed1:steps5:pauses0,120,180,200,100',
   voices: [
     {
-      id: 'laptop-usb:supertonic3:es:sid7',
+      id: 'laptop-usb:supertonic3:es:sid8',
       name: 'Laptop Supertonic 3 — Español',
       lang: 'es-ES',
     },
     {
-      id: 'laptop-usb:supertonic3:en:sid7',
+      id: 'laptop-usb:supertonic3:en:sid8',
       name: 'Laptop Supertonic 3 — English',
       lang: 'en-US',
     },
@@ -144,11 +145,40 @@ describe('LaptopUsbSpeechProvider', () => {
     await expect(provider.init()).resolves.toBe(true);
     await expect(provider.getAllVoices()).resolves.toEqual(HEALTH.voices);
     expect(provider.synthesisIdentity).toContain(HEALTH.pipelineRevision);
+    expect(provider.synthesisIdentity).toContain(HEALTH.settingsIdentity);
     expect(provider.synthesisIdentity).toContain(HEALTH.modelIdentity);
     expect(h.fetch).toHaveBeenCalledWith(
       'http://127.0.0.1:18765/health',
       expect.objectContaining({ method: 'GET', signal: expect.any(AbortSignal) }),
     );
+  });
+
+  test('accepts the configured sid advertised by the host profile', async () => {
+    const sid9Health = {
+      ...HEALTH,
+      settingsIdentity: 'reading-tts-settings-v2:sid9:speed1:steps5:pauses0,120,180,200,100',
+      voices: HEALTH.voices.map((voice) => ({
+        ...voice,
+        id: voice.id.replace('sid8', 'sid9'),
+      })),
+    };
+    h.fetch.mockResolvedValueOnce(response(sid9Health));
+    const provider = new LaptopUsbSpeechProvider();
+
+    await expect(provider.init()).resolves.toBe(true);
+    await expect(provider.getAllVoices()).resolves.toEqual(sid9Health.voices);
+  });
+
+  test('rejects a voice sid that disagrees with the host profile', async () => {
+    h.fetch.mockResolvedValueOnce(
+      response({
+        ...HEALTH,
+        settingsIdentity: 'reading-tts-settings-v2:sid9:speed1:steps5:pauses0,120,180,200,100',
+      }),
+    );
+    const provider = new LaptopUsbSpeechProvider();
+
+    await expect(provider.init()).resolves.toBe(false);
   });
 
   test('stays unavailable for absence, timeout, or incompatible health', async () => {
@@ -176,6 +206,7 @@ describe('LaptopUsbSpeechProvider', () => {
       'sampleRate',
       'maxTextUtf16',
       'synthesisConcurrency',
+      'settingsIdentity',
     ] as const) {
       const incompatible = new LaptopUsbSpeechProvider();
       h.fetch.mockResolvedValueOnce(
@@ -194,7 +225,7 @@ describe('LaptopUsbSpeechProvider', () => {
       {
         lang: 'es_cl',
         text: 'Hi 😀 cafe\u0301',
-        voice: 'laptop-usb:supertonic3:es:sid7',
+        voice: 'laptop-usb:supertonic3:es:sid8',
         pitch: 1.1,
       },
       new AbortController().signal,
@@ -213,7 +244,7 @@ describe('LaptopUsbSpeechProvider', () => {
       generation: context.generation,
       text: 'Hi 😀 cafe\u0301',
       lang: 'es-CL',
-      voice: 'laptop-usb:supertonic3:es:sid7',
+      voice: 'laptop-usb:supertonic3:es:sid8',
       pitch: 1.1,
     });
     expect(body).not.toHaveProperty('rate');
@@ -248,7 +279,7 @@ describe('LaptopUsbSpeechProvider', () => {
           {
             lang: 'en-US',
             text: 'Hi 😀 cafe\u0301',
-            voice: 'laptop-usb:supertonic3:en:sid7',
+            voice: 'laptop-usb:supertonic3:en:sid8',
             pitch: 1,
           },
           new AbortController().signal,
@@ -267,7 +298,7 @@ describe('LaptopUsbSpeechProvider', () => {
       );
       await expect(
         provider.synthesize(
-          { lang: 'es-ES', text: 'Texto', voice: 'laptop-usb:supertonic3:es:sid7', pitch: 1 },
+          { lang: 'es-ES', text: 'Texto', voice: 'laptop-usb:supertonic3:es:sid8', pitch: 1 },
           new AbortController().signal,
           context,
         ),
@@ -276,7 +307,7 @@ describe('LaptopUsbSpeechProvider', () => {
     h.fetch.mockResolvedValueOnce(response({ schemaVersion: 1, code: 'synthesis_failed' }, 500));
     await expect(
       provider.synthesize(
-        { lang: 'es-ES', text: 'Texto', voice: 'laptop-usb:supertonic3:es:sid7', pitch: 1 },
+        { lang: 'es-ES', text: 'Texto', voice: 'laptop-usb:supertonic3:es:sid8', pitch: 1 },
         new AbortController().signal,
         context,
       ),
@@ -293,7 +324,7 @@ describe('LaptopUsbSpeechProvider', () => {
         {
           lang: 'es-ES',
           text: 'secreto no debe aparecer',
-          voice: 'laptop-usb:supertonic3:es:sid7',
+          voice: 'laptop-usb:supertonic3:es:sid8',
           pitch: 1,
         },
         controller.signal,
@@ -314,7 +345,7 @@ describe('LaptopUsbSpeechProvider', () => {
       {
         lang: 'es-ES',
         text: 'secreto no debe aparecer',
-        voice: 'laptop-usb:supertonic3:es:sid7',
+        voice: 'laptop-usb:supertonic3:es:sid8',
         pitch: 1,
       },
       activeController.signal,
@@ -343,7 +374,7 @@ describe('LaptopUsbSpeechProvider', () => {
     h.fetch.mockResolvedValueOnce(synthesisResponse(source));
     const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
     const result = await provider.synthesize(
-      { lang: 'es-ES', text: privateText, voice: 'laptop-usb:supertonic3:es:sid7', pitch: 1 },
+      { lang: 'es-ES', text: privateText, voice: 'laptop-usb:supertonic3:es:sid8', pitch: 1 },
       new AbortController().signal,
       context,
     );

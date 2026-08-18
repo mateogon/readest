@@ -49,6 +49,7 @@ interface LaptopHealthResponse {
   sampleRate: number;
   maxTextUtf16: number;
   synthesisConcurrency: number;
+  settingsIdentity: string;
   voices: LaptopHealthVoice[];
 }
 
@@ -106,7 +107,7 @@ const validVoice = (value: unknown): value is LaptopHealthVoice => {
   const lang = value['lang'];
   if (
     typeof id !== 'string' ||
-    !/^laptop-usb:supertonic3:(?:es|en):sid7$/.test(id) ||
+    !/^laptop-usb:supertonic3:(?:es|en):sid(?:0|[1-9]\d*)$/.test(id) ||
     typeof name !== 'string' ||
     !name.trim() ||
     typeof lang !== 'string'
@@ -120,6 +121,15 @@ const validVoice = (value: unknown): value is LaptopHealthVoice => {
 const validHealth = (value: unknown): value is LaptopHealthResponse => {
   if (!isRecord(value)) return false;
   const voices = value['voices'];
+  const settingsIdentity = value['settingsIdentity'];
+  const voiceSuffixes = Array.isArray(voices)
+    ? new Set(
+        voices
+          .filter(validVoice)
+          .map((voice) => voice.id.split(':').at(-1))
+          .filter((suffix): suffix is string => !!suffix),
+      )
+    : new Set<string>();
   return (
     value['schemaVersion'] === 1 &&
     value['status'] === 'ready' &&
@@ -133,9 +143,15 @@ const validHealth = (value: unknown): value is LaptopHealthResponse => {
     isSafeInteger(value['maxTextUtf16']) &&
     value['maxTextUtf16'] >= MAX_TEXT_UTF16 &&
     value['synthesisConcurrency'] === 1 &&
+    typeof settingsIdentity === 'string' &&
+    /^reading-tts-settings-v2:sid(?:0|[1-9]\d*):speed\d+(?:\.\d+)?:steps[5-7]:pauses\d+,\d+,\d+,\d+,\d+$/.test(
+      settingsIdentity,
+    ) &&
     Array.isArray(voices) &&
     voices.length > 0 &&
-    voices.every(validVoice)
+    voices.every(validVoice) &&
+    voiceSuffixes.size === 1 &&
+    settingsIdentity.includes(`:${[...voiceSuffixes][0]}:`)
   );
 };
 
@@ -332,17 +348,19 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
 
   #voices: LaptopHealthVoice[] = [];
   #serviceVersion = '';
+  #settingsIdentity = '';
   #initialized = false;
   #fallbackRequestSequence = 0;
 
   get synthesisIdentity(): string {
     if (!this.#initialized) return `${ADAPTER_REVISION}:uninitialized`;
-    return `${ADAPTER_REVISION}:rtts-${PROTOCOL_VERSION}:${this.#serviceVersion}:${EXPECTED_RUNTIME_VERSION}:${EXPECTED_PIPELINE_REVISION}:${EXPECTED_MODEL_IDENTITY}`;
+    return `${ADAPTER_REVISION}:rtts-${PROTOCOL_VERSION}:${this.#serviceVersion}:${this.#settingsIdentity}:${EXPECTED_RUNTIME_VERSION}:${EXPECTED_PIPELINE_REVISION}:${EXPECTED_MODEL_IDENTITY}`;
   }
 
   async init(): Promise<boolean> {
     this.#voices = [];
     this.#serviceVersion = '';
+    this.#settingsIdentity = '';
     this.#initialized = false;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
@@ -356,6 +374,7 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
       if (!validHealth(health)) return false;
       this.#voices = health.voices.map((voice) => ({ ...voice }));
       this.#serviceVersion = health.serviceVersion;
+      this.#settingsIdentity = health.settingsIdentity;
       this.#initialized = true;
       return true;
     } catch {
@@ -455,6 +474,7 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
   async shutdown(): Promise<void> {
     this.#voices = [];
     this.#serviceVersion = '';
+    this.#settingsIdentity = '';
     this.#initialized = false;
   }
 }

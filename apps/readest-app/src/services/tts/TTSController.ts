@@ -448,6 +448,16 @@ export class TTSController extends EventTarget {
       );
       if (preferredClient) {
         this.ttsClient = preferredClient;
+      } else if (preferredClientName === this.ttsLaptopUsbClient?.name) {
+        // USB is an optional transport for the same reading workflow. When it
+        // is absent at startup, keep the laptop preference for the next
+        // connected session but speak locally through Reading TTS Android.
+        if (
+          this.ttsAndroidBufferedClient &&
+          availableClients.includes(this.ttsAndroidBufferedClient)
+        ) {
+          this.ttsClient = this.ttsAndroidBufferedClient;
+        }
       }
     }
     this.ttsWebVoices = await this.ttsWebClient.getAllVoices();
