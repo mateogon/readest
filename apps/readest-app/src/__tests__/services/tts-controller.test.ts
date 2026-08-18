@@ -31,15 +31,26 @@ vi.mock('@/services/tts/NativeTTSClient', () => ({
 }));
 
 vi.mock('@/services/tts/BufferedTTSClient', () => ({
-  BufferedTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
-    Object.assign(this, createMockTTSClient('android-system-buffered'), {
+  BufferedTTSClient: vi.fn().mockImplementation(function (
+    this: Record<string, unknown>,
+    provider: { id?: string },
+  ) {
+    Object.assign(this, createMockTTSClient(provider.id ?? 'android-system-buffered'), {
       setParagraphGap: vi.fn(),
     });
   }),
 }));
 
 vi.mock('@/services/tts/providers/android', () => ({
-  AndroidSystemSpeechProvider: vi.fn(),
+  AndroidSystemSpeechProvider: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
+    this['id'] = 'android-system-buffered';
+  }),
+}));
+
+vi.mock('@/services/tts/providers/laptopUsb', () => ({
+  LaptopUsbSpeechProvider: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
+    this['id'] = 'laptop-usb-supertonic';
+  }),
 }));
 
 // Track the inaudible background keep-alive (WebAudio) toggled for direct-speak
@@ -127,13 +138,17 @@ function createMockTTSClient(name: string): TTSClient {
     getVoices: vi.fn().mockResolvedValue([]),
     getGranularities: vi.fn().mockReturnValue(['word', 'sentence'] as TTSGranularity[]),
     getCapabilities: vi.fn().mockImplementation(() => ({
-      wordBoundaries: name === 'edge' || name === 'android-system-buffered',
-      mediaClock: name === 'edge' || name === 'android-system-buffered',
-      gapControl: name === 'edge' || name === 'android-system-buffered',
+      wordBoundaries:
+        name === 'edge' || name === 'android-system-buffered' || name === 'laptop-usb-supertonic',
+      mediaClock:
+        name === 'edge' || name === 'android-system-buffered' || name === 'laptop-usb-supertonic',
+      gapControl:
+        name === 'edge' || name === 'android-system-buffered' || name === 'laptop-usb-supertonic',
       liveRateChange: false,
       cacheable: name === 'edge',
       downloadable: name === 'edge',
-      measurableDurations: name === 'edge' || name === 'android-system-buffered',
+      measurableDurations:
+        name === 'edge' || name === 'android-system-buffered' || name === 'laptop-usb-supertonic',
     })),
     getVoiceId: vi.fn().mockReturnValue('voice-1'),
     getSpeakingLang: vi.fn().mockReturnValue('en'),
@@ -279,8 +294,11 @@ describe('TTSController', () => {
       const android = new TTSController(createMockAppService(true), mockView);
       const ios = new TTSController(createMockAppService(false, true), mockView);
 
+      expect(android.ttsLaptopUsbClient?.name).toBe('laptop-usb-supertonic');
       expect(android.ttsAndroidBufferedClient?.name).toBe('android-system-buffered');
+      expect(ios.ttsLaptopUsbClient).toBeNull();
       expect(ios.ttsAndroidBufferedClient).toBeNull();
+      expect(controller.ttsLaptopUsbClient).toBeNull();
       expect(controller.ttsAndroidBufferedClient).toBeNull();
     });
 
@@ -362,6 +380,41 @@ describe('TTSController', () => {
 
       expect(c.ttsAndroidBufferedClient!.init).toHaveBeenCalled();
       expect(c.ttsAndroidBufferedVoices).toEqual([bufferedVoice]);
+    });
+
+    test('initializes and records laptop USB voices on Android', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      const laptopVoice = {
+        id: 'laptop-usb:supertonic3:es:sid7',
+        name: 'Laptop Spanish',
+        lang: 'es-ES',
+      };
+      vi.mocked(c.ttsLaptopUsbClient!.getAllVoices).mockResolvedValue([laptopVoice]);
+
+      await c.init();
+
+      expect(c.ttsLaptopUsbClient!.init).toHaveBeenCalled();
+      expect(c.ttsLaptopUsbVoices).toEqual([laptopVoice]);
+      expect(c.ttsClient.name).toBe('edge');
+    });
+
+    test('keeps established engines when laptop USB init rejects', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      vi.mocked(c.ttsLaptopUsbClient!.init).mockRejectedValue(new Error('host unavailable'));
+
+      await expect(c.init()).resolves.toBeUndefined();
+
+      expect(c.ttsClient.name).toBe('edge');
+      expect(c.ttsLaptopUsbVoices).toEqual([]);
+    });
+
+    test('restores an explicitly preferred laptop USB client', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValue('laptop-usb-supertonic');
+      const c = new TTSController(createMockAppService(true), mockView);
+
+      await c.init();
+
+      expect(c.ttsClient.name).toBe('laptop-usb-supertonic');
     });
 
     test('restores an explicitly preferred buffered Android client', async () => {
@@ -561,6 +614,26 @@ describe('TTSController', () => {
       expect(TTSUtils.setPreferredClient).toHaveBeenCalledWith('android-system-buffered');
     });
 
+    test('switches to the laptop USB client for its namespaced voice', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      c.setParagraphGap(0.6);
+      c.ttsLaptopUsbVoices = [
+        {
+          id: 'laptop-usb:supertonic3:en:sid7',
+          name: 'Laptop voice',
+          lang: 'en-US',
+        },
+      ];
+
+      await c.setVoice('laptop-usb:supertonic3:en:sid7', 'en');
+
+      expect(c.ttsClient.name).toBe('laptop-usb-supertonic');
+      expect(c.ttsClient.setRate).toHaveBeenCalledWith(1);
+      expect(c.ttsClient.setParagraphGap).toHaveBeenCalledWith(0.6);
+      expect(TTSUtils.setPreferredClient).toHaveBeenCalledWith('laptop-usb-supertonic');
+    });
+
     test('waits for buffered native cancellation to drain before selecting direct speech', async () => {
       let finishDrain!: () => void;
       const drain = new Promise<void>((resolve) => {
@@ -670,6 +743,31 @@ describe('TTSController', () => {
 
       await expect(c.getVoices('en')).resolves.toEqual(bufferedVoices);
     });
+
+    test('lists laptop USB voices in their own group', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      const laptopVoices: TTSVoicesGroup[] = [
+        {
+          id: 'laptop-usb-supertonic',
+          name: 'Laptop — Supertonic 3 por USB',
+          voices: [
+            {
+              id: 'laptop-usb:supertonic3:en:sid7',
+              name: 'Laptop voice',
+              lang: 'en-US',
+            },
+          ],
+        },
+      ];
+      vi.mocked(c.ttsLaptopUsbClient!.getVoices).mockResolvedValue(laptopVoices);
+      vi.mocked(c.ttsAndroidBufferedClient!.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsNativeClient!.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsEdgeClient.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsWebClient.getVoices).mockResolvedValue([]);
+
+      await expect(c.getVoices('en')).resolves.toEqual(laptopVoices);
+    });
   });
 
   describe('getVoiceId', () => {
@@ -721,6 +819,15 @@ describe('TTSController', () => {
       await c.setPrimaryLang('es');
 
       expect(c.ttsAndroidBufferedClient!.setPrimaryLang).toHaveBeenCalledWith('es');
+    });
+
+    test('updates the initialized laptop USB client language', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      c.ttsLaptopUsbClient!.initialized = true;
+
+      await c.setPrimaryLang('es');
+
+      expect(c.ttsLaptopUsbClient!.setPrimaryLang).toHaveBeenCalledWith('es');
     });
 
     test('skips uninitialised clients', async () => {

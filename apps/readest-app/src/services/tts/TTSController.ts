@@ -19,6 +19,7 @@ import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
 import { BufferedTTSClient } from './BufferedTTSClient';
 import { AndroidSystemSpeechProvider } from './providers/android';
+import { LaptopUsbSpeechProvider } from './providers/laptopUsb';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { hydrateProvisionalDurations } from './ttsDuration';
 import { DownloadableSentence, SectionEnumerator, TTSDownloader } from './TTSDownloader';
@@ -177,11 +178,13 @@ export class TTSController extends EventTarget {
   ttsWebClient: TTSClient;
   ttsEdgeClient: EdgeTTSClient;
   ttsNativeClient: TTSClient | null = null;
+  ttsLaptopUsbClient: TTSClient | null = null;
   ttsAndroidBufferedClient: TTSClient | null = null;
   ttsMediaOverlayClient: MediaOverlayClient;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
   ttsNativeVoices: TTSVoice[] = [];
+  ttsLaptopUsbVoices: TTSVoice[] = [];
   ttsAndroidBufferedVoices: TTSVoice[] = [];
   ttsTargetLang: string = '';
 
@@ -203,6 +206,11 @@ export class TTSController extends EventTarget {
       this.ttsNativeClient = new NativeTTSClient(this);
     }
     if (appService?.isAndroidApp) {
+      this.ttsLaptopUsbClient = new BufferedTTSClient(
+        new LaptopUsbSpeechProvider(),
+        this,
+        appService,
+      );
       this.ttsAndroidBufferedClient = new BufferedTTSClient(
         new AndroidSystemSpeechProvider(),
         this,
@@ -412,6 +420,20 @@ export class TTSController extends EventTarget {
         // Edge/direct/web clients before the user has opted into this mode.
         console.warn('[TTS] Buffered Android system TTS unavailable', error);
         this.ttsAndroidBufferedVoices = [];
+      }
+    }
+    // Experimental and opt-in: laptop USB TTS is Android-only and remains
+    // after established engines so host availability never changes the
+    // implicit default.
+    if (this.ttsLaptopUsbClient) {
+      try {
+        if (await this.ttsLaptopUsbClient.init()) {
+          availableClients.push(this.ttsLaptopUsbClient);
+          this.ttsLaptopUsbVoices = await this.ttsLaptopUsbClient.getAllVoices();
+        }
+      } catch (error) {
+        console.warn('[TTS] Laptop USB TTS unavailable', error);
+        this.ttsLaptopUsbVoices = [];
       }
     }
     this.ttsClient = availableClients[0] || this.ttsWebClient;
@@ -1631,6 +1653,9 @@ export class TTSController extends EventTarget {
     if (this.ttsAndroidBufferedClient?.initialized) {
       this.ttsAndroidBufferedClient.setPrimaryLang(lang);
     }
+    if (this.ttsLaptopUsbClient?.initialized) {
+      this.ttsLaptopUsbClient.setPrimaryLang(lang);
+    }
     if (this.ttsMediaOverlayClient.initialized) this.ttsMediaOverlayClient.setPrimaryLang(lang);
   }
 
@@ -1647,6 +1672,7 @@ export class TTSController extends EventTarget {
     const ttsWebVoices = await this.ttsWebClient.getVoices(lang);
     const ttsEdgeVoices = await this.ttsEdgeClient.getVoices(lang);
     const ttsNativeVoices = (await this.ttsNativeClient?.getVoices(lang)) ?? [];
+    const ttsLaptopUsbVoices = (await this.ttsLaptopUsbClient?.getVoices(lang)) ?? [];
     const ttsAndroidBufferedVoices = (await this.ttsAndroidBufferedClient?.getVoices(lang)) ?? [];
     // The book's own narrator leads the list when there is one: it is the best
     // voice available for that book by a wide margin.
@@ -1657,6 +1683,7 @@ export class TTSController extends EventTarget {
     const voicesGroups = [
       ...narrationVoices,
       ...ttsNativeVoices,
+      ...ttsLaptopUsbVoices,
       ...ttsAndroidBufferedVoices,
       ...ttsEdgeVoices,
       ...ttsWebVoices,
@@ -1701,8 +1728,17 @@ export class TTSController extends EventTarget {
     const useAndroidBufferedTTS =
       voiceId !== '' &&
       !!this.ttsAndroidBufferedVoices.find((voice) => voice.id === voiceId && !voice.disabled);
+    const useLaptopUsbTTS =
+      voiceId !== '' &&
+      !!this.ttsLaptopUsbVoices.find((voice) => voice.id === voiceId && !voice.disabled);
     if (useEdgeTTS) {
       this.ttsClient = this.ttsEdgeClient;
+      await this.ttsClient.setRate(this.ttsRate);
+    } else if (useLaptopUsbTTS) {
+      if (!this.ttsLaptopUsbClient) {
+        throw new Error('Laptop USB TTS client is not available');
+      }
+      this.ttsClient = this.ttsLaptopUsbClient;
       await this.ttsClient.setRate(this.ttsRate);
     } else if (useAndroidBufferedTTS) {
       if (!this.ttsAndroidBufferedClient) {
@@ -2016,6 +2052,9 @@ export class TTSController extends EventTarget {
     }
     if (this.ttsAndroidBufferedClient?.initialized) {
       await this.ttsAndroidBufferedClient.shutdown();
+    }
+    if (this.ttsLaptopUsbClient?.initialized) {
+      await this.ttsLaptopUsbClient.shutdown();
     }
     if (this.ttsNativeClient?.initialized) {
       await this.ttsNativeClient.shutdown();
