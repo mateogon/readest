@@ -19,6 +19,7 @@ import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
 import { BufferedTTSClient } from './BufferedTTSClient';
 import { AndroidSystemSpeechProvider } from './providers/android';
+import { LaptopUsbSpeechProvider } from './providers/laptopUsb';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { hydrateProvisionalDurations } from './ttsDuration';
 import { DownloadableSentence, SectionEnumerator, TTSDownloader } from './TTSDownloader';
@@ -123,6 +124,10 @@ export class TTSController extends EventTarget {
   #preloadRunning = false;
   #preloadRunId = 0;
   #pendingPreloadCount: number | null = null;
+  // Invalidates a next-section warmup whose throwaway document is still being
+  // built. Natural auto-advance deliberately does not advance this epoch;
+  // manual navigation and configuration changes do.
+  #warmupEpoch = 0;
 
   #ttsSectionIndex: number = -1;
 
@@ -177,11 +182,13 @@ export class TTSController extends EventTarget {
   ttsWebClient: TTSClient;
   ttsEdgeClient: EdgeTTSClient;
   ttsNativeClient: TTSClient | null = null;
+  ttsLaptopUsbClient: TTSClient | null = null;
   ttsAndroidBufferedClient: TTSClient | null = null;
   ttsMediaOverlayClient: MediaOverlayClient;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
   ttsNativeVoices: TTSVoice[] = [];
+  ttsLaptopUsbVoices: TTSVoice[] = [];
   ttsAndroidBufferedVoices: TTSVoice[] = [];
   ttsTargetLang: string = '';
 
@@ -203,6 +210,11 @@ export class TTSController extends EventTarget {
       this.ttsNativeClient = new NativeTTSClient(this);
     }
     if (appService?.isAndroidApp) {
+      this.ttsLaptopUsbClient = new BufferedTTSClient(
+        new LaptopUsbSpeechProvider(),
+        this,
+        appService,
+      );
       this.ttsAndroidBufferedClient = new BufferedTTSClient(
         new AndroidSystemSpeechProvider(),
         this,
@@ -414,6 +426,20 @@ export class TTSController extends EventTarget {
         this.ttsAndroidBufferedVoices = [];
       }
     }
+    // Experimental and opt-in: laptop USB TTS is Android-only and remains
+    // after established engines so host availability never changes the
+    // implicit default.
+    if (this.ttsLaptopUsbClient) {
+      try {
+        if (await this.ttsLaptopUsbClient.init()) {
+          availableClients.push(this.ttsLaptopUsbClient);
+          this.ttsLaptopUsbVoices = await this.ttsLaptopUsbClient.getAllVoices();
+        }
+      } catch (error) {
+        console.warn('[TTS] Laptop USB TTS unavailable', error);
+        this.ttsLaptopUsbVoices = [];
+      }
+    }
     this.ttsClient = availableClients[0] || this.ttsWebClient;
     const preferredClientName = TTSUtils.getPreferredClient();
     if (preferredClientName) {
@@ -422,6 +448,16 @@ export class TTSController extends EventTarget {
       );
       if (preferredClient) {
         this.ttsClient = preferredClient;
+      } else if (preferredClientName === this.ttsLaptopUsbClient?.name) {
+        // USB is an optional transport for the same reading workflow. When it
+        // is absent at startup, keep the laptop preference for the next
+        // connected session but speak locally through Reading TTS Android.
+        if (
+          this.ttsAndroidBufferedClient &&
+          availableClients.includes(this.ttsAndroidBufferedClient)
+        ) {
+          this.ttsClient = this.ttsAndroidBufferedClient;
+        }
       }
     }
     this.ttsWebVoices = await this.ttsWebClient.getAllVoices();
@@ -1089,6 +1125,7 @@ export class TTSController extends EventTarget {
     this.#preloadRunning = false;
     this.#pendingPreloadCount = null;
     this.#preloadRunId += 1;
+    this.#warmupEpoch += 1;
   }
 
   async preloadSSML(
@@ -1179,12 +1216,18 @@ export class TTSController extends EventTarget {
     anchor: Range | undefined,
     signal: AbortSignal,
     streamState: { highestYieldedBlockOffset: number },
+    onSourceExhausted?: () => void,
+    granularity: TTSGranularity = this.#ttsGranularity,
   ): AsyncGenerator<TTSBlockInput> {
     if (signal.aborted) return;
     streamState.highestYieldedBlockOffset = 0;
     yield { blockOffset: 0, ssml: currentSSML };
-    if (!doc || !anchor || signal.aborted) return;
+    if (!doc || !anchor || signal.aborted) {
+      if (!signal.aborted) onSourceExhausted?.();
+      return;
+    }
 
+    let sourceExhausted = false;
     try {
       const { TTS } = await import('foliate-js/tts.js');
       const { textWalker } = await import('foliate-js/text-walker.js');
@@ -1194,7 +1237,7 @@ export class TTSController extends EventTarget {
         textWalker,
         createTTSNodeFilter(),
         () => {},
-        this.#ttsGranularity,
+        granularity,
         DEFAULT_TTS_MAX_SEGMENT_CHARS,
       );
       // Position on the live block without using the returned current SSML:
@@ -1204,7 +1247,10 @@ export class TTSController extends EventTarget {
       for (let blockOffset = 1; ; blockOffset++) {
         if (signal.aborted) return;
         const rawSSML = shadow.next();
-        if (rawSSML === undefined) return;
+        if (rawSSML === undefined) {
+          sourceExhausted = true;
+          return;
+        }
         const ssml = await this.#preprocessSSML(rawSSML);
         if (signal.aborted) return;
         // Preserve empty preprocessed blocks in the logical stream. A client
@@ -1215,7 +1261,71 @@ export class TTSController extends EventTarget {
       }
     } catch (error) {
       console.warn('[TTS] Unable to enumerate streamed SSML blocks', error);
+    } finally {
+      if (sourceExhausted && !signal.aborted) onSourceExhausted?.();
     }
+  }
+
+  async *#warmupNextSectionBlocks(
+    client: TTSClient,
+    sourceSectionIndex: number,
+    epoch: number,
+  ): AsyncGenerator<TTSBlockInput> {
+    const nextSectionIndex = sourceSectionIndex + 1;
+    const section = this.view.book.sections?.[nextSectionIndex];
+    if (!section?.createDocument || this.narrationActive) return;
+
+    // Build a throwaway source exactly like the live section initializer. It
+    // never replaces view.tts, so current-section highlights and cursor state
+    // remain owned by the active session while the chapter is still audible.
+    const doc = await this.#createSectionDoc(section);
+    if (
+      this.#warmupEpoch !== epoch ||
+      (this.#ttsSectionIndex !== sourceSectionIndex &&
+        this.#ttsSectionIndex !== nextSectionIndex) ||
+      this.ttsClient !== client
+    ) {
+      return;
+    }
+
+    const { TTS } = await import('foliate-js/tts.js');
+    const { textWalker } = await import('foliate-js/text-walker.js');
+    let granularity: TTSGranularity = this.view.language.isCJK ? 'sentence' : 'word';
+    const supportedGranularities = client.getGranularities();
+    if (!supportedGranularities.includes(granularity)) {
+      granularity = supportedGranularities[0]!;
+    }
+    const tts = new TTS(
+      doc,
+      textWalker,
+      createTTSNodeFilter(),
+      () => {},
+      granularity,
+      DEFAULT_TTS_MAX_SEGMENT_CHARS,
+    );
+    const firstSSML = await this.#preprocessSSML(tts.start());
+    if (!firstSSML) return;
+    const anchor = tts.getLastRange?.();
+    const sourceState = { highestYieldedBlockOffset: -1 };
+    // This source has no controller speak signal on purpose. The buffered
+    // client owns warmup cancellation through invalidateSynthesis(), which
+    // lets it survive the current session's natural handover abort.
+    yield* this.#streamSSMLBlocks(
+      firstSSML,
+      doc,
+      anchor,
+      new AbortController().signal,
+      sourceState,
+      undefined,
+      granularity,
+    );
+  }
+
+  #startNextSectionWarmup(client: TTSClient, sourceSectionIndex: number, epoch: number): void {
+    if (!client.warmupBlocks || !client.supportsBlockStreaming?.()) return;
+    void client
+      .warmupBlocks(this.#warmupNextSectionBlocks(client, sourceSectionIndex, epoch))
+      .catch((error) => console.warn('[TTS] Next-section warmup failed', error));
   }
 
   #commitStreamedBlockOffset(
@@ -1331,6 +1441,8 @@ export class TTSController extends EventTarget {
         let streamedBlocks: AsyncIterable<TTSBlockInput> | null = null;
         let streamedLiveTts: FoliateView['tts'] = null;
         const blockStreamState = { highestYieldedBlockOffset: -1 };
+        const sourceSectionIndex = this.#ttsSectionIndex;
+        const warmupEpoch = this.#warmupEpoch;
         if (!oneTime) {
           if (!plainText || marks.length === 0) {
             resolve();
@@ -1353,6 +1465,11 @@ export class TTSController extends EventTarget {
               liveTts?.getLastRange?.(),
               signal,
               blockStreamState,
+              () => {
+                if (!this.stopAtChapterEnd) {
+                  this.#startNextSectionWarmup(sessionClient, sourceSectionIndex, warmupEpoch);
+                }
+              },
             );
           } else {
             this.dispatchSpeakMark(marks[0]);
@@ -1600,10 +1717,16 @@ export class TTSController extends EventTarget {
     const ssml = byMark ? this.#getTts()?.nextMark(!isPlaying) : this.#getTts()?.next(!isPlaying);
     if (!ssml) {
       if (isAutoAdvance) {
-        // A new document/section has different mark ownership. Same-section
-        // auto-advance keeps its buffer, but cross-section work must not.
-        this.#cancelPreloads();
-        this.ttsClient.invalidateSynthesis?.();
+        // A streamed client may have warmed the next section with the same
+        // composite requests the new session will acquire. Keep that work for
+        // the natural handover; clients without this contract retain the old
+        // invalidation behavior for cross-section mark ownership.
+        const preserveStreamWarmup =
+          !!this.ttsClient.warmupBlocks && this.#supportsBlockStreaming();
+        if (!preserveStreamWarmup) {
+          this.#cancelPreloads();
+          this.ttsClient.invalidateSynthesis?.();
+        }
       }
       if (isAutoAdvance && isPlaying && this.stopAtChapterEnd) {
         return await this.#stopAtChapterBoundary();
@@ -1631,6 +1754,9 @@ export class TTSController extends EventTarget {
     if (this.ttsAndroidBufferedClient?.initialized) {
       this.ttsAndroidBufferedClient.setPrimaryLang(lang);
     }
+    if (this.ttsLaptopUsbClient?.initialized) {
+      this.ttsLaptopUsbClient.setPrimaryLang(lang);
+    }
     if (this.ttsMediaOverlayClient.initialized) this.ttsMediaOverlayClient.setPrimaryLang(lang);
   }
 
@@ -1647,6 +1773,7 @@ export class TTSController extends EventTarget {
     const ttsWebVoices = await this.ttsWebClient.getVoices(lang);
     const ttsEdgeVoices = await this.ttsEdgeClient.getVoices(lang);
     const ttsNativeVoices = (await this.ttsNativeClient?.getVoices(lang)) ?? [];
+    const ttsLaptopUsbVoices = (await this.ttsLaptopUsbClient?.getVoices(lang)) ?? [];
     const ttsAndroidBufferedVoices = (await this.ttsAndroidBufferedClient?.getVoices(lang)) ?? [];
     // The book's own narrator leads the list when there is one: it is the best
     // voice available for that book by a wide margin.
@@ -1657,6 +1784,7 @@ export class TTSController extends EventTarget {
     const voicesGroups = [
       ...narrationVoices,
       ...ttsNativeVoices,
+      ...ttsLaptopUsbVoices,
       ...ttsAndroidBufferedVoices,
       ...ttsEdgeVoices,
       ...ttsWebVoices,
@@ -1701,8 +1829,17 @@ export class TTSController extends EventTarget {
     const useAndroidBufferedTTS =
       voiceId !== '' &&
       !!this.ttsAndroidBufferedVoices.find((voice) => voice.id === voiceId && !voice.disabled);
+    const useLaptopUsbTTS =
+      voiceId !== '' &&
+      !!this.ttsLaptopUsbVoices.find((voice) => voice.id === voiceId && !voice.disabled);
     if (useEdgeTTS) {
       this.ttsClient = this.ttsEdgeClient;
+      await this.ttsClient.setRate(this.ttsRate);
+    } else if (useLaptopUsbTTS) {
+      if (!this.ttsLaptopUsbClient) {
+        throw new Error('Laptop USB TTS client is not available');
+      }
+      this.ttsClient = this.ttsLaptopUsbClient;
       await this.ttsClient.setRate(this.ttsRate);
     } else if (useAndroidBufferedTTS) {
       if (!this.ttsAndroidBufferedClient) {
@@ -1742,6 +1879,10 @@ export class TTSController extends EventTarget {
   }
 
   setTargetLang(lang: string) {
+    if (lang !== this.ttsTargetLang) {
+      this.#cancelPreloads();
+      this.ttsClient.invalidateSynthesis?.();
+    }
     this.ttsTargetLang = lang;
   }
 
@@ -2016,6 +2157,9 @@ export class TTSController extends EventTarget {
     }
     if (this.ttsAndroidBufferedClient?.initialized) {
       await this.ttsAndroidBufferedClient.shutdown();
+    }
+    if (this.ttsLaptopUsbClient?.initialized) {
+      await this.ttsLaptopUsbClient.shutdown();
     }
     if (this.ttsNativeClient?.initialized) {
       await this.ttsNativeClient.shutdown();

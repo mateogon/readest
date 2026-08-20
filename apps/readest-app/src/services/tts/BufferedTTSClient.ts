@@ -63,6 +63,18 @@ const ANDROID_STARTUP_BUFFER_SEC = 20;
 const ANDROID_REFILL_BUFFER_SEC = 12;
 const ANDROID_MAX_PENDING_VISIBLE = 5;
 const ANDROID_MAX_PENDING_HIDDEN = 8;
+// Provider duration includes the leading/trailing silence that the WebAudio
+// path trims. Count only a conservative usable fraction for warmup coverage,
+// then measure the result at the active playback rate. This keeps the target
+// at the existing 20-second reservoir without pretending that rate-1 audio
+// seconds equal audible post-trim seconds.
+const STREAMED_WARMUP_USABLE_AUDIO_FRACTION = 0.8;
+const STREAMED_WARMUP_MAX_RATE = 3;
+const STREAMED_WARMUP_BATCH_OVERSHOOT_SEC = 15;
+const STREAMED_WARMUP_CACHE_DURATION_SEC = Math.ceil(
+  (ANDROID_STARTUP_BUFFER_SEC / STREAMED_WARMUP_USABLE_AUDIO_FRACTION) * STREAMED_WARMUP_MAX_RATE +
+    STREAMED_WARMUP_BATCH_OVERSHOOT_SEC,
+);
 
 // How many consecutive unreachable sentences (offline with nothing cached, or
 // a persistent service failure) to skip before stopping. A cached chapter
@@ -181,6 +193,18 @@ export class BufferedTTSClient implements TTSClient {
   #chunkMeta: Array<ChunkMeta | undefined> = [];
   #firstRetainedChunkMeta = 0;
   #activeLogicalMeta: { chunkIndex: number; meta: LogicalChunkMeta } | null = null;
+  // The next-section warmup is synthesis-only. It has its own cancellation
+  // scope because the current speak signal is aborted during every handover,
+  // including the compatible natural auto-advance that must retain this work.
+  #warmupAbortController: AbortController | null = null;
+  #warmupRunId = 0;
+  #warmupMetrics = {
+    targetSec: ANDROID_STARTUP_BUFFER_SEC,
+    completedSec: 0,
+    requests: 0,
+    audioSec: 0,
+    rate: 1,
+  };
   #isPlaying = false;
   #wordTrackingRafId: number | null = null;
   readonly #compositeMetrics: CompositeMetrics = {
@@ -213,6 +237,12 @@ export class BufferedTTSClient implements TTSClient {
     this.provider = provider;
     this.#synthesisCoordinator = new SynthesisCoordinator(provider, {
       concurrency: provider.synthesisConcurrency,
+      ...(provider.cacheable === false &&
+      provider.compositeBoundaries?.textOffsets === 'utf16' &&
+      provider.compositeBoundaries.audioTiming === 'estimated' &&
+      this.#player instanceof WebAudioPlayer
+        ? { maxCacheDurationSec: STREAMED_WARMUP_CACHE_DURATION_SEC }
+        : {}),
     });
     this.name = provider.id;
     this.controller = controller;
@@ -335,6 +365,92 @@ export class BufferedTTSClient implements TTSClient {
       transitionFromPrevious,
       progress,
     );
+  }
+
+  async warmupBlocks(blocks: AsyncIterable<TTSBlockInput>): Promise<void> {
+    if (!this.supportsBlockStreaming()) return;
+
+    this.#warmupAbortController?.abort();
+    const runId = ++this.#warmupRunId;
+    const warmupController = new AbortController();
+    this.#warmupAbortController = warmupController;
+    const { signal } = warmupController;
+    const generation = this.#synthesisCoordinator.generation;
+    const progress: StreamProgress = {
+      highestSeenBlockOffset: -1,
+      sourceExhausted: false,
+    };
+    let warmedAudioSec = 0;
+    this.#warmupMetrics = {
+      targetSec: ANDROID_STARTUP_BUFFER_SEC,
+      completedSec: 0,
+      requests: 0,
+      audioSec: 0,
+      rate: this.#effectiveRate(),
+    };
+
+    try {
+      const units = this.#streamCompositeUnits(blocks, signal, generation, progress, false);
+      for await (const batch of planTTSCompositeBatches(units)) {
+        if (signal.aborted || generation !== this.#synthesisCoordinator.generation) return;
+
+        // Keep this request selection identical to #runScheduler: a one-mark
+        // batch is an individual provider request, while a multi-mark batch is
+        // the composite request that playback will acquire later.
+        const firstUnit = batch.logicalUnits[0]!;
+        const request =
+          batch.logicalUnits.length > 1
+            ? batch.request
+            : {
+                lang: batch.request.lang,
+                text: firstUnit.mark.text,
+                voice: batch.request.voice,
+                pitch: batch.request.pitch,
+              };
+        const audio = await this.#synthesize(request, signal, 'warmup', generation);
+        if (!audio) continue;
+        if (batch.logicalUnits.length === 1) {
+          this.#recordDurations(request.voice, firstUnit.mark.text, audio.boundaries);
+        }
+        const audioDurationSec = this.#warmupAudioDurationSec(audio.durationSec, audio.boundaries);
+        warmedAudioSec += audioDurationSec;
+        const rate = this.#effectiveRate();
+        const completedSec = (warmedAudioSec * STREAMED_WARMUP_USABLE_AUDIO_FRACTION) / rate;
+        this.#warmupMetrics = {
+          targetSec: ANDROID_STARTUP_BUFFER_SEC,
+          completedSec,
+          requests: this.#warmupMetrics.requests + 1,
+          audioSec: warmedAudioSec,
+          rate,
+        };
+        if (completedSec >= ANDROID_STARTUP_BUFFER_SEC) return;
+      }
+    } catch (error) {
+      if (!signal.aborted && generation === this.#synthesisCoordinator.generation) {
+        console.warn('Error warming next streamed TTS section', error);
+      }
+    } finally {
+      if (this.#warmupRunId === runId) this.#warmupAbortController = null;
+    }
+  }
+
+  #effectiveRate(): number {
+    return Number.isFinite(this.#rate) && this.#rate > 0 ? this.#rate : 1;
+  }
+
+  #warmupAudioDurationSec(durationSec: number | undefined, boundaries: TTSWordBoundary[]): number {
+    if (typeof durationSec === 'number' && Number.isFinite(durationSec) && durationSec > 0) {
+      return durationSec;
+    }
+    const boundaryDurationSec = boundaries.reduce(
+      (max, boundary) => Math.max(max, (boundary.offset + boundary.duration) / TICKS_PER_SECOND),
+      0,
+    );
+    if (boundaryDurationSec > 0) return boundaryDurationSec;
+    // Without provider duration or boundary timing there is no measurable
+    // coverage. Continue warming available blocks, but never claim coverage
+    // from a planner estimate that may exceed the real audio.
+    return 0;
   }
 
   async *#speakSession(
@@ -568,6 +684,7 @@ export class BufferedTTSClient implements TTSClient {
     signal: AbortSignal,
     generation: number,
     progress: StreamProgress,
+    updateCurrentVoice = true,
   ): AsyncGenerator<TTSCompositeUnit> {
     let previousBlockOffset = -1;
     let completed = false;
@@ -590,6 +707,7 @@ export class BufferedTTSClient implements TTSClient {
           const mark = marks[index]!;
           const voice = await this.getVoiceIdFromLang(mark.language);
           if (signal.aborted || generation !== this.#synthesisCoordinator.generation) return;
+          if (updateCurrentVoice) this.#currentVoiceId = voice;
           yield {
             blockOffset: block.blockOffset,
             mark,
@@ -1201,6 +1319,9 @@ export class BufferedTTSClient implements TTSClient {
   }
 
   invalidateSynthesis(): void {
+    this.#warmupAbortController?.abort();
+    this.#warmupAbortController = null;
+    this.#warmupRunId += 1;
     this.#synthesisCoordinator.advanceGeneration();
     this.#logSynthesisMetrics('invalidate');
   }
@@ -1218,6 +1339,7 @@ export class BufferedTTSClient implements TTSClient {
               ...this.#compositeMetrics,
               fallbackReasons: { ...this.#compositeMetrics.fallbackReasons },
             },
+            warmup: { ...this.#warmupMetrics },
           }
         : {}),
       ...(this.#player instanceof WebAudioPlayer

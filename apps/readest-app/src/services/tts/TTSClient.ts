@@ -38,6 +38,13 @@ export interface TTSBlockInput {
 
 export interface TTSRuntimeMetrics extends SynthesisCoordinatorMetrics {
   playback?: WebAudioPlayerDiagnostics;
+  warmup?: {
+    targetSec: number;
+    completedSec: number;
+    requests: number;
+    audioSec: number;
+    rate: number;
+  };
 }
 
 // What the active engine can actually do, so the controller and UI degrade
@@ -87,6 +94,11 @@ export interface TTSClient {
     signal: AbortSignal,
     transitionFromPrevious?: TTSPlaybackTransition,
   ): AsyncIterable<TTSMessageEvent>;
+  // Synthesize the first part of a compatible streamed section into the
+  // coordinator's short-lived in-memory retention. This is deliberately not
+  // a playback path: the next speakBlocks() call reuses the same composite
+  // requests and the existing player remains the sole playout owner.
+  warmupBlocks?(blocks: AsyncIterable<TTSBlockInput>): Promise<void>;
   pause(): Promise<boolean>;
   resume(): Promise<boolean>;
   // `handover` marks the stop the controller performs between two consecutive

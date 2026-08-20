@@ -90,6 +90,10 @@ type CompositeMode =
 const makeProvider = (
   mode: CompositeMode,
   sourceCount: () => number,
+  audioDurationSec = 2.4,
+  individualAudioDurationSec = 1,
+  omitDuration = false,
+  individualBoundaries = false,
 ): { provider: SpeechProvider; individualSourceCounts: number[] } => {
   const individualSourceCounts: number[] = [];
   const synthesize = vi.fn(
@@ -107,14 +111,14 @@ const makeProvider = (
                   : 1,
           ),
           boundaries: mode === 'missing-boundaries' ? [] : validCompositeBoundaries(request),
-          durationSec: 2.4,
+          durationSec: omitDuration ? undefined : audioDurationSec,
         };
       }
       individualSourceCounts.push(sourceCount());
       return {
         audio: taggedAudio(4),
-        boundaries: [],
-        durationSec: 1,
+        boundaries: individualBoundaries ? validCompositeBoundaries(request) : [],
+        durationSec: omitDuration ? undefined : individualAudioDurationSec,
       };
     },
   );
@@ -187,7 +191,14 @@ describe('BufferedTTSClient streamed composite playback', () => {
     vi.unstubAllGlobals();
   });
 
-  const startClient = async (mode: CompositeMode, sampleRate: number) => {
+  const startClient = async (
+    mode: CompositeMode,
+    sampleRate: number,
+    audioDurationSec = 2.4,
+    individualAudioDurationSec = 1,
+    omitDuration = false,
+    individualBoundaries = false,
+  ) => {
     let releaseDecode: () => void = () => {};
     const decodeGate = new Promise<void>((resolve) => {
       releaseDecode = resolve;
@@ -217,6 +228,10 @@ describe('BufferedTTSClient streamed composite playback', () => {
     const { provider, individualSourceCounts } = makeProvider(
       mode,
       () => FakeAudioContext.instances[0]?.sources.length ?? 0,
+      audioDurationSec,
+      individualAudioDurationSec,
+      omitDuration,
+      individualBoundaries,
     );
     const controller = {
       dispatchSpeakMark: vi.fn(),
@@ -228,6 +243,8 @@ describe('BufferedTTSClient streamed composite playback', () => {
     const ctx = () => FakeAudioContext.instances[0]!;
     return { client, provider, individualSourceCounts, controller, ctx, decode, releaseDecode };
   };
+
+  const warmupMetrics = (client: BufferedClient) => client.getSynthesisMetrics().warmup!;
 
   test('requires explicit composite capability instead of an engine identity check', async () => {
     const { client, provider } = await startClient('valid', 24_000);
@@ -515,5 +532,218 @@ describe('BufferedTTSClient streamed composite playback', () => {
     expect(run.events).toEqual([
       { code: 'error', message: 'Invalid streamed TTS block offset: 2' },
     ]);
+  });
+
+  test('reuses the exact composite request warmed for the next chapter', async () => {
+    const { client, provider, ctx } = await startClient('valid', 24_000);
+    const nextChapter = blocks([
+      { blockOffset: 0, text: textA },
+      { blockOffset: 1, text: textB },
+    ]);
+
+    await client.warmupBlocks!(nextChapter);
+    expect(provider.synthesize).toHaveBeenCalledTimes(1);
+    expect(provider.synthesize).toHaveBeenLastCalledWith(
+      expect.objectContaining({ text: `${textA}\n\n${textB}` }),
+      expect.any(AbortSignal),
+      expect.any(Object),
+    );
+
+    const run = collect(
+      client,
+      blocks([
+        { blockOffset: 0, text: textA },
+        { blockOffset: 1, text: textB },
+      ]),
+    );
+    await vi.waitFor(() => expect(audibleSources(ctx())).toHaveLength(1));
+    expect(provider.synthesize).toHaveBeenCalledTimes(1);
+    expect(client.getSynthesisMetrics()).toMatchObject({ hits: 1, misses: 1 });
+
+    await drain(ctx(), run.done);
+  });
+
+  test('does not stop after one inflated estimate when real audio is short', async () => {
+    // Force the planner's voice estimate far above the provider's real result.
+    // Warmup must use the returned duration instead of declaring 20 seconds
+    // covered by this first, overestimated individual request.
+    localStorage.setItem(
+      'readest-tts-voice-cps',
+      JSON.stringify({ 'voice-a': { chars: 1, secs: 1, n: 1 } }),
+    );
+    const { client, provider } = await startClient('valid', 24_000, 4, 4);
+    const input = Array.from({ length: 8 }, (_, blockOffset) => ({
+      blockOffset,
+      text: `${blockOffset}${'x'.repeat(60)}`,
+    }));
+
+    await client.warmupBlocks!(blocks(input));
+
+    expect(provider.synthesize).toHaveBeenCalledTimes(7);
+    expect(warmupMetrics(client)).toMatchObject({
+      targetSec: 20,
+      requests: 7,
+      audioSec: 28,
+      rate: 1,
+    });
+    expect(warmupMetrics(client).completedSec).toBeCloseTo(22.4, 6);
+  });
+
+  test('uses short boundaries instead of an inflated estimate when duration is absent', async () => {
+    localStorage.setItem(
+      'readest-tts-voice-cps',
+      JSON.stringify({ 'voice-a': { chars: 1, secs: 1, n: 1 } }),
+    );
+    const { client, provider } = await startClient('valid', 24_000, 2.4, 1, true, true);
+    const input = Array.from({ length: 8 }, (_, blockOffset) => ({
+      blockOffset,
+      text: `${blockOffset}${'x'.repeat(60)}`,
+    }));
+
+    await client.warmupBlocks!(blocks(input));
+
+    // Each boundary measures less than one second, so the inflated planner
+    // estimate must not stop warmup after the first request.
+    expect(provider.synthesize).toHaveBeenCalledTimes(8);
+    expect(warmupMetrics(client)).toMatchObject({
+      targetSec: 20,
+      requests: 8,
+      rate: 1,
+    });
+    expect(warmupMetrics(client).audioSec).toBeCloseTo(6.4, 6);
+    expect(warmupMetrics(client).completedSec).toBeCloseTo(5.12, 6);
+  });
+
+  test('warms enough base audio for at least 20 reproducible seconds at 2x', async () => {
+    const { client, provider } = await startClient('valid', 24_000);
+    await client.setRate(2);
+    const input = Array.from({ length: 80 }, (_, blockOffset) => ({
+      blockOffset,
+      text: `${blockOffset}${'x'.repeat(78)}`,
+    }));
+
+    await client.warmupBlocks!(blocks(input));
+
+    const metrics = warmupMetrics(client);
+    expect(metrics.rate).toBe(2);
+    expect(metrics.completedSec).toBeGreaterThanOrEqual(20);
+    expect(metrics.audioSec).toBeGreaterThanOrEqual(50);
+    expect(metrics.requests).toBe(vi.mocked(provider.synthesize).mock.calls.length);
+    expect(metrics.requests).toBeLessThan(input.length / 2);
+  });
+
+  test('does not over-generate at a low playback rate', async () => {
+    const { client, provider } = await startClient('valid', 24_000, 13);
+    await client.setRate(0.5);
+
+    await client.warmupBlocks!(
+      blocks([
+        { blockOffset: 0, text: textA },
+        { blockOffset: 1, text: textB },
+      ]),
+    );
+
+    expect(provider.synthesize).toHaveBeenCalledTimes(1);
+    expect(warmupMetrics(client)).toMatchObject({
+      targetSec: 20,
+      completedSec: 20.8,
+      requests: 1,
+      audioSec: 13,
+      rate: 0.5,
+    });
+  });
+
+  test('retains the first batch through a 3x warmup target and overshoot', async () => {
+    const { client, provider, ctx } = await startClient('valid', 24_000);
+    await client.setRate(3);
+    const input = Array.from({ length: 100 }, (_, blockOffset) => ({
+      blockOffset,
+      text: `${blockOffset}${'x'.repeat(50)}`,
+    }));
+
+    await client.warmupBlocks!(blocks(input));
+    const warmupCallCount = vi.mocked(provider.synthesize).mock.calls.length;
+    const metrics = warmupMetrics(client);
+    expect(metrics.rate).toBe(3);
+    expect(metrics.completedSec).toBeGreaterThanOrEqual(20);
+    expect(metrics.audioSec).toBeLessThanOrEqual(90);
+
+    const run = collect(client, blocks(input.slice(0, 2)));
+    await vi.waitFor(() => expect(audibleSources(ctx())).toHaveLength(1));
+    expect(provider.synthesize).toHaveBeenCalledTimes(warmupCallCount);
+    expect(client.getSynthesisMetrics()).toMatchObject({
+      hits: 1,
+      composite: { compositeRequests: 1, compositesScheduled: 1, fallbackSessions: 0 },
+    });
+    await drain(ctx(), run.done);
+  });
+
+  test('keeps warmup across a natural handover without lowering the startup reservoir', async () => {
+    const { client, provider, ctx } = await startClient('valid', 24_000);
+    const chapter = [
+      { blockOffset: 0, text: textA },
+      { blockOffset: 1, text: textB },
+    ];
+    await client.warmupBlocks!(blocks(chapter));
+    await client.stop(true);
+
+    const run = collect(client, blocks(chapter));
+    await vi.waitFor(() => expect(audibleSources(ctx())).toHaveLength(1));
+    expect(provider.synthesize).toHaveBeenCalledTimes(1);
+    await drain(ctx(), run.done);
+  });
+
+  test('discards warmup on an incompatible synthesis generation', async () => {
+    const { client, provider, ctx } = await startClient('valid', 24_000);
+    const chapter = [
+      { blockOffset: 0, text: textA },
+      { blockOffset: 1, text: textB },
+    ];
+    await client.warmupBlocks!(blocks(chapter));
+    client.invalidateSynthesis();
+
+    const run = collect(client, blocks(chapter));
+    await vi.waitFor(() => expect(audibleSources(ctx())).toHaveLength(1));
+    expect(provider.synthesize).toHaveBeenCalledTimes(2);
+    await drain(ctx(), run.done);
+  });
+
+  test('does not retain a stale warmup after invalidation aborts its provider lease', async () => {
+    const { client, provider, ctx } = await startClient('valid', 24_000);
+    const chapter = [
+      { blockOffset: 0, text: textA },
+      { blockOffset: 1, text: textB },
+    ];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.mocked(provider.synthesize).mockImplementationOnce(async (request) => {
+      await gate;
+      return {
+        audio: taggedAudio(1),
+        boundaries: validCompositeBoundaries(request),
+        durationSec: 2.4,
+      };
+    });
+
+    const warmup = client.warmupBlocks!(blocks(chapter));
+    await vi.waitFor(() => expect(provider.synthesize).toHaveBeenCalledTimes(1));
+    client.invalidateSynthesis();
+    release();
+    await warmup;
+
+    const run = collect(client, blocks(chapter));
+    await vi.waitFor(() => expect(audibleSources(ctx())).toHaveLength(1));
+    expect(provider.synthesize).toHaveBeenCalledTimes(2);
+    await drain(ctx(), run.done);
+  });
+
+  test('finishes a short next chapter warmup without waiting for more blocks', async () => {
+    const { client, provider } = await startClient('valid', 24_000);
+
+    await client.warmupBlocks!(blocks([{ blockOffset: 0, text: textA }]));
+
+    expect(provider.synthesize).toHaveBeenCalledTimes(1);
   });
 });

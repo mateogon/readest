@@ -31,15 +31,26 @@ vi.mock('@/services/tts/NativeTTSClient', () => ({
 }));
 
 vi.mock('@/services/tts/BufferedTTSClient', () => ({
-  BufferedTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
-    Object.assign(this, createMockTTSClient('android-system-buffered'), {
+  BufferedTTSClient: vi.fn().mockImplementation(function (
+    this: Record<string, unknown>,
+    provider: { id?: string },
+  ) {
+    Object.assign(this, createMockTTSClient(provider.id ?? 'android-system-buffered'), {
       setParagraphGap: vi.fn(),
     });
   }),
 }));
 
 vi.mock('@/services/tts/providers/android', () => ({
-  AndroidSystemSpeechProvider: vi.fn(),
+  AndroidSystemSpeechProvider: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
+    this['id'] = 'android-system-buffered';
+  }),
+}));
+
+vi.mock('@/services/tts/providers/laptopUsb', () => ({
+  LaptopUsbSpeechProvider: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
+    this['id'] = 'laptop-usb-supertonic';
+  }),
 }));
 
 // Track the inaudible background keep-alive (WebAudio) toggled for direct-speak
@@ -127,13 +138,17 @@ function createMockTTSClient(name: string): TTSClient {
     getVoices: vi.fn().mockResolvedValue([]),
     getGranularities: vi.fn().mockReturnValue(['word', 'sentence'] as TTSGranularity[]),
     getCapabilities: vi.fn().mockImplementation(() => ({
-      wordBoundaries: name === 'edge' || name === 'android-system-buffered',
-      mediaClock: name === 'edge' || name === 'android-system-buffered',
-      gapControl: name === 'edge' || name === 'android-system-buffered',
+      wordBoundaries:
+        name === 'edge' || name === 'android-system-buffered' || name === 'laptop-usb-supertonic',
+      mediaClock:
+        name === 'edge' || name === 'android-system-buffered' || name === 'laptop-usb-supertonic',
+      gapControl:
+        name === 'edge' || name === 'android-system-buffered' || name === 'laptop-usb-supertonic',
       liveRateChange: false,
       cacheable: name === 'edge',
       downloadable: name === 'edge',
-      measurableDurations: name === 'edge' || name === 'android-system-buffered',
+      measurableDurations:
+        name === 'edge' || name === 'android-system-buffered' || name === 'laptop-usb-supertonic',
     })),
     getVoiceId: vi.fn().mockReturnValue('voice-1'),
     getSpeakingLang: vi.fn().mockReturnValue('en'),
@@ -279,8 +294,11 @@ describe('TTSController', () => {
       const android = new TTSController(createMockAppService(true), mockView);
       const ios = new TTSController(createMockAppService(false, true), mockView);
 
+      expect(android.ttsLaptopUsbClient?.name).toBe('laptop-usb-supertonic');
       expect(android.ttsAndroidBufferedClient?.name).toBe('android-system-buffered');
+      expect(ios.ttsLaptopUsbClient).toBeNull();
       expect(ios.ttsAndroidBufferedClient).toBeNull();
+      expect(controller.ttsLaptopUsbClient).toBeNull();
       expect(controller.ttsAndroidBufferedClient).toBeNull();
     });
 
@@ -362,6 +380,52 @@ describe('TTSController', () => {
 
       expect(c.ttsAndroidBufferedClient!.init).toHaveBeenCalled();
       expect(c.ttsAndroidBufferedVoices).toEqual([bufferedVoice]);
+    });
+
+    test('initializes and records laptop USB voices on Android', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      const laptopVoice = {
+        id: 'laptop-usb:supertonic3:es:sid8',
+        name: 'Laptop Spanish',
+        lang: 'es-ES',
+      };
+      vi.mocked(c.ttsLaptopUsbClient!.getAllVoices).mockResolvedValue([laptopVoice]);
+
+      await c.init();
+
+      expect(c.ttsLaptopUsbClient!.init).toHaveBeenCalled();
+      expect(c.ttsLaptopUsbVoices).toEqual([laptopVoice]);
+      expect(c.ttsClient.name).toBe('edge');
+    });
+
+    test('keeps established engines when laptop USB init rejects', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      vi.mocked(c.ttsLaptopUsbClient!.init).mockRejectedValue(new Error('host unavailable'));
+
+      await expect(c.init()).resolves.toBeUndefined();
+
+      expect(c.ttsClient.name).toBe('edge');
+      expect(c.ttsLaptopUsbVoices).toEqual([]);
+    });
+
+    test('restores an explicitly preferred laptop USB client', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValue('laptop-usb-supertonic');
+      const c = new TTSController(createMockAppService(true), mockView);
+
+      await c.init();
+
+      expect(c.ttsClient.name).toBe('laptop-usb-supertonic');
+    });
+
+    test('uses Reading TTS Android when preferred laptop USB is unavailable', async () => {
+      vi.mocked(TTSUtils.getPreferredClient).mockReturnValue('laptop-usb-supertonic');
+      const c = new TTSController(createMockAppService(true), mockView);
+      vi.mocked(c.ttsLaptopUsbClient!.init).mockResolvedValue(false);
+
+      await c.init();
+
+      expect(c.ttsClient.name).toBe('android-system-buffered');
+      expect(TTSUtils.setPreferredClient).not.toHaveBeenCalled();
     });
 
     test('restores an explicitly preferred buffered Android client', async () => {
@@ -561,6 +625,26 @@ describe('TTSController', () => {
       expect(TTSUtils.setPreferredClient).toHaveBeenCalledWith('android-system-buffered');
     });
 
+    test('switches to the laptop USB client for its namespaced voice', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      c.setParagraphGap(0.6);
+      c.ttsLaptopUsbVoices = [
+        {
+          id: 'laptop-usb:supertonic3:en:sid8',
+          name: 'Laptop voice',
+          lang: 'en-US',
+        },
+      ];
+
+      await c.setVoice('laptop-usb:supertonic3:en:sid8', 'en');
+
+      expect(c.ttsClient.name).toBe('laptop-usb-supertonic');
+      expect(c.ttsClient.setRate).toHaveBeenCalledWith(1);
+      expect(c.ttsClient.setParagraphGap).toHaveBeenCalledWith(0.6);
+      expect(TTSUtils.setPreferredClient).toHaveBeenCalledWith('laptop-usb-supertonic');
+    });
+
     test('waits for buffered native cancellation to drain before selecting direct speech', async () => {
       let finishDrain!: () => void;
       const drain = new Promise<void>((resolve) => {
@@ -670,6 +754,31 @@ describe('TTSController', () => {
 
       await expect(c.getVoices('en')).resolves.toEqual(bufferedVoices);
     });
+
+    test('lists laptop USB voices in their own group', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      const laptopVoices: TTSVoicesGroup[] = [
+        {
+          id: 'laptop-usb-supertonic',
+          name: 'Laptop — Supertonic 3 por USB',
+          voices: [
+            {
+              id: 'laptop-usb:supertonic3:en:sid8',
+              name: 'Laptop voice',
+              lang: 'en-US',
+            },
+          ],
+        },
+      ];
+      vi.mocked(c.ttsLaptopUsbClient!.getVoices).mockResolvedValue(laptopVoices);
+      vi.mocked(c.ttsAndroidBufferedClient!.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsNativeClient!.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsEdgeClient.getVoices).mockResolvedValue([]);
+      vi.mocked(c.ttsWebClient.getVoices).mockResolvedValue([]);
+
+      await expect(c.getVoices('en')).resolves.toEqual(laptopVoices);
+    });
   });
 
   describe('getVoiceId', () => {
@@ -721,6 +830,15 @@ describe('TTSController', () => {
       await c.setPrimaryLang('es');
 
       expect(c.ttsAndroidBufferedClient!.setPrimaryLang).toHaveBeenCalledWith('es');
+    });
+
+    test('updates the initialized laptop USB client language', async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      c.ttsLaptopUsbClient!.initialized = true;
+
+      await c.setPrimaryLang('es');
+
+      expect(c.ttsLaptopUsbClient!.setPrimaryLang).toHaveBeenCalledWith('es');
     });
 
     test('skips uninitialised clients', async () => {
@@ -1517,6 +1635,27 @@ describe('TTSController', () => {
   });
 
   describe('forward and backward', () => {
+    test('cross-section natural auto-advance preserves a compatible streamed warmup', async () => {
+      const speakBlocks = vi.fn();
+      const warmupBlocks = vi.fn().mockResolvedValue(undefined);
+      Object.assign(controller.ttsClient, {
+        speakBlocks,
+        supportsBlockStreaming: vi.fn().mockReturnValue(true),
+        warmupBlocks,
+      });
+      mockView.tts = {
+        next: vi.fn().mockReturnValue(undefined),
+        nextMark: vi.fn().mockReturnValue(undefined),
+        start: vi.fn(),
+        doc: null,
+      } as unknown as FoliateView['tts'];
+      controller.state = 'playing';
+
+      await controller.forward(false, true);
+
+      expect(controller.ttsClient.invalidateSynthesis).not.toHaveBeenCalled();
+    });
+
     test('same-section auto-advance preserves prepared synthesis', async () => {
       mockView.tts = {
         next: vi.fn().mockReturnValue('<speak>next</speak>'),
@@ -2140,13 +2279,19 @@ describe('TTSController', () => {
 
     const installBatchClient = (
       speakBlocks: (...args: unknown[]) => AsyncIterable<TTSMessageEvent>,
+      warmupBlocks?: (...args: unknown[]) => Promise<void>,
     ) => {
       const batchSpeak = vi.fn(speakBlocks);
+      const warmup = warmupBlocks ? vi.fn(warmupBlocks) : undefined;
       Object.assign(controller.ttsClient, {
         supportsBlockStreaming: vi.fn(() => true),
         speakBlocks: batchSpeak,
+        warmupBlocks: warmup,
       });
-      return batchSpeak;
+      return {
+        batchSpeak,
+        warmup,
+      };
     };
 
     const suppressLegacyPreload = () => {
@@ -2574,6 +2719,148 @@ describe('TTSController', () => {
 
       expect(blocks).toEqual([{ blockOffset: 0, ssml: '<speak>last block</speak>' }]);
       expect(shadow.next).toHaveBeenCalledTimes(1);
+    });
+
+    test('warms the next section from the real blocks after natural source exhaustion', async () => {
+      const live = await installLiveCursor(1);
+      const currentShadow = queueShadowCursor([]);
+      const nextAnchor = new Range();
+      vi.mocked(TTS).mockImplementationOnce(function () {
+        return {
+          start: vi.fn().mockReturnValue('<speak>next-first</speak>'),
+          getLastRange: vi.fn().mockReturnValue(nextAnchor),
+        } as unknown as InstanceType<typeof TTS>;
+      });
+      const nextShadow = queueShadowCursor(['<speak>next-second</speak>']);
+      suppressLegacyPreload();
+
+      const currentBlocks: { blockOffset: number; ssml: string }[] = [];
+      const warmedBlocks: { blockOffset: number; ssml: string }[] = [];
+      let warmupDone!: () => void;
+      const warmupFinished = new Promise<void>((resolve) => {
+        warmupDone = resolve;
+      });
+      const { batchSpeak, warmup } = installBatchClient(
+        async function* (blocksArg: unknown) {
+          for await (const block of blocksArg as AsyncIterable<{
+            blockOffset: number;
+            ssml: string;
+          }>) {
+            currentBlocks.push(block);
+          }
+          yield { code: 'end', consumedBlockOffset: 0 } as TTSMessageEvent;
+        },
+        async (blocksArg: unknown) => {
+          for await (const block of blocksArg as AsyncIterable<{
+            blockOffset: number;
+            ssml: string;
+          }>) {
+            warmedBlocks.push(block);
+          }
+          warmupDone();
+        },
+      );
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await warmupFinished;
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+
+      expect(batchSpeak).toHaveBeenCalledTimes(1);
+      expect(warmup).toHaveBeenCalledTimes(1);
+      expect(currentBlocks).toEqual([{ blockOffset: 0, ssml: '<speak>current</speak>' }]);
+      expect(warmedBlocks).toEqual([
+        { blockOffset: 0, ssml: '<speak>next-first</speak>' },
+        { blockOffset: 1, ssml: '<speak>next-second</speak>' },
+      ]);
+      expect(currentShadow.next).toHaveBeenCalledTimes(1);
+      expect(nextShadow.next).toHaveBeenCalledTimes(2);
+      expect(live.next).not.toHaveBeenCalled();
+    });
+
+    test('does not warm the next section when stopAtChapterEnd is enabled', async () => {
+      await installLiveCursor(1);
+      queueShadowCursor([]);
+      suppressLegacyPreload();
+      controller.stopAtChapterEnd = true;
+      const { warmup } = installBatchClient(
+        async function* (blocksArg: unknown) {
+          for await (const _ of blocksArg as AsyncIterable<unknown>);
+          yield { code: 'end', consumedBlockOffset: 0 } as TTSMessageEvent;
+        },
+        async () => undefined,
+      );
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+
+      expect(warmup).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      'epoch',
+      'section',
+      'client',
+    ] as const)('drops next-section blocks when the warmup becomes stale by %s', async (staleReason) => {
+      await installLiveCursor(1);
+      queueShadowCursor([]);
+      suppressLegacyPreload();
+
+      let releaseDocument!: (doc: Document) => void;
+      const documentReady = new Promise<Document>((resolve) => {
+        releaseDocument = resolve;
+      });
+      const nextSection = mockView.book.sections?.[1];
+      if (!nextSection) throw new Error('Missing next test section');
+      nextSection.createDocument = vi.fn(() => documentReady);
+      const warmedBlocks: { blockOffset: number; ssml: string }[] = [];
+      let warmupStarted!: () => void;
+      const warmupBegun = new Promise<void>((resolve) => {
+        warmupStarted = resolve;
+      });
+      let warmupDone!: () => void;
+      const warmupFinished = new Promise<void>((resolve) => {
+        warmupDone = resolve;
+      });
+      const replacementClient = createMockTTSClient('replacement');
+      installBatchClient(
+        async function* (blocksArg: unknown) {
+          for await (const _ of blocksArg as AsyncIterable<unknown>);
+          yield { code: 'end', consumedBlockOffset: 0 } as TTSMessageEvent;
+        },
+        async (blocksArg: unknown) => {
+          warmupStarted();
+          for await (const block of blocksArg as AsyncIterable<{
+            blockOffset: number;
+            ssml: string;
+          }>) {
+            warmedBlocks.push(block);
+          }
+          warmupDone();
+        },
+      );
+      const forward = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>current</speak>');
+      await warmupBegun;
+      if (staleReason === 'epoch') {
+        controller.setTargetLang('es');
+      } else if (staleReason === 'section') {
+        // shutdown() clears the controller's section owner and invalidates
+        // the live session. The pending throwaway section must not become a
+        // useful warmup after that section identity disappears.
+        await controller.shutdown();
+      } else {
+        controller.ttsClient = replacementClient;
+      }
+      releaseDocument(mockView.renderer.getContents()[0]!.doc);
+      await warmupFinished;
+      if (staleReason !== 'section') {
+        await vi.waitFor(() => expect(forward).toHaveBeenCalled());
+      }
+
+      expect(warmedBlocks).toEqual([]);
     });
 
     test('commits trailing consumed blocks only after a successful end', async () => {
