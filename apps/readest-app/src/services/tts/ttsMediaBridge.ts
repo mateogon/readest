@@ -40,15 +40,13 @@ let unblockerAudio: HTMLAudioElement | null = null;
 
 // This enables WebAudio to play even when the mute toggle switch is ON.
 export const unblockAudio = (): void => {
-  // iOS Tauri: never create the element. TTS audio plays NATIVELY there
-  // (NativeAudioPlayer -> app-process AVPlayer; AVSpeechSynthesizer for
-  // system voices), so the app's own .playback session provides Now Playing
-  // and mute-switch immunity, and WebKit must be kept OUT of the media
-  // picture: a playing HTMLMediaElement (or a WebAudio page declared
-  // 'playback' via navigator.audioSession) makes WebKit register its own
-  // now-playing client — a bare "localhost" card with dead buttons that
-  // fights the native session.
-  if (getOSPlatform() === 'ios' && isTauriAppPlatform()) return;
+  const platform = getOSPlatform();
+  // Native Apple builds do not need the HTMLMediaElement shim. iOS plays TTS
+  // natively, while macOS Supertonic already owns a live Web Audio graph. On
+  // macOS WebKit, looping this 168 ms MP3 repeatedly flips the media element
+  // between paused and playing and can interrupt the independent TTS graph at
+  // chunk boundaries. Keep WebKit out of the media picture on both platforms.
+  if (isTauriAppPlatform() && (platform === 'ios' || platform === 'macos')) return;
   if (unblockerAudio) return;
   unblockerAudio = document.createElement('audio');
   unblockerAudio.setAttribute('x-webkit-airplay', 'deny');

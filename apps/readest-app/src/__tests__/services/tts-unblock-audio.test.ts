@@ -32,7 +32,16 @@ describe('unblockAudio', () => {
     spy.mockRestore();
   });
 
-  test('creates the keep-alive element on other platforms', () => {
+  test('does not create the keep-alive element on macOS Tauri', () => {
+    vi.mocked(getOSPlatform).mockReturnValue('macos');
+    vi.mocked(isTauriAppPlatform).mockReturnValue(true);
+    const spy = vi.spyOn(document, 'createElement');
+    unblockAudio();
+    expect(spy).not.toHaveBeenCalledWith('audio');
+    spy.mockRestore();
+  });
+
+  test('creates the keep-alive element on macOS web', () => {
     // Desktop Chromium only surfaces hardware media keys while an
     // HTMLMediaElement is playing; iOS Safari (web) still needs it against
     // the mute switch.
