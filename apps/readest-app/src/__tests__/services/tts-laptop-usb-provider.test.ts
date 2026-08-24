@@ -37,6 +37,81 @@ const HEALTH = {
   ],
 };
 
+const HEALTH_V2 = {
+  schemaVersion: 2,
+  status: 'ready',
+  protocolVersion: 2,
+  serviceVersion: '0.2.0',
+  pipelineRevision: 'native-rate-full-buffer-v2',
+  maxTextUtf16: 200,
+  synthesisConcurrency: 1,
+  settingsIdentity: HEALTH.settingsIdentity,
+  catalogIdentity:
+    'local-rtts-catalog-v1:sherpa-onnx-supertonic-3-tts-int8-2026-05-11,kyutai-pocket-tts-2.1.0,openmoss-moss-tts-nano-v0.5-f52645cb',
+  voices: [
+    {
+      id: 'laptop-usb:supertonic3:es:sid8',
+      name: 'Supertonic 3 — Español',
+      lang: 'es-ES',
+      backend: 'supertonic3',
+      modelIdentity: HEALTH.modelIdentity,
+      runtimeVersion: 'sherpa-onnx-1.13.4',
+      sampleRate: 44_100,
+      memoryHintMb: 600,
+    },
+    {
+      id: 'laptop-usb:supertonic3:en:sid8',
+      name: 'Supertonic 3 — English',
+      lang: 'en-US',
+      backend: 'supertonic3',
+      modelIdentity: HEALTH.modelIdentity,
+      runtimeVersion: 'sherpa-onnx-1.13.4',
+      sampleRate: 44_100,
+      memoryHintMb: 600,
+    },
+    {
+      id: 'laptop-usb:pocket-tts-2.1:es:lola',
+      name: 'Pocket TTS 2.1 — Lola (Español)',
+      lang: 'es-ES',
+      backend: 'pocket-tts-2.1',
+      modelIdentity: 'kyutai-pocket-tts-2.1.0',
+      runtimeVersion: 'pocket-tts-2.1.0',
+      sampleRate: 24_000,
+      memoryHintMb: 1_300,
+    },
+    {
+      id: 'laptop-usb:pocket-tts-2.1:en:alba',
+      name: 'Pocket TTS 2.1 — Alba (English)',
+      lang: 'en-US',
+      backend: 'pocket-tts-2.1',
+      modelIdentity: 'kyutai-pocket-tts-2.1.0',
+      runtimeVersion: 'pocket-tts-2.1.0',
+      sampleRate: 24_000,
+      memoryHintMb: 1_300,
+    },
+    {
+      id: 'laptop-usb:moss-tts-nano:es:Xiaoyu',
+      name: 'MOSS-TTS-Nano — Xiaoyu (Español)',
+      lang: 'es-ES',
+      backend: 'moss-tts-nano',
+      modelIdentity: 'openmoss-moss-tts-nano-v0.5-f52645cb',
+      runtimeVersion: 'onnxruntime-1.23.2',
+      sampleRate: 48_000,
+      memoryHintMb: 3_100,
+    },
+    {
+      id: 'laptop-usb:moss-tts-nano:en:Ava',
+      name: 'MOSS-TTS-Nano — Ava (English)',
+      lang: 'en-US',
+      backend: 'moss-tts-nano',
+      modelIdentity: 'openmoss-moss-tts-nano-v0.5-f52645cb',
+      runtimeVersion: 'onnxruntime-1.23.2',
+      sampleRate: 48_000,
+      memoryHintMb: 3_100,
+    },
+  ],
+};
+
 const context = {
   sessionId: 'tts-coordinator-1',
   requestId: 'tts-coordinator-1:0:1',
@@ -52,7 +127,7 @@ const response = (body: unknown, status = 200): Response =>
     arrayBuffer: vi.fn(),
   }) as unknown as Response;
 
-const makeWav = (frameCount = 441): ArrayBuffer => {
+const makeWav = (frameCount = 441, sampleRate = 44_100): ArrayBuffer => {
   const dataBytes = frameCount * 2;
   const bytes = new Uint8Array(44 + dataBytes);
   const view = new DataView(bytes.buffer);
@@ -67,8 +142,8 @@ const makeWav = (frameCount = 441): ArrayBuffer => {
   view.setUint32(16, 16, true);
   view.setUint16(20, 1, true);
   view.setUint16(22, 1, true);
-  view.setUint32(24, 44_100, true);
-  view.setUint32(28, 88_200, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
   view.setUint16(32, 2, true);
   view.setUint16(34, 16, true);
   write(36, 'data');
@@ -128,7 +203,7 @@ describe('LaptopUsbSpeechProvider', () => {
     const provider = new LaptopUsbSpeechProvider();
 
     expect(provider.id).toBe('laptop-usb-supertonic');
-    expect(provider.label).toBe('Laptop — Supertonic 3');
+    expect(provider.label).toBe('Laptop — Modelos locales');
     expect(provider.cacheable).toBe(false);
     expect(provider.synthesisConcurrency).toBe(1);
     expect(provider.retryPolicy?.maxAttempts).toBe(1);
@@ -148,7 +223,7 @@ describe('LaptopUsbSpeechProvider', () => {
     expect(provider.synthesisIdentity).toContain(HEALTH.settingsIdentity);
     expect(provider.synthesisIdentity).toContain(HEALTH.modelIdentity);
     expect(h.fetch).toHaveBeenCalledWith(
-      'http://127.0.0.1:18765/health',
+      'http://127.0.0.1:18765/v2/health',
       expect.objectContaining({ method: 'GET', signal: expect.any(AbortSignal) }),
     );
   });
@@ -167,6 +242,53 @@ describe('LaptopUsbSpeechProvider', () => {
 
     await expect(provider.init()).resolves.toBe(true);
     await expect(provider.getAllVoices()).resolves.toEqual(sid9Health.voices);
+  });
+
+  test('discovers all v2 models and validates native-rate Pocket audio', async () => {
+    h.fetch.mockResolvedValueOnce(response(HEALTH_V2));
+    const provider = new LaptopUsbSpeechProvider();
+
+    await expect(provider.init()).resolves.toBe(true);
+    const voices = await provider.getAllVoices();
+    expect(voices).toHaveLength(6);
+    expect(voices).toContainEqual({
+      id: 'laptop-usb:pocket-tts-2.1:es:lola',
+      name: 'Pocket TTS 2.1 — Lola (Español)',
+      lang: 'es-ES',
+    });
+    expect(provider.synthesisIdentity).toContain(HEALTH_V2.catalogIdentity);
+
+    const metadata = {
+      schemaVersion: 2,
+      requestId: context.requestId,
+      modelIdentity: 'kyutai-pocket-tts-2.1.0',
+      runtimeVersion: 'pocket-tts-2.1.0',
+      pipelineRevision: 'native-rate-full-buffer-v2',
+      sampleRate: 24_000,
+      channels: 1,
+      format: 'wav-pcm16le',
+      frameCount: 240,
+      durationSec: 0.01,
+      appliedPitch: 1,
+      boundaries: [{ offset: 0, duration: 100_000, text: 'Hola', textStart: 0, textEnd: 4 }],
+    };
+    h.fetch.mockResolvedValueOnce(synthesisResponse(makeFrame(metadata, makeWav(240, 24_000))));
+    await expect(
+      provider.synthesize(
+        {
+          lang: 'es-CL',
+          text: 'Hola',
+          voice: 'laptop-usb:pocket-tts-2.1:es:lola',
+          pitch: 1,
+        },
+        new AbortController().signal,
+        context,
+      ),
+    ).resolves.toMatchObject({ durationSec: 0.01 });
+
+    expect(h.fetch.mock.calls[1]?.[0]).toBe('http://127.0.0.1:18765/v2/synthesize');
+    const body = JSON.parse(String((h.fetch.mock.calls[1]?.[1] as RequestInit).body));
+    expect(body.schemaVersion).toBe(2);
   });
 
   test('rejects a voice sid that disagrees with the host profile', async () => {

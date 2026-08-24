@@ -11,7 +11,7 @@ import {
   type SpeechSynthesisResult,
 } from './types';
 
-export const LAPTOP_USB_VOICE_PREFIX = 'laptop-usb:supertonic3:';
+export const LAPTOP_USB_VOICE_PREFIX = 'laptop-usb:';
 
 const ENDPOINT = 'http://127.0.0.1:18765';
 // The first plugin-http request after a cold Android WebView start can exceed
@@ -20,22 +20,33 @@ const ENDPOINT = 'http://127.0.0.1:18765';
 // startup so an explicitly preferred laptop voice does not silently start on
 // an established fallback engine.
 const HEALTH_TIMEOUT_MS = 1_500;
-const PROTOCOL_VERSION = 1;
-const SAMPLE_RATE = 44_100;
+const FRAME_PROTOCOL_VERSION = 1;
+const LEGACY_PROTOCOL_VERSION = 1;
+const MULTI_MODEL_PROTOCOL_VERSION = 2;
+const LEGACY_SAMPLE_RATE = 44_100;
 const MAX_TEXT_UTF16 = 200;
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_METADATA_BYTES = 256 * 1024;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const RESPONSE_CONTENT_TYPE = 'application/vnd.reading-tts.synthesis';
-const EXPECTED_MODEL_IDENTITY = 'sherpa-onnx-supertonic-3-tts-int8-2026-05-11';
-const EXPECTED_PIPELINE_REVISION = 'android-full-buffer-parity-v1';
-const EXPECTED_RUNTIME_VERSION = '1.13.4';
-const ADAPTER_REVISION = 'rtts-v1';
+const LEGACY_MODEL_IDENTITY = 'sherpa-onnx-supertonic-3-tts-int8-2026-05-11';
+const LEGACY_PIPELINE_REVISION = 'android-full-buffer-parity-v1';
+const MULTI_MODEL_PIPELINE_REVISION = 'native-rate-full-buffer-v2';
+const LEGACY_RUNTIME_VERSION = '1.13.4';
+const ADAPTER_REVISION = 'rtts-v2';
 
 interface LaptopHealthVoice {
   id: string;
   name: string;
   lang: string;
+}
+
+interface MultiModelHealthVoice extends LaptopHealthVoice {
+  backend: string;
+  modelIdentity: string;
+  runtimeVersion: string;
+  sampleRate: number;
+  memoryHintMb: number;
 }
 
 interface LaptopHealthResponse {
@@ -53,6 +64,19 @@ interface LaptopHealthResponse {
   voices: LaptopHealthVoice[];
 }
 
+interface MultiModelHealthResponse {
+  schemaVersion: 2;
+  status: string;
+  protocolVersion: 2;
+  serviceVersion: string;
+  pipelineRevision: string;
+  maxTextUtf16: number;
+  synthesisConcurrency: number;
+  settingsIdentity: string;
+  catalogIdentity: string;
+  voices: MultiModelHealthVoice[];
+}
+
 interface LaptopBoundary {
   offset: number;
   duration: number;
@@ -65,6 +89,7 @@ interface LaptopFrameMetadata {
   schemaVersion: number;
   requestId: string;
   modelIdentity: string;
+  runtimeVersion?: string;
   pipelineRevision: string;
   sampleRate: number;
   channels: number;
@@ -73,6 +98,14 @@ interface LaptopFrameMetadata {
   durationSec: number;
   appliedPitch: number;
   boundaries: LaptopBoundary[];
+}
+
+interface ExpectedFrameContract {
+  schemaVersion: 1 | 2;
+  modelIdentity: string;
+  runtimeVersion?: string;
+  pipelineRevision: string;
+  sampleRate: number;
 }
 
 class LaptopUsbProtocolError extends Error {
@@ -100,7 +133,7 @@ const isFiniteNumber = (value: unknown): value is number =>
 
 const primaryLanguage = (locale: string): string => locale.split('-')[0]?.toLowerCase() ?? '';
 
-const validVoice = (value: unknown): value is LaptopHealthVoice => {
+const validLegacyVoice = (value: unknown): value is LaptopHealthVoice => {
   if (!isRecord(value)) return false;
   const id = value['id'];
   const name = value['name'];
@@ -118,14 +151,14 @@ const validVoice = (value: unknown): value is LaptopHealthVoice => {
   return primaryLanguage(normalized) === id.split(':')[2];
 };
 
-const validHealth = (value: unknown): value is LaptopHealthResponse => {
+const validLegacyHealth = (value: unknown): value is LaptopHealthResponse => {
   if (!isRecord(value)) return false;
   const voices = value['voices'];
   const settingsIdentity = value['settingsIdentity'];
   const voiceSuffixes = Array.isArray(voices)
     ? new Set(
         voices
-          .filter(validVoice)
+          .filter(validLegacyVoice)
           .map((voice) => voice.id.split(':').at(-1))
           .filter((suffix): suffix is string => !!suffix),
       )
@@ -133,13 +166,13 @@ const validHealth = (value: unknown): value is LaptopHealthResponse => {
   return (
     value['schemaVersion'] === 1 &&
     value['status'] === 'ready' &&
-    value['protocolVersion'] === PROTOCOL_VERSION &&
+    value['protocolVersion'] === LEGACY_PROTOCOL_VERSION &&
     typeof value['serviceVersion'] === 'string' &&
     value['serviceVersion'].length > 0 &&
-    value['pipelineRevision'] === EXPECTED_PIPELINE_REVISION &&
-    value['modelIdentity'] === EXPECTED_MODEL_IDENTITY &&
-    value['runtimeVersion'] === EXPECTED_RUNTIME_VERSION &&
-    value['sampleRate'] === SAMPLE_RATE &&
+    value['pipelineRevision'] === LEGACY_PIPELINE_REVISION &&
+    value['modelIdentity'] === LEGACY_MODEL_IDENTITY &&
+    value['runtimeVersion'] === LEGACY_RUNTIME_VERSION &&
+    value['sampleRate'] === LEGACY_SAMPLE_RATE &&
     isSafeInteger(value['maxTextUtf16']) &&
     value['maxTextUtf16'] >= MAX_TEXT_UTF16 &&
     value['synthesisConcurrency'] === 1 &&
@@ -149,10 +182,96 @@ const validHealth = (value: unknown): value is LaptopHealthResponse => {
     ) &&
     Array.isArray(voices) &&
     voices.length > 0 &&
-    voices.every(validVoice) &&
+    voices.every(validLegacyVoice) &&
     voiceSuffixes.size === 1 &&
     settingsIdentity.includes(`:${[...voiceSuffixes][0]}:`)
   );
+};
+
+const MODEL_CONTRACTS = {
+  supertonic3: {
+    modelIdentity: LEGACY_MODEL_IDENTITY,
+    runtimeVersion: 'sherpa-onnx-1.13.4',
+    sampleRate: 44_100,
+    voice: /^laptop-usb:supertonic3:(?:es|en):sid(?:0|[1-9]\d*)$/,
+  },
+  'pocket-tts-2.1': {
+    modelIdentity: 'kyutai-pocket-tts-2.1.0',
+    runtimeVersion: 'pocket-tts-2.1.0',
+    sampleRate: 24_000,
+    voice: /^laptop-usb:pocket-tts-2\.1:(?:es:lola|en:alba)$/,
+  },
+  'moss-tts-nano': {
+    modelIdentity: 'openmoss-moss-tts-nano-v0.5-f52645cb',
+    runtimeVersion: 'onnxruntime-1.23.2',
+    sampleRate: 48_000,
+    voice: /^laptop-usb:moss-tts-nano:(?:es:Xiaoyu|en:Ava)$/,
+  },
+} as const;
+
+const validMultiModelVoice = (value: unknown): value is MultiModelHealthVoice => {
+  if (!isRecord(value)) return false;
+  const id = value['id'];
+  const name = value['name'];
+  const lang = value['lang'];
+  const backend = value['backend'];
+  if (
+    typeof id !== 'string' ||
+    typeof name !== 'string' ||
+    !name.trim() ||
+    typeof lang !== 'string' ||
+    typeof backend !== 'string' ||
+    !(backend in MODEL_CONTRACTS)
+  ) {
+    return false;
+  }
+  const contract = MODEL_CONTRACTS[backend as keyof typeof MODEL_CONTRACTS];
+  const normalized = normalizeSynthesisLocale(lang);
+  return (
+    contract.voice.test(id) &&
+    id.split(':')[1] === backend &&
+    primaryLanguage(normalized) === id.split(':')[2] &&
+    value['modelIdentity'] === contract.modelIdentity &&
+    value['runtimeVersion'] === contract.runtimeVersion &&
+    value['sampleRate'] === contract.sampleRate &&
+    isSafeInteger(value['memoryHintMb']) &&
+    value['memoryHintMb'] > 0
+  );
+};
+
+const validMultiModelHealth = (value: unknown): value is MultiModelHealthResponse => {
+  if (!isRecord(value)) return false;
+  const voices = value['voices'];
+  const settingsIdentity = value['settingsIdentity'];
+  const catalogIdentity = value['catalogIdentity'];
+  if (
+    value['schemaVersion'] !== 2 ||
+    value['status'] !== 'ready' ||
+    value['protocolVersion'] !== MULTI_MODEL_PROTOCOL_VERSION ||
+    typeof value['serviceVersion'] !== 'string' ||
+    !value['serviceVersion'] ||
+    value['pipelineRevision'] !== MULTI_MODEL_PIPELINE_REVISION ||
+    !isSafeInteger(value['maxTextUtf16']) ||
+    value['maxTextUtf16'] < MAX_TEXT_UTF16 ||
+    value['synthesisConcurrency'] !== 1 ||
+    typeof settingsIdentity !== 'string' ||
+    !/^reading-tts-settings-v2:sid(?:0|[1-9]\d*):speed\d+(?:\.\d+)?:steps[5-7]:pauses\d+,\d+,\d+,\d+,\d+$/.test(
+      settingsIdentity,
+    ) ||
+    typeof catalogIdentity !== 'string' ||
+    !catalogIdentity.startsWith('local-rtts-catalog-v1:') ||
+    !Array.isArray(voices) ||
+    voices.length < 2 ||
+    !voices.every(validMultiModelVoice)
+  ) {
+    return false;
+  }
+  const ids = new Set(voices.map((voice) => voice.id));
+  if (ids.size !== voices.length) return false;
+  const sid = settingsIdentity.match(/:sid(\d+):/)?.[1];
+  return voices
+    .filter((voice) => voice.backend === 'supertonic3')
+    .every((voice) => voice.id.endsWith(`:sid${sid}`));
 };
 
 const headerValue = (response: Response, name: string): string | null => response.headers.get(name);
@@ -192,7 +311,7 @@ const requestIdOrFallback = (
 const validOperationId = (value: string): boolean =>
   value.length > 0 && value.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(value);
 
-const parseWav = (wav: Uint8Array): number => {
+const parseWav = (wav: Uint8Array, expectedSampleRate: number): number => {
   if (wav.length < 44 || new TextDecoder().decode(wav.subarray(0, 4)) !== 'RIFF') {
     throw new LaptopUsbProtocolError('Invalid WAV container');
   }
@@ -219,7 +338,7 @@ const parseWav = (wav: Uint8Array): number => {
       if (
         format !== 1 ||
         channels !== 1 ||
-        sampleRate !== SAMPLE_RATE ||
+        sampleRate !== expectedSampleRate ||
         bits !== 16 ||
         blockAlign !== 2
       ) {
@@ -241,6 +360,7 @@ const parseFrame = (
   frame: ArrayBuffer,
   expectedRequestId: string,
   text: string,
+  expected: ExpectedFrameContract,
 ): SpeechSynthesisResult => {
   if (frame.byteLength < 12 || frame.byteLength > MAX_RESPONSE_BYTES) {
     throw new LaptopUsbProtocolError('Invalid RTTS frame length');
@@ -250,7 +370,7 @@ const parseFrame = (
     throw new LaptopUsbProtocolError('Invalid RTTS magic');
   }
   const view = new DataView(frame);
-  if (view.getUint16(4, false) !== PROTOCOL_VERSION || view.getUint16(6, false) !== 0) {
+  if (view.getUint16(4, false) !== FRAME_PROTOCOL_VERSION || view.getUint16(6, false) !== 0) {
     throw new LaptopUsbProtocolError('Unsupported RTTS frame version');
   }
   const metadataLength = view.getUint32(8, false);
@@ -272,11 +392,13 @@ const parseFrame = (
   if (!isRecord(metadataValue)) throw new LaptopUsbProtocolError('Invalid RTTS metadata');
   const metadata = metadataValue as Partial<LaptopFrameMetadata>;
   if (
-    metadata.schemaVersion !== 1 ||
+    metadata.schemaVersion !== expected.schemaVersion ||
     metadata.requestId !== expectedRequestId ||
-    metadata.modelIdentity !== EXPECTED_MODEL_IDENTITY ||
-    metadata.pipelineRevision !== EXPECTED_PIPELINE_REVISION ||
-    metadata.sampleRate !== SAMPLE_RATE ||
+    metadata.modelIdentity !== expected.modelIdentity ||
+    (expected.runtimeVersion !== undefined &&
+      metadata.runtimeVersion !== expected.runtimeVersion) ||
+    metadata.pipelineRevision !== expected.pipelineRevision ||
+    metadata.sampleRate !== expected.sampleRate ||
     metadata.channels !== 1 ||
     metadata.format !== 'wav-pcm16le' ||
     !isSafeInteger(metadata.frameCount) ||
@@ -290,10 +412,10 @@ const parseFrame = (
   }
   const wavOffset = 12 + metadataLength;
   const wav = bytes.subarray(wavOffset);
-  const wavFrames = parseWav(wav);
+  const wavFrames = parseWav(wav, expected.sampleRate);
   if (wavFrames !== metadata.frameCount)
     throw new LaptopUsbProtocolError('WAV frame count mismatch');
-  const expectedDuration = metadata.frameCount / SAMPLE_RATE;
+  const expectedDuration = metadata.frameCount / expected.sampleRate;
   if (Math.abs(metadata.durationSec - expectedDuration) > 0.005) {
     throw new LaptopUsbProtocolError('WAV duration mismatch');
   }
@@ -337,7 +459,7 @@ const parseFrame = (
 
 export class LaptopUsbSpeechProvider implements SpeechProvider {
   readonly id = 'laptop-usb-supertonic';
-  readonly label = 'Laptop — Supertonic 3';
+  readonly label = 'Laptop — Modelos locales';
   readonly cacheable = false;
   readonly synthesisConcurrency = 1;
   readonly compositeBoundaries = {
@@ -347,35 +469,59 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
   readonly retryPolicy = { maxAttempts: 1 } satisfies SpeechRetryPolicy;
 
   #voices: LaptopHealthVoice[] = [];
+  #voiceContracts = new Map<string, ExpectedFrameContract>();
   #serviceVersion = '';
   #settingsIdentity = '';
+  #catalogIdentity = '';
+  #protocolVersion: 1 | 2 = 1;
   #initialized = false;
   #fallbackRequestSequence = 0;
 
   get synthesisIdentity(): string {
     if (!this.#initialized) return `${ADAPTER_REVISION}:uninitialized`;
-    return `${ADAPTER_REVISION}:rtts-${PROTOCOL_VERSION}:${this.#serviceVersion}:${this.#settingsIdentity}:${EXPECTED_RUNTIME_VERSION}:${EXPECTED_PIPELINE_REVISION}:${EXPECTED_MODEL_IDENTITY}`;
+    const pipelineRevision =
+      this.#protocolVersion === 2 ? MULTI_MODEL_PIPELINE_REVISION : LEGACY_PIPELINE_REVISION;
+    return `${ADAPTER_REVISION}:rtts-${this.#protocolVersion}:${this.#serviceVersion}:${this.#settingsIdentity}:${pipelineRevision}:${this.#catalogIdentity}`;
   }
 
   async init(): Promise<boolean> {
     this.#voices = [];
+    this.#voiceContracts.clear();
     this.#serviceVersion = '';
     this.#settingsIdentity = '';
+    this.#catalogIdentity = '';
+    this.#protocolVersion = 1;
     this.#initialized = false;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
     try {
-      const response = await tauriFetch(`${ENDPOINT}/health`, {
+      const multiResponse = await tauriFetch(`${ENDPOINT}/v2/health`, {
         method: 'GET',
         signal: controller.signal,
       });
-      if (!response.ok || response.status !== 200) return false;
-      const health: unknown = await response.json();
-      if (!validHealth(health)) return false;
-      this.#voices = health.voices.map((voice) => ({ ...voice }));
-      this.#serviceVersion = health.serviceVersion;
-      this.#settingsIdentity = health.settingsIdentity;
-      this.#initialized = true;
+      if (multiResponse.ok && multiResponse.status === 200) {
+        const health: unknown = await multiResponse.json();
+        if (validMultiModelHealth(health)) {
+          this.#applyMultiModelHealth(health);
+          return true;
+        }
+        // A v1 payload at the new path is accepted for compatibility with
+        // simple local proxies and older test fixtures.
+        if (validLegacyHealth(health)) {
+          this.#applyLegacyHealth(health);
+          return true;
+        }
+        return false;
+      }
+      if (multiResponse.status !== 404) return false;
+      const legacyResponse = await tauriFetch(`${ENDPOINT}/health`, {
+        method: 'GET',
+        signal: controller.signal,
+      });
+      if (!legacyResponse.ok || legacyResponse.status !== 200) return false;
+      const legacyHealth: unknown = await legacyResponse.json();
+      if (!validLegacyHealth(legacyHealth)) return false;
+      this.#applyLegacyHealth(legacyHealth);
       return true;
     } catch {
       return false;
@@ -384,8 +530,49 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
     }
   }
 
+  #applyLegacyHealth(health: LaptopHealthResponse): void {
+    this.#voices = health.voices.map((voice) => ({ ...voice }));
+    this.#voiceContracts = new Map(
+      health.voices.map((voice) => [
+        voice.id,
+        {
+          schemaVersion: 1,
+          modelIdentity: LEGACY_MODEL_IDENTITY,
+          pipelineRevision: LEGACY_PIPELINE_REVISION,
+          sampleRate: LEGACY_SAMPLE_RATE,
+        },
+      ]),
+    );
+    this.#serviceVersion = health.serviceVersion;
+    this.#settingsIdentity = health.settingsIdentity;
+    this.#catalogIdentity = `${LEGACY_MODEL_IDENTITY}:${LEGACY_RUNTIME_VERSION}`;
+    this.#protocolVersion = 1;
+    this.#initialized = true;
+  }
+
+  #applyMultiModelHealth(health: MultiModelHealthResponse): void {
+    this.#voices = health.voices.map(({ id, name, lang }) => ({ id, name, lang }));
+    this.#voiceContracts = new Map(
+      health.voices.map((voice) => [
+        voice.id,
+        {
+          schemaVersion: 2,
+          modelIdentity: voice.modelIdentity,
+          runtimeVersion: voice.runtimeVersion,
+          pipelineRevision: MULTI_MODEL_PIPELINE_REVISION,
+          sampleRate: voice.sampleRate,
+        },
+      ]),
+    );
+    this.#serviceVersion = health.serviceVersion;
+    this.#settingsIdentity = health.settingsIdentity;
+    this.#catalogIdentity = health.catalogIdentity;
+    this.#protocolVersion = 2;
+    this.#initialized = true;
+  }
+
   async getAllVoices(): Promise<TTSVoice[]> {
-    return this.#voices.map((voice) => ({ ...voice }));
+    return this.#voices.map(({ id, name, lang }) => ({ id, name, lang }));
   }
 
   async synthesize(
@@ -404,9 +591,11 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
     const lang = normalizeSynthesisLocale(req.lang);
     const primary = primaryLanguage(lang);
     const voice = this.#voices.find((candidate) => candidate.id === req.voice);
+    const frameContract = this.#voiceContracts.get(req.voice);
     if (
       !['es', 'en'].includes(primary) ||
       !voice ||
+      !frameContract ||
       primaryLanguage(normalizeSynthesisLocale(voice.lang)) !== primary
     ) {
       throw new SpeechSynthesisPermanentError('Invalid laptop TTS voice or language');
@@ -423,7 +612,7 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
       throw new SpeechSynthesisPermanentError('Invalid laptop TTS operation identity');
     }
     const body = JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: this.#protocolVersion,
       sessionId,
       requestId,
       generation,
@@ -436,7 +625,7 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
       throw new SpeechSynthesisPermanentError('Laptop TTS request exceeds protocol limits');
     }
     try {
-      const response = await tauriFetch(`${ENDPOINT}/v1/synthesize`, {
+      const response = await tauriFetch(`${ENDPOINT}/v${this.#protocolVersion}/synthesize`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -464,7 +653,7 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
       const frame = await response.arrayBuffer();
       if (frame.byteLength !== expectedLength)
         throw new LaptopUsbProtocolError('Truncated RTTS response');
-      return parseFrame(frame, requestId, req.text);
+      return parseFrame(frame, requestId, req.text, frameContract);
     } catch (error) {
       if (signal.aborted || isAbortError(error)) throw abortError();
       throw error;
@@ -473,8 +662,11 @@ export class LaptopUsbSpeechProvider implements SpeechProvider {
 
   async shutdown(): Promise<void> {
     this.#voices = [];
+    this.#voiceContracts.clear();
     this.#serviceVersion = '';
     this.#settingsIdentity = '';
+    this.#catalogIdentity = '';
+    this.#protocolVersion = 1;
     this.#initialized = false;
   }
 }
