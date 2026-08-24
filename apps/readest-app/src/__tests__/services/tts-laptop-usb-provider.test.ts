@@ -128,7 +128,7 @@ describe('LaptopUsbSpeechProvider', () => {
     const provider = new LaptopUsbSpeechProvider();
 
     expect(provider.id).toBe('laptop-usb-supertonic');
-    expect(provider.label).toBe('Laptop — Supertonic 3 por USB');
+    expect(provider.label).toBe('Laptop — Supertonic 3');
     expect(provider.cacheable).toBe(false);
     expect(provider.synthesisConcurrency).toBe(1);
     expect(provider.retryPolicy?.maxAttempts).toBe(1);

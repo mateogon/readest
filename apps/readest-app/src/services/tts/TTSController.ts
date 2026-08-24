@@ -209,12 +209,16 @@ export class TTSController extends EventTarget {
     if (appService?.isAndroidApp || appService?.isIOSApp) {
       this.ttsNativeClient = new NativeTTSClient(this);
     }
-    if (appService?.isAndroidApp) {
+    // The same loopback provider serves two transports: Android reaches the
+    // Mac host through adb reverse, while the macOS app reaches it directly.
+    if (appService?.isAndroidApp || appService?.isMacOSApp) {
       this.ttsLaptopUsbClient = new BufferedTTSClient(
         new LaptopUsbSpeechProvider(),
         this,
         appService,
       );
+    }
+    if (appService?.isAndroidApp) {
       this.ttsAndroidBufferedClient = new BufferedTTSClient(
         new AndroidSystemSpeechProvider(),
         this,
@@ -426,9 +430,9 @@ export class TTSController extends EventTarget {
         this.ttsAndroidBufferedVoices = [];
       }
     }
-    // Experimental and opt-in: laptop USB TTS is Android-only and remains
-    // after established engines so host availability never changes the
-    // implicit default.
+    // Experimental and opt-in: the laptop host is available to Android over
+    // adb reverse and directly to macOS. It remains after established engines
+    // so host availability never changes the implicit default.
     if (this.ttsLaptopUsbClient) {
       try {
         if (await this.ttsLaptopUsbClient.init()) {

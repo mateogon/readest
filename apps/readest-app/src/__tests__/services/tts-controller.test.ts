@@ -194,10 +194,11 @@ function createMockView(): FoliateView {
 
 // --- Helper: create mock AppService ---
 
-function createMockAppService(isAndroid = false, isIOS = false): AppService {
+function createMockAppService(isAndroid = false, isIOS = false, isMacOS = false): AppService {
   return {
     isAndroidApp: isAndroid,
     isIOSApp: isIOS,
+    isMacOSApp: isMacOS,
   } as unknown as AppService;
 }
 
@@ -290,12 +291,15 @@ describe('TTSController', () => {
       expect(c.ttsNativeClient).not.toBeNull();
     });
 
-    test('creates a separate buffered system client only on Android', () => {
+    test('creates the laptop host client on Android and macOS', () => {
       const android = new TTSController(createMockAppService(true), mockView);
       const ios = new TTSController(createMockAppService(false, true), mockView);
+      const macos = new TTSController(createMockAppService(false, false, true), mockView);
 
       expect(android.ttsLaptopUsbClient?.name).toBe('laptop-usb-supertonic');
       expect(android.ttsAndroidBufferedClient?.name).toBe('android-system-buffered');
+      expect(macos.ttsLaptopUsbClient?.name).toBe('laptop-usb-supertonic');
+      expect(macos.ttsAndroidBufferedClient).toBeNull();
       expect(ios.ttsLaptopUsbClient).toBeNull();
       expect(ios.ttsAndroidBufferedClient).toBeNull();
       expect(controller.ttsLaptopUsbClient).toBeNull();
@@ -761,7 +765,7 @@ describe('TTSController', () => {
       const laptopVoices: TTSVoicesGroup[] = [
         {
           id: 'laptop-usb-supertonic',
-          name: 'Laptop — Supertonic 3 por USB',
+          name: 'Laptop — Supertonic 3',
           voices: [
             {
               id: 'laptop-usb:supertonic3:en:sid8',

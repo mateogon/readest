@@ -337,7 +337,7 @@ const parseFrame = (
 
 export class LaptopUsbSpeechProvider implements SpeechProvider {
   readonly id = 'laptop-usb-supertonic';
-  readonly label = 'Laptop — Supertonic 3 por USB';
+  readonly label = 'Laptop — Supertonic 3';
   readonly cacheable = false;
   readonly synthesisConcurrency = 1;
   readonly compositeBoundaries = {
