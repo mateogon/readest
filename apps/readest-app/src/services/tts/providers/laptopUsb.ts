@@ -34,6 +34,34 @@ const LEGACY_PIPELINE_REVISION = 'android-full-buffer-parity-v1';
 const MULTI_MODEL_PIPELINE_REVISION = 'native-rate-full-buffer-v2';
 const LEGACY_RUNTIME_VERSION = '1.13.4';
 const ADAPTER_REVISION = 'rtts-v2';
+const POCKET_VOICE_NAMES = new Set([
+  'alba',
+  'anna',
+  'azelma',
+  'bill_boerst',
+  'caro_davy',
+  'charles',
+  'cosette',
+  'eponine',
+  'estelle',
+  'eve',
+  'fantine',
+  'george',
+  'giovanni',
+  'jane',
+  'javert',
+  'jean',
+  'juergen',
+  'lola',
+  'marius',
+  'mary',
+  'michael',
+  'paul',
+  'peter_yearsley',
+  'rafael',
+  'stuart_bell',
+  'vera',
+]);
 
 interface LaptopHealthVoice {
   id: string;
@@ -193,19 +221,28 @@ const MODEL_CONTRACTS = {
     modelIdentity: LEGACY_MODEL_IDENTITY,
     runtimeVersion: 'sherpa-onnx-1.13.4',
     sampleRate: 44_100,
-    voice: /^laptop-usb:supertonic3:(?:es|en):sid(?:0|[1-9]\d*)$/,
+    validVoice: (id: string) => /^laptop-usb:supertonic3:(?:es|en):sid(?:0|[1-9]\d*)$/.test(id),
   },
   'pocket-tts-2.1': {
     modelIdentity: 'kyutai-pocket-tts-2.1.0',
     runtimeVersion: 'pocket-tts-2.1.0',
     sampleRate: 24_000,
-    voice: /^laptop-usb:pocket-tts-2\.1:(?:es:lola|en:alba)$/,
+    validVoice: (id: string) => {
+      const parts = id.split(':');
+      return (
+        parts.length === 4 &&
+        parts[0] === 'laptop-usb' &&
+        parts[1] === 'pocket-tts-2.1' &&
+        (parts[2] === 'es' || parts[2] === 'en') &&
+        POCKET_VOICE_NAMES.has(parts[3] ?? '')
+      );
+    },
   },
   'moss-tts-nano': {
     modelIdentity: 'openmoss-moss-tts-nano-v0.5-f52645cb',
     runtimeVersion: 'onnxruntime-1.23.2',
     sampleRate: 48_000,
-    voice: /^laptop-usb:moss-tts-nano:(?:es:Xiaoyu|en:Ava)$/,
+    validVoice: (id: string) => /^laptop-usb:moss-tts-nano:(?:es:Xiaoyu|en:Ava)$/.test(id),
   },
 } as const;
 
@@ -228,7 +265,7 @@ const validMultiModelVoice = (value: unknown): value is MultiModelHealthVoice =>
   const contract = MODEL_CONTRACTS[backend as keyof typeof MODEL_CONTRACTS];
   const normalized = normalizeSynthesisLocale(lang);
   return (
-    contract.voice.test(id) &&
+    contract.validVoice(id) &&
     id.split(':')[1] === backend &&
     primaryLanguage(normalized) === id.split(':')[2] &&
     value['modelIdentity'] === contract.modelIdentity &&

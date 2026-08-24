@@ -80,6 +80,16 @@ const HEALTH_V2 = {
       memoryHintMb: 1_300,
     },
     {
+      id: 'laptop-usb:pocket-tts-2.1:es:alba',
+      name: 'Pocket TTS 2.1 — Alba (Español)',
+      lang: 'es-ES',
+      backend: 'pocket-tts-2.1',
+      modelIdentity: 'kyutai-pocket-tts-2.1.0',
+      runtimeVersion: 'pocket-tts-2.1.0',
+      sampleRate: 24_000,
+      memoryHintMb: 1_300,
+    },
+    {
       id: 'laptop-usb:pocket-tts-2.1:en:alba',
       name: 'Pocket TTS 2.1 — Alba (English)',
       lang: 'en-US',
@@ -250,10 +260,15 @@ describe('LaptopUsbSpeechProvider', () => {
 
     await expect(provider.init()).resolves.toBe(true);
     const voices = await provider.getAllVoices();
-    expect(voices).toHaveLength(6);
+    expect(voices).toHaveLength(7);
     expect(voices).toContainEqual({
       id: 'laptop-usb:pocket-tts-2.1:es:lola',
       name: 'Pocket TTS 2.1 — Lola (Español)',
+      lang: 'es-ES',
+    });
+    expect(voices).toContainEqual({
+      id: 'laptop-usb:pocket-tts-2.1:es:alba',
+      name: 'Pocket TTS 2.1 — Alba (Español)',
       lang: 'es-ES',
     });
     expect(provider.synthesisIdentity).toContain(HEALTH_V2.catalogIdentity);
