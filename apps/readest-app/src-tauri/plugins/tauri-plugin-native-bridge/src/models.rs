@@ -33,6 +33,20 @@ pub struct CopyURIResponse {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RenderPdfCoverRequest {
+    pub file_path: String,
+    pub max_long_edge: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderPdfCoverResponse {
+    pub cover_base64: String,
+    pub cover_mime: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveImageToGalleryRequest {
     /// Absolute path of the source image file on disk.
     pub src_path: String,
@@ -56,6 +70,14 @@ pub struct SaveImageToGalleryResponse {
 #[serde(rename_all = "camelCase")]
 pub struct UseBackgroundAudioRequest {
     pub enabled: bool,
+}
+
+/// Acquire/release the Android WifiManager MulticastLock so LocalSend
+/// discovery announcements are delivered while the service runs.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MulticastLockRequest {
+    pub acquire: bool,
 }
 
 /// Which piece of the OS selection UI to gate: "gesture" suppresses the
@@ -388,6 +410,42 @@ pub struct ClipUrlResponse {
     /// Rendered `document.documentElement.outerHTML` captured from the
     /// hidden WKWebView / WebView once load+settle completed.
     pub html: String,
+}
+
+/// Args for the in-app web browser (#5775). Mirrors `WebBrowserOptions`
+/// in `web_browser.rs` plus the absolute `download_dir` Rust resolved from
+/// `app_cache_dir()` so native downloads land inside the fs scope.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebBrowserRequest {
+    pub url: String,
+    pub download_dir: String,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub foreground: Option<String>,
+    #[serde(default)]
+    pub is_eink: Option<bool>,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebBrowserResponse {
+    /// Set when the user tapped [Open] on an imported book in the chrome.
+    #[serde(default)]
+    pub open_book_hash: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebBrowserStatusRequest {
+    /// `importing` | `added` | `failed` | `unsupported`
+    pub state: String,
+    pub filename: String,
+    #[serde(default)]
+    pub book_hash: Option<String>,
 }
 
 /// Read (and delete) a page-HTML file the iOS Share Extension captured

@@ -60,6 +60,13 @@ impl<R: Runtime> NativeBridge<R> {
         Err(crate::Error::UnsupportedPlatformError)
     }
 
+    pub fn render_pdf_cover(
+        &self,
+        _payload: RenderPdfCoverRequest,
+    ) -> crate::Result<RenderPdfCoverResponse> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
     pub fn save_image_to_gallery(
         &self,
         _payload: SaveImageToGalleryRequest,
@@ -68,6 +75,10 @@ impl<R: Runtime> NativeBridge<R> {
     }
 
     pub fn use_background_audio(&self, _payload: UseBackgroundAudioRequest) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatformError)
+    }
+
+    pub fn set_multicast_lock(&self, _payload: MulticastLockRequest) -> crate::Result<()> {
         Err(crate::Error::UnsupportedPlatformError)
     }
 
@@ -315,6 +326,22 @@ impl<R: Runtime> NativeBridge<R> {
         Err(crate::Error::NativeBridgeError(
             "clip_url plugin is mobile-only; desktop callers should invoke the top-level command"
                 .to_string(),
+        ))
+    }
+
+    pub fn open_web_browser(
+        &self,
+        _payload: WebBrowserRequest,
+    ) -> crate::Result<WebBrowserResponse> {
+        Err(crate::Error::NativeBridgeError(
+            "open_web_browser plugin is mobile-only; desktop callers should invoke the top-level command"
+                .to_string(),
+        ))
+    }
+
+    pub fn set_web_browser_status(&self, _payload: WebBrowserStatusRequest) -> crate::Result<()> {
+        Err(crate::Error::NativeBridgeError(
+            "set_web_browser_status plugin is mobile-only".to_string(),
         ))
     }
 

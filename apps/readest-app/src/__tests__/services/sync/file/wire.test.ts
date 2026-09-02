@@ -41,6 +41,48 @@ describe('wire envelope (frozen)', () => {
     expect('viewSettings' in p.config).toBe(false);
   });
 
+  test('preserves a reserved Notebook record through the frozen wire envelope', () => {
+    const notebookConfig: BookConfig = {
+      ...config,
+      booknotes: [
+        {
+          id: 'notebook',
+          type: 'notebook',
+          cfi: 'epubcfi(/6/2)',
+          note: '# Notes',
+          createdAt: 10,
+          updatedAt: 20,
+        },
+      ],
+    };
+
+    const parsed = parseRemotePayload(
+      JSON.stringify(buildRemotePayload(book, notebookConfig, 'dev-1')),
+    );
+
+    expect(parsed?.booknotes).toEqual(notebookConfig.booknotes);
+  });
+
+  // Issue #5716. The count stands in for the book's own page list, so it is
+  // book data rather than a screen preference. It rides its own envelope key
+  // instead of `config.viewSettings` so the generic scalar spread in
+  // mergeBookConfig can never replace a peer's whole viewSettings object.
+  test('buildRemotePayload carries the reference page count outside config', () => {
+    const withCount = {
+      ...config,
+      viewSettings: { fontSize: 14, referencePageCount: 350 },
+    } as unknown as BookConfig;
+    const p = buildRemotePayload(book, withCount, 'dev-1');
+    expect(p.referencePageCount).toBe(350);
+    // Still never leaks the rest of viewSettings.
+    expect('viewSettings' in p.config).toBe(false);
+  });
+
+  test('buildRemotePayload omits the count when the user never set one', () => {
+    const p = buildRemotePayload(book, config, 'dev-1');
+    expect(p.referencePageCount).toBeUndefined();
+  });
+
   test('parseRemotePayload rejects null / non-JSON / wrong schema', () => {
     expect(parseRemotePayload(null)).toBeNull();
     expect(parseRemotePayload('not json')).toBeNull();

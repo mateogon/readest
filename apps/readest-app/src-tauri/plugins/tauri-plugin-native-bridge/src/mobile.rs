@@ -46,6 +46,15 @@ impl<R: Runtime> NativeBridge<R> {
             .run_mobile_plugin("copy_uri_to_path", payload)
             .map_err(Into::into)
     }
+
+    pub fn render_pdf_cover(
+        &self,
+        payload: RenderPdfCoverRequest,
+    ) -> crate::Result<RenderPdfCoverResponse> {
+        self.0
+            .run_mobile_plugin("render_pdf_cover", payload)
+            .map_err(Into::into)
+    }
 }
 
 impl<R: Runtime> NativeBridge<R> {
@@ -64,6 +73,24 @@ impl<R: Runtime> NativeBridge<R> {
         self.0
             .run_mobile_plugin("use_background_audio", payload)
             .map_err(Into::into)
+    }
+}
+
+impl<R: Runtime> NativeBridge<R> {
+    /// The MulticastLock is an Android concept; iOS delivers multicast
+    /// without one (entitlements permitting), so this is a no-op there.
+    pub fn set_multicast_lock(&self, payload: MulticastLockRequest) -> crate::Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin("set_multicast_lock", payload)
+                .map_err(Into::into)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = payload;
+            Ok(())
+        }
     }
 }
 
@@ -396,6 +423,26 @@ impl<R: Runtime> NativeBridge<R> {
     pub fn clip_url(&self, payload: ClipUrlRequest) -> crate::Result<ClipUrlResponse> {
         self.0
             .run_mobile_plugin("clip_url", payload)
+            .map_err(Into::into)
+    }
+
+    /// Present the native in-app browser (`WebBrowserController.swift/.kt`).
+    /// Blocks until the user closes it; downloads arrive meanwhile as
+    /// `web-browser-download` plugin events.
+    pub fn open_web_browser(
+        &self,
+        payload: WebBrowserRequest,
+    ) -> crate::Result<WebBrowserResponse> {
+        self.0
+            .run_mobile_plugin("open_web_browser", payload)
+            .map_err(Into::into)
+    }
+
+    /// Push an import status into the open browser's banner.
+    pub fn set_web_browser_status(&self, payload: WebBrowserStatusRequest) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin::<serde::de::IgnoredAny>("set_web_browser_status", payload)
+            .map(|_| ())
             .map_err(Into::into)
     }
 

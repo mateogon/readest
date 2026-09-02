@@ -31,6 +31,14 @@ pub(crate) async fn copy_uri_to_path<R: Runtime>(
 }
 
 #[command]
+pub(crate) async fn render_pdf_cover<R: Runtime>(
+    app: AppHandle<R>,
+    payload: RenderPdfCoverRequest,
+) -> Result<RenderPdfCoverResponse> {
+    app.native_bridge().render_pdf_cover(payload)
+}
+
+#[command]
 pub(crate) async fn save_image_to_gallery<R: Runtime>(
     app: AppHandle<R>,
     payload: SaveImageToGalleryRequest,
@@ -44,6 +52,14 @@ pub(crate) async fn use_background_audio<R: Runtime>(
     payload: UseBackgroundAudioRequest,
 ) -> Result<()> {
     app.native_bridge().use_background_audio(payload)
+}
+
+#[command]
+pub(crate) async fn set_multicast_lock<R: Runtime>(
+    app: AppHandle<R>,
+    payload: MulticastLockRequest,
+) -> Result<()> {
+    app.native_bridge().set_multicast_lock(payload)
 }
 
 #[command]

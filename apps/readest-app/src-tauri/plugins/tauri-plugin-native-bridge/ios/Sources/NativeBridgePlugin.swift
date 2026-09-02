@@ -575,6 +575,9 @@ class NativeBridgePlugin: Plugin {
   private var webViewLifecycleManager: WebViewLifecycleManager?
   private var pencilGestureHandler: PencilGestureHandler?
   private var traitChangeRegistered = false
+  // The in-app browser currently presented by `open_web_browser` (#5775);
+  // `set_web_browser_status` pushes import results into its banner.
+  private weak var activeWebBrowser: WebBrowserController?
 
   // Screen-brightness management. `UIScreen.main.brightness` is a *global*
   // device setting, not a per-window one: once the app writes to it, iOS
@@ -1636,6 +1639,65 @@ class NativeBridgePlugin: Plugin {
     }
   }
 
+  /// Present the in-app browser (#5775). Resolves `{ openBookHash? }` when
+  /// the user closes it; downloads are forwarded as `web-browser-download`
+  /// plugin events while it is open. See `WebBrowserController.swift`.
+  @objc public func open_web_browser(_ invoke: Invoke) {
+    let args: WebBrowserArgs
+    do {
+      args = try invoke.parseArgs(WebBrowserArgs.self)
+    } catch {
+      invoke.reject(error.localizedDescription)
+      return
+    }
+    guard let url = URL(string: args.url), let scheme = url.scheme?.lowercased(),
+      scheme == "http" || scheme == "https"
+    else {
+      invoke.reject("Invalid URL")
+      return
+    }
+    DispatchQueue.main.async {
+      guard let presenter = topmostViewController() else {
+        invoke.reject("Could not find a view controller to present from")
+        return
+      }
+      let controller = WebBrowserController(args: args)
+      controller.onDownload = { [weak self] event in
+        var data: JSObject = [
+          "url": event.url, "path": event.path, "filename": event.filename,
+          "success": event.success,
+        ]
+        if let error = event.error { data["error"] = error }
+        self?.trigger("web-browser-download", data: data)
+      }
+      controller.onFinish = { [weak self] hash in
+        self?.activeWebBrowser = nil
+        var ret = JSObject()
+        if let hash = hash { ret["openBookHash"] = hash }
+        invoke.resolve(ret)
+      }
+      self.activeWebBrowser = controller
+      presenter.present(controller, animated: true)
+    }
+  }
+
+  /// Push an import status (importing / added / failed / unsupported) into
+  /// the open browser's banner. No-op when no browser is presented.
+  @objc public func set_web_browser_status(_ invoke: Invoke) {
+    let args: WebBrowserStatusArgs
+    do {
+      args = try invoke.parseArgs(WebBrowserStatusArgs.self)
+    } catch {
+      invoke.reject(error.localizedDescription)
+      return
+    }
+    DispatchQueue.main.async {
+      self.activeWebBrowser?.setStatus(
+        state: args.state, filename: args.filename, bookHash: args.bookHash)
+      invoke.resolve()
+    }
+  }
+
   /// Read + delete a page-HTML file the Share Extension captured from
   /// the user's signed-in Safari tab (App Group `SharedClips/`). Resolves
   /// `{ html }`, or `{}` when the file is missing/unreadable — the JS
@@ -2122,7 +2184,26 @@ private final class ShareBridgeMessageHandler: NSObject, WKScriptMessageHandler 
 @available(iOS 13.0, *)
 extension NativeBridgePlugin: ASWebAuthenticationPresentationContextProviding {
   func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-    return UIApplication.shared.windows.first ?? UIWindow()
+    // `UIApplication.shared.windows` is deprecated since iOS 15 and returns
+    // every window of every scene in an arbitrary order, so it can hand back a
+    // system-owned window: UIRemoteKeyboardWindow and UITextEffectsWindow are
+    // both alive whenever the keyboard is up, which is exactly the state the
+    // sign-in screen is in when the user taps an OAuth provider. Anchoring the
+    // auth sheet to one of those leaves UIKit's remote view controller hosting
+    // without a process handle and it aborts the app
+    // ("Invalid condition not satisfying: processHandle"). The old
+    // `?? UIWindow()` fallback was worse still - a window with no scene can
+    // never host a remote view controller. Keyboard and text-effects windows
+    // sit above `.normal`, so the window level filters them out.
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+    let windows = (scene?.windows ?? []).filter { $0.windowLevel == .normal }
+    if let anchor = windows.first(where: { $0.isKeyWindow }) ?? windows.first {
+      return anchor
+    }
+    // Unreachable while the WebView is on screen; still keep the fallback
+    // attached to a scene so remote view hosting has one.
+    return scene.map { UIWindow(windowScene: $0) } ?? UIWindow()
   }
 }
 

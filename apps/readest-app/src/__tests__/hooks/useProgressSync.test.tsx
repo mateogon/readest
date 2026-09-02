@@ -41,11 +41,20 @@ const h = vi.hoisted(() => {
     setViewSettingsMock: vi.fn(),
     recreateViewerMock: vi.fn(),
     cfiCompareMock: vi.fn((_a: string, _b: string) => 0),
-    view: { renderer: { getContents: () => [], primaryIndex: 0 }, goTo: vi.fn() },
+    getCFIFromXPointerMock: vi.fn(async (..._args: unknown[]) => ''),
+    view: {
+      renderer: { getContents: () => [], primaryIndex: 0 },
+      goTo: vi.fn(),
+      goToFraction: vi.fn(),
+    },
     state: {
       syncedConfigs: [] as unknown[] | null,
-      progress: { location: 'cfi-loc' } as { location: string } | null,
-      viewSettings: { proofreadRules: [] } as { proofreadRules: unknown[] } | null,
+      progress: { location: 'cfi-loc' } as { location: string; fraction?: number } | null,
+      viewSettings: { proofreadRules: [] } as {
+        proofreadRules: unknown[];
+        referencePageCount?: number;
+      } | null,
+      bookDoc: {} as unknown,
     },
     eventListeners: new Map<string, Set<(e: CustomEvent) => void>>(),
   };
@@ -76,7 +85,7 @@ vi.mock('@/store/bookDataStore', () => ({
     getConfig: () => h.config,
     setConfig: vi.fn(),
     saveConfig: h.saveConfigMock,
-    getBookData: () => ({ book: h.book }),
+    getBookData: () => ({ book: h.book, bookDoc: h.state.bookDoc }),
   }),
 }));
 
@@ -108,11 +117,22 @@ vi.mock('@/store/libraryStore', () => ({
 }));
 
 vi.mock('@/utils/serializer', () => ({
-  serializeConfig: () => JSON.stringify({ progress: [5, 100], location: 'cfi-loc' }),
+  serializeConfig: () =>
+    JSON.stringify({
+      progress: [5, 100],
+      location: 'cfi-loc',
+      audiobook: {
+        version: 1,
+        files: [{ path: 'h1/audiobook/private.m4b' }],
+        chapters: [],
+        mappings: [],
+        createdAt: 1,
+      },
+    }),
 }));
 
 vi.mock('@/utils/xcfi', () => ({
-  getCFIFromXPointer: vi.fn(async () => ''),
+  getCFIFromXPointer: (...args: unknown[]) => h.getCFIFromXPointerMock(...args),
   getXPointerFromCFI: vi.fn(async () => ({ xpointer: '' })),
 }));
 
@@ -157,11 +177,16 @@ beforeEach(() => {
   h.setViewSettingsMock.mockClear();
   h.recreateViewerMock.mockClear();
   h.view.goTo.mockClear();
+  h.view.goToFraction.mockClear();
   h.cfiCompareMock.mockReset();
   h.cfiCompareMock.mockReturnValue(0);
+  h.getCFIFromXPointerMock.mockReset();
+  h.getCFIFromXPointerMock.mockResolvedValue('');
+  h.book.format = 'PDF';
   h.state.syncedConfigs = [];
   h.state.progress = { location: 'cfi-loc' };
   h.state.viewSettings = { proofreadRules: [] };
+  h.state.bookDoc = {};
   h.eventListeners.clear();
 });
 
@@ -198,6 +223,16 @@ describe('useProgressSync', () => {
 
     expect(h.syncConfigsMock).toHaveBeenCalledWith(expect.any(Array), 'h1', 'm1', 'push');
     expect(h.syncBooksMock).not.toHaveBeenCalled();
+  });
+
+  test('does not upload the device-local audiobook association', async () => {
+    renderHook(() => useProgressSync('h1-view1'));
+    await flushAutoSync();
+
+    const push = h.syncConfigsMock.mock.calls.find((call) => (call as unknown[])[3] === 'push') as
+      | unknown[]
+      | undefined;
+    expect((push?.[0] as unknown[])?.[0]).not.toHaveProperty('audiobook');
   });
 
   test('retries the first pull on failure with backoff, then releases the gate', async () => {
@@ -337,6 +372,77 @@ describe('useProgressSync', () => {
     expect(h.recreateViewerMock).toHaveBeenCalledTimes(1);
   });
 
+  // Issue #5716: a reference page count typed on one device never reached the
+  // others, because the pull applies only proofreadRules out of a remote
+  // config's viewSettings. The count describes the book's print edition, so it
+  // has to travel like reading state does.
+  test('adopts a synced reference page count into local view settings', async () => {
+    h.cfiCompareMock.mockReturnValue(0);
+    h.state.viewSettings = { proofreadRules: [] };
+    h.state.syncedConfigs = [
+      {
+        bookHash: 'h1',
+        metaHash: 'm1',
+        updatedAt: 5000,
+        viewSettings: { referencePageCount: 350 },
+      },
+    ];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.setViewSettingsMock).toHaveBeenCalledTimes(1);
+    const applied = h.setViewSettingsMock.mock.calls[0]![1] as { referencePageCount?: number };
+    expect(applied.referencePageCount).toBe(350);
+    expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+    // The footer reads the count straight off viewSettings, so there is no
+    // reason to tear down and rebuild the view the way a rule change needs.
+    expect(h.recreateViewerMock).not.toHaveBeenCalled();
+  });
+
+  test('a peer without a reference page count never clears the local one', async () => {
+    h.cfiCompareMock.mockReturnValue(0);
+    h.state.viewSettings = { proofreadRules: [], referencePageCount: 350 };
+    h.state.syncedConfigs = [{ bookHash: 'h1', metaHash: 'm1', updatedAt: 5000, viewSettings: {} }];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.setViewSettingsMock).not.toHaveBeenCalled();
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+  });
+
+  test('an equal config timestamp keeps the local page count', async () => {
+    // Pinned on both backends so they can never pick different winners for the
+    // same pair of configs; the file-sync twin lives in sync/file/merge.test.ts.
+    h.cfiCompareMock.mockReturnValue(0);
+    h.state.viewSettings = { proofreadRules: [], referencePageCount: 350 };
+    h.state.syncedConfigs = [
+      {
+        bookHash: 'h1',
+        metaHash: 'm1',
+        updatedAt: h.config.updatedAt,
+        viewSettings: { referencePageCount: 400 },
+      },
+    ];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.setViewSettingsMock).not.toHaveBeenCalled();
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+  });
+
+  test('does not rewrite the config when neither side has a page count', async () => {
+    // An unset key and a 0 both mean "no count". Treating them as different
+    // would rewrite viewSettings and bump updatedAt on every single book open.
+    h.cfiCompareMock.mockReturnValue(0);
+    h.state.viewSettings = { proofreadRules: [] };
+    h.state.syncedConfigs = [{ bookHash: 'h1', metaHash: 'm1', updatedAt: 5000, viewSettings: {} }];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.setViewSettingsMock).not.toHaveBeenCalled();
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+  });
+
   test('does not touch the view when synced proofread rules match local', async () => {
     h.cfiCompareMock.mockReturnValue(0);
     const rule = { id: 'same', scope: 'book', pattern: 'a', updatedAt: 100 };
@@ -383,5 +489,105 @@ describe('useProgressSync', () => {
     // The pending push is flushed immediately — Device A's last local position
     // reaches the cloud before the reader tears down.
     expect(pushCallCount()).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// Issue #5625. The Readest KOReader plugin pushes `progress` + `xpointer` and
+// never a `location`, so the CREngine XPointer is the ONLY precise handle on
+// the remote position. When converting it throws — a chapter whose XHTML isn't
+// well-formed used to make `createDocument()` hand back a body-less
+// `parsererror` document — the rejection escaped `applyRemoteProgress`
+// entirely: the reader stayed put, the proofread merge never ran, and the
+// debounced auto-push then overwrote the newer Kobo position with the older
+// local one.
+describe('useProgressSync — KOReader-origin config (#5625)', () => {
+  // [current, total] as CREngine paginates it, matching the reported payload.
+  const KO_PROGRESS: [number, number] = [176, 411];
+  const KO_FRACTION = 176 / 411;
+  const koConfig = (extra: Record<string, unknown> = {}) => ({
+    bookHash: 'h1',
+    metaHash: 'm1',
+    progress: KO_PROGRESS,
+    xpointer: '/body/DocFragment[14]/body/p[45]/text().0',
+    updatedAt: 3000,
+    ...extra,
+  });
+
+  beforeEach(() => {
+    h.book.format = 'EPUB';
+    h.state.progress = { location: 'cfi-loc', fraction: 0.05 };
+  });
+
+  test('feeds the KOReader page fraction in as the DocFragment drift anchor', async () => {
+    h.state.syncedConfigs = [koConfig()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.getCFIFromXPointerMock).toHaveBeenCalledTimes(1);
+    expect(h.getCFIFromXPointerMock.mock.calls[0]![4]).toBeCloseTo(KO_FRACTION, 6);
+  });
+
+  test('does not anchor on the percentage when the remote config carries its own CFI', async () => {
+    // A Readest-origin config: its xpointer was derived from that same CFI, so
+    // the nominal DocFragment is already exact and its [page, total] is
+    // foliate's pagination, not CREngine's — re-anchoring on it would move the
+    // target to the wrong section.
+    h.state.syncedConfigs = [koConfig({ location: 'epubcfi(/6/24!/4/20/1:58)' })];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.getCFIFromXPointerMock.mock.calls[0]![4]).toBeUndefined();
+  });
+
+  test('a failed XPointer conversion still lets the rest of the pull run', async () => {
+    h.getCFIFromXPointerMock.mockRejectedValue(new Error('Failed to convert XPointer'));
+    h.state.viewSettings = {
+      proofreadRules: [{ id: 'local', scope: 'book', pattern: 'a', updatedAt: 100 }],
+    };
+    h.state.syncedConfigs = [
+      koConfig({
+        viewSettings: {
+          proofreadRules: [{ id: 'remote', scope: 'book', pattern: 'b', updatedAt: 200 }],
+        },
+      }),
+    ];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    // The throw used to reject applyRemoteProgress before this point.
+    expect(h.setViewSettingsMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('falls back to the reported fraction when the XPointer cannot be converted', async () => {
+    h.getCFIFromXPointerMock.mockRejectedValue(new Error('Failed to convert XPointer'));
+    h.state.syncedConfigs = [koConfig()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).toHaveBeenCalledTimes(1);
+    expect(h.view.goToFraction.mock.calls[0]![0]).toBeCloseTo(KO_FRACTION, 6);
+  });
+
+  test('never walks the reader backwards on that fallback', async () => {
+    // Local is already past the Kobo position; an approximate jump would be a
+    // regression, and the auto-push will carry the local position forward.
+    h.getCFIFromXPointerMock.mockRejectedValue(new Error('Failed to convert XPointer'));
+    h.state.progress = { location: 'cfi-loc', fraction: 0.9 };
+    h.state.syncedConfigs = [koConfig()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+
+  test('prefers the converted CFI over the approximate fraction', async () => {
+    h.getCFIFromXPointerMock.mockResolvedValue('epubcfi(/6/30!/4/90/1:0)');
+    h.cfiCompareMock.mockReturnValue(-1);
+    h.state.syncedConfigs = [koConfig()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goTo).toHaveBeenCalledWith('epubcfi(/6/30!/4/90/1:0)');
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
   });
 });

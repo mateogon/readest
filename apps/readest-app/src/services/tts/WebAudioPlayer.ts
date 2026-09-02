@@ -153,6 +153,12 @@ export interface WebAudioPlayerDiagnostics {
 }
 
 export interface WebAudioSessionOptions {
+  // Silence to leave between the previous session's last sample and this
+  // session's first one, scheduled on the audio clock. A paragraph is one
+  // session, so this is the inter-paragraph pause: putting it here (rather
+  // than sleeping between sessions) lets the next paragraph's synthesis and
+  // decode run inside the pause instead of extending it (#5750).
+  startAfterPreviousSec?: number;
   // Controller-owned context. Automatic continuation distinguishes ordinary
   // paragraphs from chapter boundaries; manual starts and seeks pass null.
   transitionFromPrevious?: TTSPlaybackTransition;
@@ -311,6 +317,10 @@ export class WebAudioPlayer implements TTSAudioPlayer {
   #chapterGapMs: number[] = [];
   #coldStartGapMs: number[] = [];
   #lastAudibleEndSec: number | null = null;
+  // Audio-clock time at which the last naturally completed session stopped
+  // sounding. It is consumed once by the next session; a stop, seek, or skip
+  // clears it because the scheduled tail did not play.
+  #carryOverEndTime = 0;
   #maxBufferAheadMs = 0;
 
   constructor(createContext?: () => TTSAudioContext) {
@@ -348,6 +358,8 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     this.abortSession();
     const generation = ++this.#generation;
     this.#sessionsStarted += 1;
+    const carryOver = this.#carryOverEndTime;
+    this.#carryOverEndTime = 0;
     const transitionFromPrevious = options.transitionFromPrevious ?? null;
     if (transitionFromPrevious === null) this.#lastAudibleEndSec = null;
     this.#session = {
@@ -363,7 +375,8 @@ export class WebAudioPlayer implements TTSAudioPlayer {
       buffering: (options.startupBufferSec ?? 0) > 0 ? 'startup' : null,
       chunks: [],
       nextChunkIndex: 0,
-      nextStartTime: 0,
+      nextStartTime:
+        carryOver > 0 ? carryOver + Math.max(0, options.startAfterPreviousSec ?? 0) : 0,
       ended: false,
       endedEmitted: false,
       waiters: [],
@@ -476,6 +489,7 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     if (!session.endedEmitted) {
       this.#sessionsAborted += 1;
       this.#lastAudibleEndSec = null;
+      this.#carryOverEndTime = 0;
     }
     for (const chunk of session.chunks) {
       chunk.source.onended = null;
@@ -798,6 +812,10 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     if (session.chunks.some((c) => !c.ended)) return;
     session.endedEmitted = true;
     this.#sessionsCompleted += 1;
+    // Do not carry the last chunk's configured trailing gap into the next
+    // paragraph. The next session supplies its own paragraph pause.
+    const last = session.chunks.at(-1);
+    this.#carryOverEndTime = last ? last.startTime + last.duration : 0;
     session.onEvent({ type: 'session-end' });
   }
 

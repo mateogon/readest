@@ -6,6 +6,7 @@ import { isReadestCloudStorageActive } from '@/services/sync/cloudSyncProvider';
 import { TranslationFunc } from '@/hooks/useTranslation';
 import { createProgressThrottle, ProgressHandler, ProgressPayload } from '@/utils/transfer';
 import { eventDispatcher } from '@/utils/event';
+import { isAudiobook } from '@/utils/audiobook';
 import { getTransferMessages } from './transferMessages';
 
 const TRANSFER_QUEUE_KEY = 'readest_transfer_queue';
@@ -149,6 +150,9 @@ class TransferManager {
       return null;
     }
 
+    // ABS books stream from the server; there is no local file to upload.
+    if (isAudiobook(book)) return null;
+
     // Readest Cloud storage is not written to while a third-party
     // provider is selected. Before settings hydrate the entry is queued
     // and deferred; the reconcile on hydration decides its fate.
@@ -175,6 +179,9 @@ class TransferManager {
       console.warn('TransferManager not initialized');
       return null;
     }
+
+    // ABS books stream from the server; there is no cloud file to download.
+    if (isAudiobook(book)) return null;
 
     const store = useTransferStore.getState();
 
@@ -232,7 +239,9 @@ class TransferManager {
 
     const id = store.addReplicaTransfer(replicaKind, replicaId, displayTitle, 'upload', {
       priority: opts.priority,
-      isBackground: opts.isBackground,
+      // Replica transfers are background sync by default — see the note on
+      // queueReplicaDownload.
+      isBackground: opts.isBackground ?? true,
       files,
       base,
       reincarnation: opts.reincarnation,
@@ -260,7 +269,12 @@ class TransferManager {
 
     const id = store.addReplicaTransfer(replicaKind, replicaId, displayTitle, 'download', {
       priority: opts.priority,
-      isBackground: opts.isBackground,
+      // Replica bundles (fonts, textures, dictionaries, OPDS catalogs) sync on
+      // their own schedule, not because the user asked for this file right
+      // now. Toasting each one turns a fresh device into a wall of
+      // notifications, so they are background — and therefore silent — unless
+      // a caller explicitly opts into the foreground.
+      isBackground: opts.isBackground ?? true,
       files,
       base,
     });
@@ -286,7 +300,8 @@ class TransferManager {
 
     const id = store.addReplicaTransfer(replicaKind, replicaId, displayTitle, 'delete', {
       priority: opts.priority,
-      isBackground: opts.isBackground,
+      // Background by default — see the note on queueReplicaDownload.
+      isBackground: opts.isBackground ?? true,
       files: filenames.map((logical) => ({ logical, lfp: '', byteSize: 0 })),
     });
     this.persistQueue();
@@ -483,20 +498,27 @@ class TransferManager {
           this.processQueue();
         }, delay);
       } else {
-        if (errorMessage.includes('Not authenticated')) {
-          eventDispatcher.dispatch('toast', {
-            type: 'error',
-            message: _('Please log in to continue'),
-          });
-        } else if (isQuotaError) {
-          this.recordQuotaFailure();
-        } else {
-          const errorMessages = getTransferMessages(transfer, _).failure;
+        // Background work fails quietly. The success path has always honoured
+        // `isBackground`; the failure path did not, so a broken replica sync
+        // fired one toast per file (issue #5675 — sixteen "Failed to download
+        // file" toasts for sixteen fonts). The failure is still recorded on
+        // the transfer, which is what the Transfer Queue panel reads.
+        if (!transfer.isBackground) {
+          if (errorMessage.includes('Not authenticated')) {
+            eventDispatcher.dispatch('toast', {
+              type: 'error',
+              message: _('Please log in to continue'),
+            });
+          } else if (isQuotaError) {
+            this.recordQuotaFailure();
+          } else {
+            const errorMessages = getTransferMessages(transfer, _).failure;
 
-          eventDispatcher.dispatch('toast', {
-            type: 'error',
-            message: errorMessages[transfer.type],
-          });
+            eventDispatcher.dispatch('toast', {
+              type: 'error',
+              message: errorMessages[transfer.type],
+            });
+          }
         }
 
         useTransferStore.getState().setTransferStatus(transfer.id, 'failed', errorMessage);

@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: reference
   originSessionId: 0dba721b-b7cb-42d4-8240-34a5f3afd221
-  modified: 2026-08-08T06:51:35.812Z
+  modified: 2026-08-16T09:28:51.174Z
 ---
 
 Recipe for verifying reader/annotator changes in Chrome against `pnpm dev-web` (run it from
@@ -41,7 +41,33 @@ pointerId throws and `handlePointerUp` never reaches `onDragEnd`. The handles ar
 listens for `click` on the iframe document, so synthetic clicks on the top document just turn
 the page). Verify it fired by listening for `show-annotation` on the foliate-view element.
 
+**Import a test EPUB without a file picker:** the web library has no `<input type=file>`
+(native picker via button = undrivable). `useDragDropImport` listens for `drop` on
+`.library-page`, so build the File in page JS (inline the epub as base64, `new File`),
+put it in a `DataTransfer`, and dispatch a `DragEvent('drop', {bubbles: true})` with
+`dataTransfer` defined via `Object.defineProperty`. Import runs instantly. Don't delete
+the imported book afterwards if the user is signed in — library deletes can touch sync.
+
+**A blank reader pane on a PDF in `dev-web` is almost never a bug.** Unminified pdf.js takes
+**~30s per section** to render in dev: "Opening book" and the matching "doc index loaded: N" console
+lines were 31s apart for a 10-page sample PDF. Every navigation into an unrendered section (Home/End,
+page-jump, TOC click) shows a blank pane or the three-dot spinner for that long, and `renderer.page`
+already reports the target while nothing is painted. Before diagnosing a render bug, reload with **no
+keypress at all** as a baseline and grep the console for `doc index loaded` timestamps — a
+"reproducible" blank that also reproduces with zero input is just latency.
+
 **Screenshot coordinates:** the screenshot may be scaled relative to CSS pixels
 (e.g. 1568x774 image for a 1280x632 viewport). Coordinates you pass back are in the same
 scaled space, so reading positions off the screenshot is correct — but any coordinate you
-compute in CSS px from JS must be multiplied by `screenshotWidth / innerWidth`.
+compute in CSS px from JS must be multiplied by `screenshotWidth / innerWidth`. For SMALL
+targets (toolbar icons, superscript footnote links) don't eyeball the screenshot — a few
+px of reading error lands on foliate's tap-to-turn region or a dismiss overlay and silently
+does the wrong thing (page turn / popup dismissed). Get the element rect via JS
+(`getBoundingClientRect`), scale the center, and click that; verify hit-testing first with
+`document.elementFromPoint` in CSS space.
+
+**Opening a footnote/link popup reliably:** pixel-clicking tiny `<a>`s is flaky, but a
+synthetic `MouseEvent('click', {bubbles: true})` dispatched ON THE ANCHOR inside the
+iframe doc works — foliate's link handler listens on the iframe doc, so the event bubbles
+into it (unlike synthetic clicks on the top document, which just turn the page). Find it
+with `view.renderer.getContents()[i].doc.querySelector('a[href*="..."]')`.
