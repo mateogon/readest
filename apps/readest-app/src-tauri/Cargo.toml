@@ -34,7 +34,7 @@ log = "0.4"
 thiserror = "2"
 walkdir = "2"
 tokio = { version = "1", features = ["fs"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
 futures-util = "0.3"
 futures = "0.3.31"
 read-progress-stream = "1.0.0"
@@ -48,7 +48,14 @@ tauri-plugin-log = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-os = "2"
-tauri-plugin-http = { version = "2", features = ["dangerous-settings"] }
+# `unsafe-headers` lets callers pass fetch-spec "forbidden" headers (Origin,
+# Referer, Cookie, ...) instead of having the plugin silently drop them. Needed
+# so the OAuth token exchange can opt out of the webview Origin the plugin would
+# otherwise stamp on it, which Microsoft rejects with AADSTS90023.
+tauri-plugin-http = { version = "2", features = [
+  "dangerous-settings",
+  "unsafe-headers",
+] }
 tauri-plugin-shell = "2"
 tauri-plugin-process = "2"
 tauri-plugin-oauth = "2"
@@ -67,6 +74,23 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-device-info = "1.0.1"
 tauri-plugin-turso = { path = "./plugins/tauri-plugin-turso" }
 tauri-plugin-webdriver = { version = "0.2", optional = true }
+
+# LocalSend protocol v2.2 (discovery + HTTPS transfer). Upstream's own
+# protocol core, pinned by rev; `discovery` pulls `http`+`crypto`+`multicast`,
+# WebRTC/v3 stays off.
+#
+# Sourced from our fork, which only adds `update = none` to upstream's flutter
+# submodule. Cargo updates every submodule of a git dependency, so upstream
+# pulls the whole Flutter SDK (552 MB checked out) and blows past MAX_PATH on
+# Windows. The fork's `readest` branch tracks the same upstream rev
+# (ff2995c9523c5fae407f7d444d0986b2c6ae568e); rebase it when bumping.
+localsend = { git = "https://github.com/readest/localsend", rev = "3cae1825670617244ad235ba4295114d53e5fd2b", default-features = false, features = ["discovery"] }
+uuid = { version = "1", features = ["v4"] }
+pem = "4"
+anyhow = "1"
+bytes = "1"
+tokio-stream = "0.1"
+if-addrs = "0.15"
 
 # Native EPUB import path (Q1): zip + quick-xml + md5.
 # Used by `epub_parser::parse_epub_metadata` (partialMD5 + downscaled
@@ -89,7 +113,7 @@ percent-encoding = "2"
 # webview rendering (~30-60 KB instead of multi-MB). Default features
 # are disabled to keep the binary lean — we only need decoders for the
 # formats EPUBs actually use (jpeg/png/gif) plus the JPEG encoder.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 # Native MOBI/AZW/AZW3 import path. Mirrors the EPUB fast-path: parse
 # PalmDB + MobiHeader + EXTH in Rust to extract title/author/publisher/
@@ -98,6 +122,13 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # (which has to inflate the whole record stream up-front on the iOS
 # WebView). Pure-Rust crate, ships to every Tauri target.
 mobi = "0.8"
+
+# Import-only PDF metadata. `pdf` resolves the trailer/catalog/XMP from an
+# mmap-backed source, so importing does not allocate or transfer the complete
+# PDF. Page-one cover rendering stays in Android's native PdfRenderer.
+pdf = { version = "0.10", default-features = false }
+memmap2 = "0.9"
+flate2 = "1"
 
 # Crash/error reporting. `tauri-plugin-sentry` injects @sentry/browser into
 # every webview and routes browser + Rust panic events through one client.

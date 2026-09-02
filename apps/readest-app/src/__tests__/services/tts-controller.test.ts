@@ -194,10 +194,11 @@ function createMockView(): FoliateView {
 
 // --- Helper: create mock AppService ---
 
-function createMockAppService(isAndroid = false, isIOS = false): AppService {
+function createMockAppService(isAndroid = false, isIOS = false, isMacOS = false): AppService {
   return {
     isAndroidApp: isAndroid,
     isIOSApp: isIOS,
+    isMacOSApp: isMacOS,
   } as unknown as AppService;
 }
 
@@ -227,6 +228,10 @@ describe('TTSController', () => {
   });
 
   afterEach(async () => {
+    // Before anything that awaits a real timer: a fake-timer test that fails
+    // mid-way never reaches its own useRealTimers, and would hang every test
+    // after it on this shared clock.
+    vi.useRealTimers();
     // Ensure controller is stopped after each test
     try {
       await controller.stop();
@@ -290,12 +295,15 @@ describe('TTSController', () => {
       expect(c.ttsNativeClient).not.toBeNull();
     });
 
-    test('creates a separate buffered system client only on Android', () => {
+    test('creates the laptop host client on Android and macOS', () => {
       const android = new TTSController(createMockAppService(true), mockView);
       const ios = new TTSController(createMockAppService(false, true), mockView);
+      const macos = new TTSController(createMockAppService(false, false, true), mockView);
 
       expect(android.ttsLaptopUsbClient?.name).toBe('laptop-usb-supertonic');
       expect(android.ttsAndroidBufferedClient?.name).toBe('android-system-buffered');
+      expect(macos.ttsLaptopUsbClient?.name).toBe('laptop-usb-supertonic');
+      expect(macos.ttsAndroidBufferedClient).toBeNull();
       expect(ios.ttsLaptopUsbClient).toBeNull();
       expect(ios.ttsAndroidBufferedClient).toBeNull();
       expect(controller.ttsLaptopUsbClient).toBeNull();
@@ -761,7 +769,7 @@ describe('TTSController', () => {
       const laptopVoices: TTSVoicesGroup[] = [
         {
           id: 'laptop-usb-supertonic',
-          name: 'Laptop — Supertonic 3 por USB',
+          name: 'Laptop — Supertonic 3',
           voices: [
             {
               id: 'laptop-usb:supertonic3:en:sid8',
@@ -1560,6 +1568,50 @@ describe('TTSController', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       expect(forwardSpy).toHaveBeenCalledWith(false, true);
+    });
+
+    test('the paragraph gap is waited out as given, not re-scaled by the rate', async () => {
+      // The gap arrives already scaled for the rate (see scaleGapForRate);
+      // dividing it again here cut every paragraph pause in half at 2x (#5750).
+      vi.useFakeTimers();
+      await controller.init();
+      await controller.initViewTTS(0);
+      controller.setParagraphGap(0.3);
+      await controller.setRate(2);
+      const forwardSpy = vi.spyOn(controller, 'forward').mockResolvedValue();
+      speakingControllers.push(controller);
+
+      await controller.speak('<speak>hello</speak>');
+      await vi.advanceTimersByTimeAsync(290);
+      expect(forwardSpy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(forwardSpy).toHaveBeenCalledWith(false, true);
+      vi.useRealTimers();
+    });
+
+    test('a client that schedules its own gaps is not made to wait twice', async () => {
+      // The buffered client puts the paragraph pause on the audio clock, where
+      // the next paragraph's synthesis and decode hide inside it. Sleeping here
+      // as well would add the gap twice and put the network back on top (#5750).
+      vi.useFakeTimers();
+      await controller.init();
+      await controller.initViewTTS(0);
+      controller.setParagraphGap(0.3);
+      controller.ttsClient.getCapabilities = vi.fn().mockReturnValue({
+        wordBoundaries: true,
+        mediaClock: true,
+        gapControl: true,
+        liveRateChange: false,
+        scheduledGaps: true,
+      });
+      const forwardSpy = vi.spyOn(controller, 'forward').mockResolvedValue();
+      speakingControllers.push(controller);
+
+      await controller.speak('<speak>hello</speak>');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(forwardSpy).toHaveBeenCalledWith(false, true);
+      vi.useRealTimers();
     });
   });
 

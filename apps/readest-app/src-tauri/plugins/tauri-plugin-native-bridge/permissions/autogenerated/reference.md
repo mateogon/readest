@@ -9,6 +9,7 @@ Default permissions for the plugin
 - `allow-copy-uri-to-path`
 - `allow-save-image-to-gallery`
 - `allow-use-background-audio`
+- `allow-set-multicast-lock`
 - `allow-install-package`
 - `allow-set-system-ui-visibility`
 - `allow-get-status-bar-height`
@@ -953,6 +954,32 @@ Denies the open_external_url command without any pre-configured scope.
 <tr>
 <td>
 
+`native-bridge:allow-open-web-browser`
+
+</td>
+<td>
+
+Enables the open_web_browser command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-open-web-browser`
+
+</td>
+<td>
+
+Denies the open_web_browser command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `native-bridge:allow-read-share-clip-html`
 
 </td>
@@ -1050,6 +1077,32 @@ Enables the remove_listener command without any pre-configured scope.
 <td>
 
 Denies the remove_listener command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:allow-render-pdf-cover`
+
+</td>
+<td>
+
+Enables the render_pdf_cover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-render-pdf-cover`
+
+</td>
+<td>
+
+Denies the render_pdf_cover command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1213,6 +1266,32 @@ Denies the select_directory command without any pre-configured scope.
 <tr>
 <td>
 
+`native-bridge:allow-set-multicast-lock`
+
+</td>
+<td>
+
+Enables the set_multicast_lock command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-set-multicast-lock`
+
+</td>
+<td>
+
+Denies the set_multicast_lock command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `native-bridge:allow-set-screen-brightness`
 
 </td>
@@ -1336,6 +1415,32 @@ Enables the set_system_ui_visibility command without any pre-configured scope.
 <td>
 
 Denies the set_system_ui_visibility command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:allow-set-web-browser-status`
+
+</td>
+<td>
+
+Enables the set_web_browser_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-bridge:deny-set-web-browser-status`
+
+</td>
+<td>
+
+Denies the set_web_browser_status command without any pre-configured scope.
 
 </td>
 </tr>

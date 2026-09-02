@@ -15,6 +15,7 @@ const mockView = {
   prev: vi.fn(),
   next: vi.fn(),
   pan: vi.fn(),
+  goToFraction: vi.fn(),
   renderer: {
     scrolled: false,
     setAttribute: vi.fn(),
@@ -23,6 +24,11 @@ const mockView = {
     back: vi.fn(),
     forward: vi.fn(),
   },
+};
+
+const currentViewState = {
+  ttsEnabled: false,
+  inited: true,
 };
 
 const currentViewSettings = {
@@ -35,31 +41,58 @@ const currentViewSettings = {
   paragraphMode: { enabled: false },
 };
 
+const sideBarState = {
+  isSideBarPinned: false,
+  isSideBarVisible: false,
+  sideBarBookKey: 'book-1',
+};
+let currentSideBarTab = 'toc';
+const mockSetHoveredBookKey = vi.fn();
+const mockSetSideBarBookKey = vi.fn();
+const mockSetSideBarVisible = vi.fn();
+const mockSetSearchBarVisible = vi.fn();
+const mockToggleSideBar = vi.fn();
+const mockGetConfig = vi.fn(() => ({
+  viewSettings: { sideBarTab: currentSideBarTab },
+}));
+const mockSetConfig = vi.fn();
+
 vi.mock('@/store/readerStore', () => ({
   useReaderStore: () => ({
     getView: () => mockView,
-    getViewState: () => ({ ttsEnabled: false }),
+    getViewState: () => currentViewState,
     getViewSettings: () => currentViewSettings,
     setViewSettings: vi.fn(),
+    setHoveredBookKey: mockSetHoveredBookKey,
   }),
 }));
 
 vi.mock('@/store/sidebarStore', () => ({
-  useSidebarStore: () => ({
-    toggleSideBar: vi.fn(),
-    setSideBarBookKey: vi.fn(),
-  }),
+  useSidebarStore: Object.assign(
+    () => ({
+      toggleSideBar: mockToggleSideBar,
+      setSideBarBookKey: mockSetSideBarBookKey,
+      setSideBarVisible: mockSetSideBarVisible,
+      setSearchBarVisible: mockSetSearchBarVisible,
+    }),
+    { getState: () => sideBarState },
+  ),
 }));
 
+const mockSetSettingsDialogOpen = vi.fn();
+const mockSetSettingsDialogBookKey = vi.fn();
 vi.mock('@/store/settingsStore', () => ({
   useSettingsStore: () => ({
-    setSettingsDialogOpen: vi.fn(),
+    setSettingsDialogOpen: mockSetSettingsDialogOpen,
+    setSettingsDialogBookKey: mockSetSettingsDialogBookKey,
   }),
 }));
 
 vi.mock('@/store/bookDataStore', () => ({
   useBookDataStore: () => ({
     getBookData: vi.fn(),
+    getConfig: mockGetConfig,
+    setConfig: mockSetConfig,
   }),
 }));
 
@@ -127,7 +160,12 @@ describe('useBookShortcuts', () => {
     currentViewSettings.vertical = false;
     currentViewSettings.rtl = false;
     currentViewSettings.paragraphMode.enabled = false;
+    currentViewState.inited = true;
     mockView.book.dir = 'ltr';
+    sideBarState.isSideBarPinned = false;
+    sideBarState.isSideBarVisible = false;
+    sideBarState.sideBarBookKey = 'book-1';
+    currentSideBarTab = 'toc';
   });
 
   afterEach(() => {
@@ -178,6 +216,32 @@ describe('useBookShortcuts', () => {
     expect(mockView.next).toHaveBeenCalledWith(72);
   });
 
+  it('jumps to the start of the book on Home, ignoring the reading ruler (#5660)', () => {
+    vi.spyOn(eventDispatcher, 'dispatchSync').mockReturnValue(true);
+
+    render(<Harness />);
+    shortcutState.actions?.['onGoBookStart']?.();
+
+    expect(mockView.goToFraction).toHaveBeenCalledWith(0);
+  });
+
+  it('jumps to the end of the book on End (#5660)', () => {
+    render(<Harness />);
+    shortcutState.actions?.['onGoBookEnd']?.();
+
+    expect(mockView.goToFraction).toHaveBeenCalledWith(1);
+  });
+
+  it('ignores book start/end jumps until the view finished initializing (#5660)', () => {
+    currentViewState.inited = false;
+
+    render(<Harness />);
+    shortcutState.actions?.['onGoBookStart']?.();
+    shortcutState.actions?.['onGoBookEnd']?.();
+
+    expect(mockView.goToFraction).not.toHaveBeenCalled();
+  });
+
   it('dispatches rsvp-start for the current book when the RSVP shortcut fires', () => {
     const dispatchSpy = vi.spyOn(eventDispatcher, 'dispatch');
 
@@ -185,5 +249,72 @@ describe('useBookShortcuts', () => {
     shortcutState.actions?.['onStartRSVP']?.();
 
     expect(dispatchSpy).toHaveBeenCalledWith('rsvp-start', { bookKey: 'book-1' });
+  });
+
+  it('targets the active book when the settings shortcut opens the dialog (#5591)', () => {
+    render(<Harness />);
+    shortcutState.actions?.['onOpenFontLayoutSettings']?.();
+
+    expect(mockSetSettingsDialogBookKey).toHaveBeenCalledWith('book-1');
+    expect(mockSetSettingsDialogOpen).toHaveBeenCalledWith(true);
+  });
+
+  it.each([
+    {
+      name: 'opens a hidden table of contents',
+      state: { isSideBarVisible: false, sideBarBookKey: 'book-1', tab: 'toc' },
+      expectedVisibility: true,
+      writesTab: true,
+    },
+    {
+      name: 'switches another sidebar tab to the table of contents',
+      state: { isSideBarVisible: true, sideBarBookKey: 'book-1', tab: 'search' },
+      expectedVisibility: true,
+      writesTab: true,
+    },
+    {
+      name: "switches another book's sidebar to the table of contents",
+      state: { isSideBarVisible: true, sideBarBookKey: 'book-2', tab: 'toc' },
+      expectedVisibility: true,
+      writesTab: true,
+    },
+    {
+      name: 'closes the current unpinned table of contents',
+      state: { isSideBarVisible: true, sideBarBookKey: 'book-1', tab: 'toc' },
+      expectedVisibility: false,
+      writesTab: false,
+    },
+    {
+      name: 'keeps the current pinned table of contents open',
+      state: {
+        isSideBarPinned: true,
+        isSideBarVisible: true,
+        sideBarBookKey: 'book-1',
+        tab: 'toc',
+      },
+      expectedVisibility: undefined,
+      writesTab: false,
+    },
+  ])('$name', ({ state, expectedVisibility, writesTab }) => {
+    Object.assign(sideBarState, state);
+    currentSideBarTab = state.tab;
+    render(<Harness />);
+
+    shortcutState.actions?.['onOpenTableOfContents']?.();
+
+    if (expectedVisibility === undefined) {
+      expect(mockSetSideBarVisible).not.toHaveBeenCalled();
+      expect(mockSetSideBarBookKey).not.toHaveBeenCalled();
+      expect(mockSetHoveredBookKey).not.toHaveBeenCalled();
+    } else {
+      expect(mockSetSideBarVisible).toHaveBeenCalledWith(expectedVisibility);
+    }
+    if (writesTab) {
+      expect(mockSetConfig).toHaveBeenCalledWith('book-1', {
+        viewSettings: { sideBarTab: 'toc' },
+      });
+    } else {
+      expect(mockSetConfig).not.toHaveBeenCalled();
+    }
   });
 });

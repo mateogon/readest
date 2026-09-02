@@ -27,6 +27,7 @@ import {
 } from './providers/types';
 import { SynthesisCoordinator, SynthesisPriority } from './SynthesisCoordinator';
 import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
+import { DEFAULT_PARAGRAPH_GAP_SEC } from './gap';
 import {
   planTTSCompositeBatches,
   TTSCompositeBatch,
@@ -47,12 +48,13 @@ import {
 // the screen off), not when it is fetched — schedule-ahead would otherwise
 // run foliate's mark cursor ahead of the voice and break prev/next/resume.
 
-// Natural pause between sentences, replacing the silence Edge bakes into every
-// utterance: measured at ~0.18s leading and ~0.8s trailing, so ~1s of dead air
-// per sentence if it is played as-is (see #5414). Divided by the playback rate
-// so pauses shrink with speed (#2033's "gaps don't scale" complaint). Note the
-// native path only cuts the trailing silence, so its audible gap also carries
-// the next utterance's ~0.18s of leading silence.
+// Natural pause between sentences at 1.0x, replacing the silence Edge bakes
+// into every utterance: measured at ~0.18s leading and ~0.8s trailing, so ~1s
+// of dead air per sentence if it is played as-is (see #5414). The rate scaling
+// happens once, before the value reaches this client (see scaleGapForRate);
+// what arrives here is wall-clock seconds of silence. Note the native path only
+// cuts the trailing silence, so its audible gap also carries the next
+// utterance's ~0.18s of leading silence.
 export const DEFAULT_SENTENCE_GAP_SEC = 0.15;
 const TICKS_PER_SECOND = 10_000_000;
 // Android file synthesis is atomic and single-concurrency. At the observed
@@ -177,7 +179,7 @@ export class BufferedTTSClient implements TTSClient {
   #rate = 1.0;
   #pitch = 1.0;
   #sentenceGapSec = DEFAULT_SENTENCE_GAP_SEC;
-  #paragraphGapSec = 0;
+  #paragraphGapSec = DEFAULT_PARAGRAPH_GAP_SEC;
 
   // iOS plays natively (app-process AVPlayer): audio in the app's own audio
   // session makes Now Playing, pause-slot retention, AirPods routing, and the
@@ -488,7 +490,10 @@ export class BufferedTTSClient implements TTSClient {
       },
       {
         transitionFromPrevious,
-        leadingGapSec: this.#paragraphGapSec / this.#rate,
+        // The controller already rate-scales this wall-clock pause. Schedule
+        // it against the prior session so synthesis and decode can overlap it.
+        startAfterPreviousSec: this.#paragraphGapSec,
+        leadingGapSec: this.#paragraphGapSec,
         ...(streamProgress
           ? {
               startupBufferSec: ANDROID_STARTUP_BUFFER_SEC,
@@ -564,7 +569,7 @@ export class BufferedTTSClient implements TTSClient {
           if (located && meta.req && this.provider instanceof CachingProvider) {
             // The sentence audibly played: record its cache key against the
             // section manifest so a fully covered section can compact.
-            this.provider.recordMark(located.sectionIndex, located.sentenceIndex, meta.req);
+            void this.provider.recordMark(located.sectionIndex, located.sentenceIndex, meta.req);
           }
           this.#startWordTracking(generation, event.chunkIndex, meta);
           yield {
@@ -829,9 +834,11 @@ export class BufferedTTSClient implements TTSClient {
     return previousBlockOffset === unit.blockOffset ? 'sentence' : 'paragraph';
   }
 
-  #gapAfter(transition: 'sentence' | TTSPlaybackTransition, rate: number): number {
-    if (transition === 'sentence') return this.#sentenceGapSec / rate;
-    if (transition === 'paragraph' || transition === 'chapter') return this.#paragraphGapSec / rate;
+  #gapAfter(transition: 'sentence' | TTSPlaybackTransition): number {
+    // Both values arrive already scaled into wall-clock seconds by the hook.
+    // Dividing here again makes punctuation pauses too short at faster rates.
+    if (transition === 'sentence') return this.#sentenceGapSec;
+    if (transition === 'paragraph' || transition === 'chapter') return this.#paragraphGapSec;
     return 0;
   }
 
@@ -912,7 +919,7 @@ export class BufferedTTSClient implements TTSClient {
       chunkMeta.push({ logicalMarks: [logicalMeta] });
       try {
         const durationSec = await this.#player.scheduleRawChunk(generation, index, audio.data, {
-          gapSec: this.#gapAfter(transitionAfter, rate),
+          gapSec: this.#gapAfter(transitionAfter),
         });
         logicalMeta.durationSec = durationSec;
         this.#recordDurations(batch.request.voice, unit.mark.text, audio.boundaries, durationSec);
@@ -961,7 +968,7 @@ export class BufferedTTSClient implements TTSClient {
     this.#player.scheduleChunk(generation, prepared.buffer, {
       trimStartSec: prepared.trimStartSec,
       mediaScale: prepared.trimmedDurationSec / prepared.buffer.duration,
-      gapSec: this.#gapAfter(transitionAfter, rate),
+      gapSec: this.#gapAfter(transitionAfter),
       transitionFromPrevious: this.#transitionInto(state, unit),
     });
     state.lastScheduledBlockOffset = unit.blockOffset;
@@ -1048,7 +1055,7 @@ export class BufferedTTSClient implements TTSClient {
       // A configured gap can only be inserted between physical chunks. Inside
       // this composite, original punctuation/newlines and engine prosody own
       // the pauses; inserting silence at estimated offsets would cut speech.
-      gapSec: this.#gapAfter(batch.transitionAfter, rate),
+      gapSec: this.#gapAfter(batch.transitionAfter),
       transitionFromPrevious: this.#transitionInto(state, firstUnit),
       logicalBoundaryOffsetsSec: prepared.chunk.logicalBoundaryOffsetsSec,
     });
@@ -1414,9 +1421,9 @@ export class BufferedTTSClient implements TTSClient {
     this.#sentenceGapSec = sec;
   }
 
-  registerSectionManifest(section: number, marks: string[]): void {
+  registerSectionManifest(section: number, marks: string[]): Promise<void> | void {
     if (this.provider instanceof CachingProvider) {
-      this.provider.registerSectionManifest(section, marks);
+      return this.provider.registerSectionManifest(section, marks);
     }
   }
 
@@ -1443,6 +1450,7 @@ export class BufferedTTSClient implements TTSClient {
     ordinal: number,
     lang: string,
     text: string,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     if (!(this.provider instanceof CachingProvider)) return false;
     const voiceId = await this.getVoiceIdFromLang(lang);
@@ -1451,15 +1459,44 @@ export class BufferedTTSClient implements TTSClient {
       const lease = this.#synthesisCoordinator.acquire(req, {
         priority: 'warmup',
         generation: this.#synthesisCoordinator.generation,
+        signal,
       });
       if (!(await lease.result)) return false;
-    } catch {
+    } catch (err) {
       // Offline / permanent failure: leave the ordinal unrecorded so the
       // section stays incomplete and can be retried later.
+      console.warn(
+        `[TTS] warmSentence FAIL s=${section} o=${ordinal} lang=${lang} voice=${voiceId} ` +
+          `text="${text.slice(0, 80)}" err=${err instanceof Error ? err.message : String(err)}`,
+      );
       return false;
     }
-    this.provider.recordMark(section, ordinal, req);
+    await this.provider.recordMark(section, ordinal, req);
     return true;
+  }
+
+  async beginDownloadSections(sections: number[]): Promise<void> {
+    if (this.provider instanceof CachingProvider) {
+      await this.provider.beginDownloadSections(sections);
+    }
+  }
+
+  async completeDownloadSections(sections: number[]): Promise<void> {
+    if (this.provider instanceof CachingProvider) {
+      await this.provider.completeDownloadSections(sections);
+    }
+  }
+
+  async cancelDownloadSections(sections: number[]): Promise<void> {
+    if (this.provider instanceof CachingProvider) {
+      await this.provider.cancelDownloadSections(sections);
+    }
+  }
+
+  async clearDownloads(): Promise<void> {
+    if (this.provider instanceof CachingProvider) {
+      await this.provider.clearDownloads();
+    }
   }
 
   async compactCache(): Promise<void> {
@@ -1467,7 +1504,10 @@ export class BufferedTTSClient implements TTSClient {
   }
 
   async getSectionCacheStatuses(): Promise<
-    Map<number, { total: number; recorded: number; packed: boolean }>
+    Map<
+      number,
+      { total: number; recorded: number; packed: boolean; pinned: boolean; active: boolean }
+    >
   > {
     if (!(this.provider instanceof CachingProvider)) return new Map();
     return this.provider.getSectionStatuses();
@@ -1522,6 +1562,9 @@ export class BufferedTTSClient implements TTSClient {
       cacheable: this.provider.cacheable !== false,
       downloadable: false,
       measurableDurations: true,
+      // Only WebAudio can carry an exact audio-clock deadline between
+      // sessions. Native playback leaves this pause with the controller.
+      scheduledGaps: !(this.#player instanceof NativeAudioPlayer),
     };
   }
 

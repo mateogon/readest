@@ -3,6 +3,8 @@ import { CustomFont } from '@/styles/fonts';
 import { CustomTexture } from '@/styles/textures';
 import { HighlightColor, HighlightStyle, UserHighlightColor, ViewSettings } from './book';
 import { OPDSCatalog } from './opds';
+import { WebSource } from './webSource';
+import { ABSServer } from './audiobookshelf';
 import type { AISettings } from '@/services/ai/types';
 import type { NotebookTab } from '@/store/notebookStore';
 import type { DictionarySettings, ImportedDictionary } from '@/services/dictionaries/types';
@@ -84,6 +86,14 @@ export interface KOSyncSettings {
   checksumMethod: KOSyncChecksumMethod;
   strategy: KOSyncStrategy;
   customHeaders?: Record<string, string>;
+  /**
+   * Include the book's filename, title and authors in progress uploads, in the
+   * optional `metadata` field KOReader 2026.05+ sends when "Send document
+   * metadata" is enabled. The official sync server ignores it; custom
+   * KOSync-compatible servers may use it to identify what is being read.
+   * Off by default, matching KOReader.
+   */
+  sendMetadata?: boolean;
 }
 
 export interface BookOrbitSettings {
@@ -311,6 +321,7 @@ export type SyncCategory =
   | 'font'
   | 'texture'
   | 'opds_catalog'
+  | 'abs_server'
   | 'settings'
   | 'credentials'
   | 'stats';
@@ -323,6 +334,7 @@ export const SYNC_CATEGORIES: readonly SyncCategory[] = [
   'font',
   'texture',
   'opds_catalog',
+  'abs_server',
   'settings',
   'stats',
   'credentials',
@@ -335,6 +347,12 @@ export interface KeyBinding {
   id: string;
   /** Human-readable label shown in settings. */
   label: string;
+  /** DOM modifier state. Optional so persisted single-key bindings remain valid. */
+  ctrlKey?: boolean;
+  altKey?: boolean;
+  shiftKey?: boolean;
+  metaKey?: boolean;
+  altGraphKey?: boolean;
 }
 
 export interface HardwarePageTurnerSettings {
@@ -424,6 +442,12 @@ export interface SystemSettings {
   libraryAutoColumns: boolean;
   libraryColumns: number;
   librarySkeuomorphicCovers: boolean;
+  /**
+   * When true, the library hides real cover images and shows a plain
+   * title/author panel instead. Privacy escape hatch for when the shelf is
+   * visible to others.
+   */
+  libraryHideCovers: boolean;
   /** Show the recently-read carousel at the top of the library (issue #3797). */
   libraryRecentShelfEnabled: boolean;
   /**
@@ -443,6 +467,9 @@ export interface SystemSettings {
   customDictionaries: ImportedDictionary[];
   dictionarySettings: DictionarySettings;
   opdsCatalogs: OPDSCatalog[];
+  absServers: ABSServer[];
+  /** Saved sites for the "From Web Browser" import (#5775). Device-local. */
+  webSources?: WebSource[];
   metadataSeriesCollapsed: boolean;
   metadataOthersCollapsed: boolean;
   metadataDescriptionCollapsed: boolean;

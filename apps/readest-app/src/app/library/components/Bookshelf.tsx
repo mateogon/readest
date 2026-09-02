@@ -25,7 +25,9 @@ import { useEnv } from '@/context/EnvContext';
 import { useThemeStore } from '@/store/themeStore';
 import { useAutoFocus } from '@/hooks/useAutoFocus';
 import { useSettingsStore } from '@/store/settingsStore';
+import { isAbsBookOrphaned, useABSServerStore } from '@/store/absServerStore';
 import { useLibraryStore } from '@/store/libraryStore';
+import { selectActiveBookDownloadProgress, useTransferStore } from '@/store/transferStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { navigateToLibrary, navigateToReader, showReaderWindow } from '@/utils/nav';
@@ -54,6 +56,9 @@ import { eventDispatcher } from '@/utils/event';
 import { getLocalBookFilename } from '@/utils/book';
 import { MIMETYPES, EXTS } from '@/libs/document';
 import { makeSafeFilename } from '@/utils/misc';
+import { isTauriAppPlatform } from '@/services/environment';
+import { isLocalSendEnabled } from '@/services/localsend/devicePrefs';
+import { splitLibraryOpenIds } from '@/utils/audiobook';
 
 import { useSpatialNavigation } from '../hooks/useSpatialNavigation';
 import DeleteConfirmAlert from '@/components/DeleteConfirmAlert';
@@ -92,7 +97,8 @@ interface BookshelfProps {
   handleShowDetailsBook: (book: Book) => void;
   handleLibraryNavigation: (targetGroup: string) => void;
   handlePushLibrary: () => Promise<void>;
-  booksTransferProgress: { [key: string]: number | null };
+  /** Direct (non-queued) downloads only; queue transfers are read from the store. */
+  booksTransferProgress: { [key: string]: number };
   contentSearch: ContentSearchRequest | null;
   onSearchContents: () => void;
   onSearchProgress?: (value: number | null) => void;
@@ -280,15 +286,29 @@ const Bookshelf: React.FC<BookshelfProps> = ({
     [router, searchParams],
   );
 
+  // ABS books whose server row hasn't reached this device (or was removed)
+  // can't stream, have no cover source, and can't be opened — hide them from
+  // every shelf derivation (grid, groups, recent shelf, search). They stay in
+  // the store and keep syncing; they reappear the moment the server row
+  // lands. `absServers` and `settings` are deps because the orphan check
+  // reads the server store with a settings fallback, both of which hydrate
+  // asynchronously after the cached library first renders.
+  const absServers = useABSServerStore((state) => state.servers);
+  const visibleBooks = useMemo(
+    () => libraryBooks.filter((book) => !isAbsBookOrphaned(book)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [libraryBooks, absServers, settings],
+  );
+
   const filteredBooks = useMemo(() => {
     const bookFilter = createBookFilter(queryTerm);
-    return queryTerm ? libraryBooks.filter((book) => bookFilter(book)) : libraryBooks;
-  }, [libraryBooks, queryTerm]);
+    return queryTerm ? visibleBooks.filter((book) => bookFilter(book)) : visibleBooks;
+  }, [visibleBooks, queryTerm]);
 
   const manualGroupName = groupBy === LibraryGroupByType.Group ? getGroupName(groupId) : undefined;
   const currentShelfBooks = useMemo(
-    () => resolveCurrentShelfBooks(libraryBooks, groupBy, groupId, manualGroupName),
-    [libraryBooks, groupBy, groupId, manualGroupName],
+    () => resolveCurrentShelfBooks(visibleBooks, groupBy, groupId, manualGroupName),
+    [visibleBooks, groupBy, groupId, manualGroupName],
   );
   const filteredShelfBooks = useMemo(() => {
     const bookFilter = createBookFilter(queryTerm);
@@ -440,11 +460,26 @@ const Bookshelf: React.FC<BookshelfProps> = ({
 
   const openSelectedBooks = () => {
     handleSetSelectMode(false);
+    const { audiobookHash, readerIds, droppedAudiobooks } = splitLibraryOpenIds(
+      getSelectedBooks(),
+      (hash) => libraryBooks.find((book) => book.hash === hash),
+    );
+    if (audiobookHash) {
+      router.push(`/player?id=${audiobookHash}`);
+      return;
+    }
+    if (droppedAudiobooks) {
+      eventDispatcher.dispatch('toast', {
+        message: _('Audiobooks open in the player'),
+        type: 'info',
+      });
+    }
+    if (readerIds.length === 0) return;
     if (appService?.hasWindow && settings.openBookInNewWindow) {
-      showReaderWindow(appService, getSelectedBooks());
+      showReaderWindow(appService, readerIds);
     } else {
       setTimeout(() => setLoading(true), 200);
-      navigateToReader(router, getSelectedBooks());
+      navigateToReader(router, readerIds);
     }
   };
 
@@ -615,6 +650,19 @@ const Bookshelf: React.FC<BookshelfProps> = ({
         timeout: 2500,
       });
     }
+  };
+
+  const sendSelectedNearby = () => {
+    // Group ids in the selection simply don't match any book hash and drop
+    // out; LocalSendManager resolves the files and reports unavailable books.
+    const ids = getSelectedBooks();
+    const books = ids
+      .map((id) => filteredBooks.find((book) => book.hash === id))
+      .filter((book): book is Book => !!book);
+    if (books.length === 0) return;
+    setShowSelectModeActions(false);
+    handleSetSelectMode(false);
+    eventDispatcher.dispatch('localsend-send-books', { books });
   };
 
   const updateBooksStatus = async (status: ReadingStatus | undefined) => {
@@ -795,10 +843,22 @@ const Bookshelf: React.FC<BookshelfProps> = ({
   );
 
   // Flat recency slice of the whole library, independent of the main shelf's
-  // sort/grouping. Built from `libraryBooks` (not the sorted/filtered items).
+  // sort/grouping. Built from `visibleBooks` (not the sorted/filtered items).
   const recentBooks = useMemo(
-    () => selectRecentShelfBooks(libraryBooks, RECENT_SHELF_BOOK_COUNT),
-    [libraryBooks],
+    () => selectRecentShelfBooks(visibleBooks, RECENT_SHELF_BOOK_COUNT),
+    [visibleBooks],
+  );
+
+  // Cover transfer overlay progress for every book on screen, from both
+  // sources: queued downloads live in the transfer store, direct ones in
+  // `booksTransferProgress`. Merged on read so neither has to reconcile
+  // against the other's lifecycle, and so the recent strip and the grid
+  // cannot disagree about the same book. Selecting `transfers` keeps the
+  // subscription off the store's unrelated UI fields.
+  const transfers = useTransferStore((state) => state.transfers);
+  const transferProgress = useMemo(
+    () => ({ ...selectActiveBookDownloadProgress(transfers), ...booksTransferProgress }),
+    [transfers, booksTransferProgress],
   );
 
   // A top-level quick-resume strip: hidden while searching, inside a group, or
@@ -824,11 +884,13 @@ const Bookshelf: React.FC<BookshelfProps> = ({
           handleBookDownload={handleBookDownload}
           showBookDetailsModal={handleShowDetailsBook}
           showTimeRemaining={showTimeRemaining}
+          transferProgress={transferProgress}
         />
       ) : null,
     [
       showRecentShelf,
       recentBooks,
+      transferProgress,
       coverFit,
       settings.libraryAutoColumns,
       settings.libraryColumns,
@@ -920,9 +982,7 @@ const Bookshelf: React.FC<BookshelfProps> = ({
           handleShowDetailsBook={handleShowDetailsBook}
           handleLibraryNavigation={handleLibraryNavigation}
           handleUpdateReadingStatus={handleUpdateReadingStatus}
-          transferProgress={
-            'hash' in item ? booksTransferProgress[(item as Book).hash] || null : null
-          }
+          transferProgress={'hash' in item ? (transferProgress[(item as Book).hash] ?? null) : null}
           showTimeRemaining={showTimeRemaining}
         />
       );
@@ -935,7 +995,7 @@ const Bookshelf: React.FC<BookshelfProps> = ({
       viewMode,
       coverFit,
       isSelectMode,
-      booksTransferProgress,
+      transferProgress,
       iconSize15,
       handleImportBooks,
       toggleSelection,
@@ -968,7 +1028,7 @@ const Bookshelf: React.FC<BookshelfProps> = ({
       tabIndex={-1}
       role='main'
       aria-label={_('Bookshelf')}
-      className='bookshelf flex min-h-0 flex-grow flex-col focus:outline-none'
+      className='bookshelf flex min-h-0 grow flex-col focus:outline-hidden'
     >
       {!contentSearch?.query.trim() && queryTerm && (
         <div className='flex shrink-0 justify-center px-4 pb-2'>
@@ -979,7 +1039,7 @@ const Bookshelf: React.FC<BookshelfProps> = ({
               'eink-bordered border-base-200 bg-base-100 hover:border-base-300 hover:bg-base-300/40',
               'text-base-content/80 hover:text-base-content not-eink:transition-colors',
               'flex h-9 items-center gap-2 rounded-lg border px-4 text-sm font-medium duration-150',
-              'focus-visible:ring-base-content/15 focus-visible:outline-none focus-visible:ring-2',
+              'focus-visible:ring-base-content/15 focus-visible:outline-hidden focus-visible:ring-2',
             )}
           >
             <MdManageSearch aria-hidden='true' className='h-5 w-5' />
@@ -1047,6 +1107,8 @@ const Bookshelf: React.FC<BookshelfProps> = ({
             !!appService &&
             (appService.isIOSApp || appService.isAndroidApp || appService.isMacOSApp)
           }
+          sendNearbyEnabled={isTauriAppPlatform() && isLocalSendEnabled()}
+          onSendNearby={sendSelectedNearby}
           canDownload={downloadableBooks.length > 0}
           onOpen={openSelectedBooks}
           onGroup={groupSelectedBooks}

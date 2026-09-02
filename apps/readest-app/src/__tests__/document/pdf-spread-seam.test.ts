@@ -22,8 +22,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const PAGE_W = 612;
 const PAGE_H = 792;
 
-// Minimal stand-in for the vendored pdf.js build. foliate-js/pdf.js imports it
-// for the side effect of setting globalThis.pdfjsLib, then reads from that
+// Minimal stand-in for the vendored pdf.js build. foliate-js/pdf.js loads it
+// from makePDF() for the side effect of setting globalThis.pdfjsLib, then reads from that
 // global — so the mock installs a controllable fake there.
 vi.mock('@pdfjs/pdf.min.mjs', () => {
   class PDFDataRangeTransport {
@@ -40,7 +40,11 @@ vi.mock('@pdfjs/pdf.min.mjs', () => {
       height: PAGE_H * scale,
       scale,
     }),
-    render: () => ({ promise: Promise.resolve(), cancel: () => {} }),
+    render: (params: unknown) => {
+      const target = globalThis as typeof globalThis & { __pdfRenderParams?: unknown[] };
+      (target.__pdfRenderParams ??= []).push(params);
+      return { promise: Promise.resolve(), cancel: () => {} };
+    },
     streamTextContent: () => ({}),
     getTextContent: async () => ({ items: [] }),
     getAnnotations: async () => [],
@@ -50,7 +54,9 @@ vi.mock('@pdfjs/pdf.min.mjs', () => {
     numPages: 3,
     getPage: vi.fn(async () => makePage()),
     getMetadata: vi.fn(async () => ({ metadata: undefined, info: {} })),
+    getViewerPreferences: vi.fn(async () => null),
     getOutline: vi.fn(async () => null),
+    getPageLabels: vi.fn(async () => null),
     getDestination: vi.fn(),
     getPageIndex: vi.fn(),
     destroy: vi.fn(),
@@ -80,6 +86,7 @@ beforeEach(() => {
   );
   URL.createObjectURL = vi.fn(() => 'blob:mock');
   URL.revokeObjectURL = vi.fn();
+  (globalThis as typeof globalThis & { __pdfRenderParams?: unknown[] }).__pdfRenderParams = [];
   // jsdom has no 2D context; render() only forwards it to the mocked
   // page.render(), so a null context is fine.
   vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null);
@@ -91,6 +98,23 @@ afterEach(() => {
 });
 
 describe('PDF spread canvas seam (#4587)', () => {
+  it('renders imported PDF covers without depending on a visible animation frame', async () => {
+    const { makePDF } = await import('foliate-js/pdf.js');
+    const file = { size: 1024, slice: () => ({ arrayBuffer: async () => new ArrayBuffer(0) }) };
+    const book = (await makePDF(file as unknown as File)) as unknown as {
+      getCover: () => Promise<Blob | null>;
+    };
+    vi.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation((callback) => {
+      callback(new Blob(['cover'], { type: 'image/png' }));
+    });
+
+    await book.getCover();
+
+    const calls = (globalThis as typeof globalThis & { __pdfRenderParams?: unknown[] })
+      .__pdfRenderParams as Array<{ intent?: string }>;
+    expect(calls.at(-1)?.intent).toBe('print');
+  });
+
   it('sizes the page canvas to fill its box exactly at fractional devicePixelRatio', async () => {
     const { makePDF } = await import('foliate-js/pdf.js');
 

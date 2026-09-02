@@ -111,7 +111,7 @@ const makeProps = (overrides: Record<string, unknown> = {}) => ({
   ttsLang: 'en',
   isPlaying: true,
   hasTimeline: true,
-  hasGapControl: false,
+  audioTransport: false,
   timeoutOption: 0,
   timeoutTimestamp: 0,
   chapterRemainingSec: null as number | null,
@@ -120,8 +120,6 @@ const makeProps = (overrides: Record<string, unknown> = {}) => ({
   onBackward: vi.fn(),
   onForward: vi.fn(),
   onSetRate: vi.fn(),
-  onSetSentenceGap: vi.fn(),
-  onSetParagraphGap: vi.fn(),
   onGetVoices: vi.fn().mockResolvedValue(voiceGroups),
   onSetVoice: vi.fn(),
   onGetVoiceId: vi.fn().mockReturnValue('ava'),
@@ -131,15 +129,27 @@ const makeProps = (overrides: Record<string, unknown> = {}) => ({
   onGetPlaybackInfo: vi
     .fn()
     .mockReturnValue({ position: 10, duration: 100, measuredFraction: 0.4 }),
+  // Lyric view off by default here: these tests cover the cover player, and
+  // the lyric layout has its own suite.
+  supportsLyrics: false,
+  buffering: false,
+  onGetLyrics: vi.fn().mockResolvedValue(null),
+  onGetActiveIndex: vi.fn().mockReturnValue(-1),
+  onGetLyricPage: vi.fn().mockResolvedValue(null),
+  onPlayFromLyric: vi.fn().mockResolvedValue(undefined),
   downloads: {
     supported: false,
     chapters: [],
     statuses: new Map(),
     cacheBytes: 0,
-    download: { activeChapterKey: null, done: 0, total: 0 },
-    downloadChapter: vi.fn().mockResolvedValue(undefined),
-    downloadAll: vi.fn().mockResolvedValue(undefined),
-    cancel: vi.fn(),
+    clearing: false,
+    items: [],
+    itemFor: () => undefined,
+    downloadChapter: vi.fn(),
+    downloadAll: vi.fn(),
+    cancelChapter: vi.fn(),
+    cancelAll: vi.fn(),
+    clearDownloads: vi.fn().mockResolvedValue(undefined),
     statusOf: vi.fn().mockReturnValue('none'),
     refresh: vi.fn().mockResolvedValue(undefined),
   },
@@ -215,6 +225,27 @@ describe('TTSPlayerSheet', () => {
     expect(props.onForward).toHaveBeenCalledWith(false);
   });
 
+  test('a paired audiobook gets seek and chapter transport with the same step semantics', () => {
+    const props = makeProps({ audioTransport: true });
+    render(<TTSPlayerSheet {...props} />);
+    for (const label of [
+      'Previous Paragraph',
+      'Previous Sentence',
+      'Next Sentence',
+      'Next Paragraph',
+    ]) {
+      expect(screen.queryByLabelText(label)).toBeNull();
+    }
+    fireEvent.click(screen.getByLabelText('Previous Chapter'));
+    expect(props.onBackward).toHaveBeenCalledWith(false);
+    fireEvent.click(screen.getByLabelText('Back 15 Seconds'));
+    expect(props.onBackward).toHaveBeenCalledWith(true);
+    fireEvent.click(screen.getByLabelText('Forward 30 Seconds'));
+    expect(props.onForward).toHaveBeenCalledWith(true);
+    fireEvent.click(screen.getByLabelText('Next Chapter'));
+    expect(props.onForward).toHaveBeenCalledWith(false);
+  });
+
   test('main view offers a close button since desktop has no drag handle', () => {
     const props = makeProps();
     render(<TTSPlayerSheet {...props} />);
@@ -232,7 +263,59 @@ describe('TTSPlayerSheet', () => {
     const { container } = render(<TTSPlayerSheet {...makeProps()} />);
     const cover = container.querySelector('img');
     expect(cover).toBeTruthy();
-    expect(cover?.parentElement?.className).toContain('sm:pt-4');
+    // The cover sits inside the artwork/title block, which the main view owns.
+    expect(cover?.parentElement?.parentElement?.className).toContain('sm:pt-4');
+  });
+
+  test('rings the transport button while the engine has no audio out yet', () => {
+    const { container, rerender } = render(<TTSPlayerSheet {...makeProps()} />);
+    const button = screen.getByLabelText('Pause');
+    expect(button.getAttribute('aria-busy')).toBe('false');
+    expect(container.querySelector('svg circle')).toBeNull();
+
+    rerender(<TTSPlayerSheet {...makeProps({ buffering: true })} />);
+    const busy = screen.getByLabelText('Pause');
+    expect(busy.getAttribute('aria-busy')).toBe('true');
+    // The glyph stays: a reader must still be able to pause mid-fetch.
+    expect(busy.querySelector('svg circle')).toBeTruthy();
+  });
+
+  test('an aligned engine swaps the cover billing for the lyric sheet', async () => {
+    getBookData.mockReturnValue({
+      book: { title: 'Alice in Wonderland', coverImageUrl: 'blob:cover' },
+    });
+    const { container } = render(
+      <TTSPlayerSheet
+        {...makeProps({
+          supportsLyrics: true,
+          onGetLyrics: vi
+            .fn()
+            .mockResolvedValue({ sectionIndex: 0, lines: ['Down the rabbit hole.'] }),
+        })}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText('Down the rabbit hole.')).toBeTruthy());
+    // The artwork steps aside into a thumbnail so the transcript gets the room.
+    expect(container.querySelector('img')?.className).toContain('h-12');
+  });
+
+  test('a section with nothing to transcribe keeps the cover player', async () => {
+    getBookData.mockReturnValue({
+      book: { title: 'Alice in Wonderland', coverImageUrl: 'blob:cover' },
+    });
+    const onGetLyrics = vi.fn().mockResolvedValue(null);
+    const { container } = render(
+      <TTSPlayerSheet {...makeProps({ supportsLyrics: true, onGetLyrics })} />,
+    );
+    await waitFor(() => expect(onGetLyrics).toHaveBeenCalled());
+    await waitFor(() => expect(container.querySelector('img')?.className).toContain('h-32'));
+  });
+
+  test('an engine without sentence alignment never asks for a transcript', async () => {
+    const onGetLyrics = vi.fn().mockResolvedValue({ sectionIndex: 0, lines: ['nope'] });
+    render(<TTSPlayerSheet {...makeProps({ supportsLyrics: false, onGetLyrics })} />);
+    await waitFor(() => expect(screen.getByText('Alice in Wonderland')).toBeTruthy());
+    expect(onGetLyrics).not.toHaveBeenCalled();
   });
 
   test('the speed caption pads and truncates like its sibling captions', () => {
@@ -254,51 +337,9 @@ describe('TTSPlayerSheet', () => {
     expect(props.onSetRate).not.toHaveBeenCalled();
     fireEvent.pointerUp(slider);
     expect(props.onSetRate).toHaveBeenCalledWith(1.5);
-    expect(props.onSetSentenceGap).toHaveBeenCalledWith(0.12);
-    expect(props.onSetParagraphGap).toHaveBeenCalledWith(0.24);
     expect(viewSettings['ttsRate']).toBe(1.5);
-    expect(viewSettings['ttsSentenceGap']).toBe(0.12);
-    expect(viewSettings['ttsParagraphGap']).toBe(0.24);
     expect(settings.globalViewSettings.ttsRate).toBe(1.5);
-    expect(settings.globalViewSettings.ttsSentenceGap).toBe(0.12);
-    expect(settings.globalViewSettings.ttsParagraphGap).toBe(0.24);
     expect(saveSettings).toHaveBeenCalled();
-  });
-
-  test('selecting 1.0 persists the non-zero default gaps in seconds', () => {
-    viewSettings['ttsRate'] = 1.5;
-    const props = makeProps();
-    render(<TTSPlayerSheet {...props} />);
-    fireEvent.click(screen.getByLabelText('Speed'));
-    const slider = screen.getByRole('slider', { name: 'Speed' });
-    fireEvent.change(slider, { target: { value: '1.0' } });
-    fireEvent.pointerUp(slider);
-
-    expect(props.onSetRate).toHaveBeenCalledWith(1.0);
-    expect(props.onSetSentenceGap).toHaveBeenCalledWith(0.15);
-    expect(props.onSetParagraphGap).toHaveBeenCalledWith(0.3);
-    expect(viewSettings['ttsSentenceGap']).toBe(0.15);
-    expect(viewSettings['ttsParagraphGap']).toBe(0.3);
-    expect(settings.globalViewSettings.ttsSentenceGap).toBe(0.15);
-    expect(settings.globalViewSettings.ttsParagraphGap).toBe(0.3);
-    expect(saveSettings).toHaveBeenCalled();
-  });
-
-  test('rate-derived pauses keep sub-second precision instead of collapsing to zero', () => {
-    // The gaps are sub-second by design (0.15s / 0.3s), so rounding them to a
-    // whole number erases both at every speed - no pause between sentences or
-    // paragraphs, and no control left to restore one. See #5414.
-    const props = makeProps();
-    render(<TTSPlayerSheet {...props} />);
-    fireEvent.click(screen.getByLabelText('Speed'));
-    const slider = screen.getByRole('slider', { name: 'Speed' });
-    fireEvent.change(slider, { target: { value: '1.5' } });
-    fireEvent.pointerUp(slider);
-    // Faster speech shortens the pauses, it must not erase them.
-    expect(props.onSetSentenceGap).toHaveBeenCalledWith(0.12);
-    expect(props.onSetParagraphGap).toHaveBeenCalledWith(0.24);
-    expect(viewSettings['ttsSentenceGap']).toBe(0.12);
-    expect(viewSettings['ttsParagraphGap']).toBe(0.24);
   });
 
   test('voice button drills into the voice list and selects a voice', async () => {
@@ -324,10 +365,14 @@ describe('TTSPlayerSheet', () => {
     chapters: [{ key: 'c1', label: 'One', depth: 0, startSection: 0, endSection: 1 }],
     statuses: new Map(),
     cacheBytes: 0,
-    download: { activeChapterKey: null, done: 0, total: 0 },
-    downloadChapter: vi.fn().mockResolvedValue(undefined),
-    downloadAll: vi.fn().mockResolvedValue(undefined),
-    cancel: vi.fn(),
+    clearing: false,
+    items: [],
+    itemFor: () => undefined,
+    downloadChapter: vi.fn(),
+    downloadAll: vi.fn(),
+    cancelChapter: vi.fn(),
+    cancelAll: vi.fn(),
+    clearDownloads: vi.fn().mockResolvedValue(undefined),
     statusOf: vi.fn().mockReturnValue('complete'),
     refresh: vi.fn().mockResolvedValue(undefined),
     ...over,
